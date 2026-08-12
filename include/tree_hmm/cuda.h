@@ -37,12 +37,18 @@ public:
                           std::span<const btrc::Index> observation_nodes,
                           int device = 0);
 
-  // Reserves the forward workspace together with reconstruction storage.
-  // Likelihood-only Reserve calls remain smaller and use the same kernels as
-  // before. This workspace can evaluate maximum-a-posteriori assignments.
-  void ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
-                            std::size_t batch_capacity, int device = 0);
-  void ReserveCategoricalBidirectional(
+  // Reconstruction workspaces retain only the tapes required by the selected
+  // algebra. Likelihood-only Reserve calls remain smaller.
+  void ReserveMaximum(const btrc::Plan &plan, std::size_t states,
+                      std::size_t batch_capacity, int device = 0);
+  void ReserveCategoricalMaximum(const btrc::Plan &plan, std::size_t states,
+                                 std::size_t batch_capacity,
+                                 std::size_t categories,
+                                 std::span<const btrc::Index> observation_nodes,
+                                 int device = 0);
+  void ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+                         std::size_t batch_capacity, int device = 0);
+  void ReserveCategoricalSumProduct(
       const btrc::Plan &plan, std::size_t states, std::size_t batch_capacity,
       std::size_t categories, std::span<const btrc::Index> observation_nodes,
       int device = 0);
@@ -54,6 +60,8 @@ public:
   tree_hmm::MutableBatchedCategoricalModelView CategoricalInputs();
   tree_hmm::MutableBatchedCategoricalModelView
   CategoricalInputs(std::size_t batch);
+  std::span<float> Uniforms();
+  std::span<float> Uniforms(std::size_t batch);
 
 private:
   friend tree_hmm::PartitionView
@@ -70,6 +78,12 @@ private:
   friend tree_hmm::BatchedMaximumAssignmentView
   MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView,
                              Workspace &);
+  friend tree_hmm::BatchedPosteriorSampleView
+  PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const float>,
+                          Workspace &);
+  friend tree_hmm::BatchedPosteriorSampleView
+  PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
+                          std::span<const float>, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -91,6 +105,12 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
                            Workspace &workspace);
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
+                        std::span<const float> uniforms, Workspace &workspace);
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
+                        std::span<const float> uniforms, Workspace &workspace);
 
 } // namespace tree_hmm::cuda
 

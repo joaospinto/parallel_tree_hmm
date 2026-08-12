@@ -98,6 +98,54 @@ inline uint compression_choice_index(constant Params &p, uint batch,
          child_state;
 }
 
+inline uint rake_path_tape_index(constant Params &p, uint batch, uint branch,
+                                 uint entry) {
+  return (branch * p.batch + batch) * p.states * p.states + entry;
+}
+
+inline uint rake_leaf_tape_index(constant Params &p, uint batch, uint branch,
+                                 uint state) {
+  return (branch * p.batch + batch) * p.states + state;
+}
+
+inline uint compression_matrix_tape_index(constant Params &p, uint batch,
+                                          uint tape, uint entry) {
+  return (tape * p.batch + batch) * p.states * p.states + entry;
+}
+
+inline uint compression_vector_tape_index(constant Params &p, uint batch,
+                                          uint tape, uint state) {
+  return (tape * p.batch + batch) * p.states + state;
+}
+
+inline uint sample_contiguous(device const float *weights, uint states,
+                              float uniform) {
+  float total = 0.0f;
+  for (uint state = 0; state < states; ++state)
+    total += weights[state];
+  const float threshold = uniform * total;
+  float cumulative = 0.0f;
+  uint fallback = 0;
+  for (uint state = 0; state < states; ++state) {
+    if (weights[state] > 0.0f)
+      fallback = state;
+    cumulative += weights[state];
+    if (threshold < cumulative)
+      return state;
+  }
+  return fallback;
+}
+
+inline float log_product(float left, float right) {
+  return left > 0.0f && right > 0.0f ? log(left) + log(right) : -INFINITY;
+}
+
+inline float log_product(float left, float middle, float right) {
+  return left > 0.0f && middle > 0.0f && right > 0.0f
+             ? log(left) + log(middle) + log(right)
+             : -INFINITY;
+}
+
 inline float potential_log(float value) {
   return value > 0.0f ? log(value) : -INFINITY;
 }
@@ -158,6 +206,208 @@ kernel void take_logs(device float *values [[buffer(0)]],
                       uint index [[thread_position_in_grid]]) {
   if (index < count)
     values[index] = potential_log(values[index]);
+}
+
+kernel void save_rake_tapes(
+    device const Rake *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device const float *paths [[buffer(2)]],
+    device float *path_tape [[buffer(3)]],
+    device float *leaf_tape [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Rake op = operations[p.operation_offset + operation_index];
+  const uint matrix_size = p.states * p.states;
+  const uint path_base = path_index(p, batch_index, op.edge, 0, 0);
+  const uint node_base = node_index(p, batch_index, op.leaf, 0);
+  for (uint entry = 0; entry < matrix_size; ++entry) {
+    path_tape[rake_path_tape_index(p, batch_index, op.branch, entry)] =
+        paths[path_base + entry];
+  }
+  for (uint state = 0; state < p.states; ++state) {
+    leaf_tape[rake_leaf_tape_index(p, batch_index, op.branch, state)] =
+        nodes[node_base + state];
+  }
+}
+
+kernel void save_compression_tapes(
+    device const Compression *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device const float *paths [[buffer(2)]],
+    device float *left_tape [[buffer(3)]],
+    device float *middle_tape [[buffer(4)]],
+    device float *right_tape [[buffer(5)]],
+    constant Params &p [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Compression op = operations[p.operation_offset + operation_index];
+  const uint matrix_size = p.states * p.states;
+  const uint left_base = path_index(p, batch_index, op.left_edge, 0, 0);
+  const uint right_base = path_index(p, batch_index, op.right_edge, 0, 0);
+  const uint middle_base = node_index(p, batch_index, op.middle, 0);
+  for (uint entry = 0; entry < matrix_size; ++entry) {
+    const uint tape_index =
+        compression_matrix_tape_index(p, batch_index, op.tape, entry);
+    left_tape[tape_index] = paths[left_base + entry];
+    right_tape[tape_index] = paths[right_base + entry];
+  }
+  for (uint state = 0; state < p.states; ++state) {
+    middle_tape[compression_vector_tape_index(p, batch_index, op.tape,
+                                              state)] =
+        nodes[middle_base + state];
+  }
+}
+
+kernel void seed_root_samples(
+    device const float *nodes [[buffer(0)]],
+    device const float *uniforms [[buffer(1)]],
+    device uint *assignments [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint batch_index [[thread_position_in_grid]]) {
+  if (batch_index >= p.batch)
+    return;
+  assignments[assignment_index(p, batch_index, p.root)] = sample_contiguous(
+      nodes + node_index(p, batch_index, p.root, 0), p.states,
+      uniforms[assignment_index(p, batch_index, p.root)]);
+}
+
+kernel void expand_sample_rakes(
+    device const Rake *operations [[buffer(0)]],
+    device const float *path_tape [[buffer(1)]],
+    device const float *leaf_tape [[buffer(2)]],
+    device const float *uniforms [[buffer(3)]],
+    device uint *assignments [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Rake op = operations[p.operation_offset + operation_index];
+  const uint parent_state =
+      assignments[assignment_index(p, batch_index, op.parent)];
+  float maximum = -INFINITY;
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    maximum = max(
+        maximum,
+        log_product(path_tape[rake_path_tape_index(
+                        p, batch_index, op.branch,
+                        parent_state * p.states + child_state)],
+                    leaf_tape[rake_leaf_tape_index(
+                        p, batch_index, op.branch, child_state)]));
+  }
+  float total = 0.0f;
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    total += exp(log_product(
+                     path_tape[rake_path_tape_index(
+                         p, batch_index, op.branch,
+                         parent_state * p.states + child_state)],
+                     leaf_tape[rake_leaf_tape_index(
+                         p, batch_index, op.branch, child_state)]) -
+                 maximum);
+  }
+  const float threshold =
+      uniforms[assignment_index(p, batch_index, op.leaf)] * total;
+  float cumulative = 0.0f;
+  uint choice = 0;
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    const float value = exp(
+        log_product(path_tape[rake_path_tape_index(
+                        p, batch_index, op.branch,
+                        parent_state * p.states + child_state)],
+                    leaf_tape[rake_leaf_tape_index(
+                        p, batch_index, op.branch, child_state)]) -
+        maximum);
+    if (value > 0.0f)
+      choice = child_state;
+    cumulative += value;
+    if (threshold < cumulative) {
+      choice = child_state;
+      break;
+    }
+  }
+  assignments[assignment_index(p, batch_index, op.leaf)] = choice;
+}
+
+kernel void expand_sample_compressions(
+    device const Compression *operations [[buffer(0)]],
+    device const float *left_tape [[buffer(1)]],
+    device const float *middle_tape [[buffer(2)]],
+    device const float *right_tape [[buffer(3)]],
+    device const float *uniforms [[buffer(4)]],
+    device uint *assignments [[buffer(5)]],
+    constant Params &p [[buffer(6)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Compression op = operations[p.operation_offset + operation_index];
+  const uint parent_state =
+      assignments[assignment_index(p, batch_index, op.parent)];
+  const uint child_state =
+      assignments[assignment_index(p, batch_index, op.child)];
+  float maximum = -INFINITY;
+  for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
+    maximum = max(
+        maximum,
+        log_product(left_tape[compression_matrix_tape_index(
+                        p, batch_index, op.tape,
+                        parent_state * p.states + middle_state)],
+                    middle_tape[compression_vector_tape_index(
+                        p, batch_index, op.tape, middle_state)],
+                    right_tape[compression_matrix_tape_index(
+                        p, batch_index, op.tape,
+                        middle_state * p.states + child_state)]));
+  }
+  float total = 0.0f;
+  for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
+    total += exp(log_product(
+                     left_tape[compression_matrix_tape_index(
+                         p, batch_index, op.tape,
+                         parent_state * p.states + middle_state)],
+                     middle_tape[compression_vector_tape_index(
+                         p, batch_index, op.tape, middle_state)],
+                     right_tape[compression_matrix_tape_index(
+                         p, batch_index, op.tape,
+                         middle_state * p.states + child_state)]) -
+                 maximum);
+  }
+  const float threshold =
+      uniforms[assignment_index(p, batch_index, op.middle)] * total;
+  float cumulative = 0.0f;
+  uint choice = 0;
+  for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
+    const float value = exp(
+        log_product(left_tape[compression_matrix_tape_index(
+                        p, batch_index, op.tape,
+                        parent_state * p.states + middle_state)],
+                    middle_tape[compression_vector_tape_index(
+                        p, batch_index, op.tape, middle_state)],
+                    right_tape[compression_matrix_tape_index(
+                        p, batch_index, op.tape,
+                        middle_state * p.states + child_state)]) -
+        maximum);
+    if (value > 0.0f)
+      choice = middle_state;
+    cumulative += value;
+    if (threshold < cumulative) {
+      choice = middle_state;
+      break;
+    }
+  }
+  assignments[assignment_index(p, batch_index, op.middle)] = choice;
 }
 
 kernel void maximum_rake(

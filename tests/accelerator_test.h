@@ -227,11 +227,15 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
 }
 
 template <class Reserve, class Inputs, class SolveLog, class SolveMaximum,
-          class SolveDense>
+          class SolveDense, class ReserveSampling, class Uniforms,
+          class SolveSampling>
 void TestCategoricalAccelerator(const char *name, bool available,
                                 Reserve reserve, Inputs inputs,
                                 SolveLog solve_log, SolveMaximum solve_maximum,
-                                SolveDense solve_dense) {
+                                SolveDense solve_dense,
+                                ReserveSampling reserve_sampling,
+                                Uniforms uniforms,
+                                SolveSampling solve_sampling) {
   if (!available)
     return;
   const btrc::Plan plan =
@@ -348,6 +352,49 @@ void TestCategoricalAccelerator(const char *name, bool available,
     throw std::runtime_error(std::string(name) +
                              " categorical tail shape is wrong");
   }
+
+  reserve_sampling(plan, kStates, kBatch, kCategories, observation_nodes);
+  staged = inputs(kBatch);
+  std::copy(observations.begin(), observations.end(),
+            staged.observations.begin());
+  std::copy(root_potential.begin(), root_potential.end(),
+            staged.root_potential.begin());
+  std::copy(emissions.begin(), emissions.end(),
+            staged.emission_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  std::span<float> staged_uniforms = uniforms(kBatch);
+  for (std::size_t index = 0; index < staged_uniforms.size(); ++index)
+    staged_uniforms[index] = 0.13f + 0.12f * static_cast<float>(index % 7);
+  const tree_hmm::BatchedPosteriorSampleView samples =
+      solve_sampling(static_cast<tree_hmm::BatchedCategoricalModelView>(staged),
+                     staged_uniforms);
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
+    std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
+    for (std::size_t observation = 0; observation < observation_nodes.size();
+         ++observation) {
+      const std::uint8_t category =
+          observations[batch * observation_nodes.size() + observation];
+      for (std::size_t state = 0; state < kStates; ++state) {
+        nodes[observation_nodes[observation] * kStates + state] *=
+            emissions[category * kStates + state];
+      }
+    }
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::size_t offset = batch * plan.num_nodes();
+    const std::vector<double> host_uniforms(staged_uniforms.begin() + offset,
+                                            staged_uniforms.begin() + offset +
+                                                plan.num_nodes());
+    const std::vector<std::size_t> expected = tree_hmm::PosteriorSample(
+        {plan, kStates, nodes, host_edges}, host_uniforms);
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      if (samples.states[batch * plan.num_nodes() + node] != expected[node]) {
+        throw std::runtime_error(
+            std::string(name) +
+            " categorical posterior sample disagrees with CPU");
+      }
+    }
+  }
 }
 
 template <class Reserve, class Inputs, class Solve>
@@ -409,6 +456,84 @@ void TestMaximumAccelerator(const char *name, bool available, Reserve reserve,
             std::string(name) + " MAP assignment disagrees with CPU inference");
       }
     }
+  }
+}
+
+template <class Reserve, class Inputs, class Uniforms, class Solve>
+void TestSamplingAccelerator(const char *name, bool available, Reserve reserve,
+                             Inputs inputs, Uniforms uniforms, Solve solve) {
+  if (!available)
+    return;
+  const btrc::Plan plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kBatch = 5;
+  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      for (std::size_t state = 0; state < kStates; ++state) {
+        nodes[(batch * plan.num_nodes() + node) * kStates + state] =
+            0.2f +
+            0.01f * static_cast<float>(1 + 2 * batch + 3 * node + 5 * state);
+      }
+    }
+  }
+  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    for (std::size_t parent = 0; parent < kStates; ++parent) {
+      for (std::size_t child = 0; child < kStates; ++child) {
+        edges[(edge * kStates + parent) * kStates + child] =
+            0.1f +
+            0.015f * static_cast<float>(1 + edge + 2 * parent + 4 * child);
+      }
+    }
+  }
+  std::vector<float> variates(kBatch * plan.num_nodes());
+  for (std::size_t index = 0; index < variates.size(); ++index)
+    variates[index] = 0.07f + 0.11f * static_cast<float>(index % 8);
+
+  reserve(plan, kStates, kBatch);
+  tree_hmm::MutableBatchedModelView staged = inputs(kBatch);
+  std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  std::span<float> staged_uniforms = uniforms(kBatch);
+  std::copy(variates.begin(), variates.end(), staged_uniforms.begin());
+  const tree_hmm::BatchedPosteriorSampleView actual =
+      solve(static_cast<tree_hmm::BatchedModelView>(staged), staged_uniforms);
+  if (actual.states.size() != kBatch * plan.num_nodes()) {
+    throw std::runtime_error(std::string(name) +
+                             " posterior-sample shape is wrong");
+  }
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    const std::size_t node_values = plan.num_nodes() * kStates;
+    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
+                                         nodes.begin() +
+                                             (batch + 1) * node_values);
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::size_t uniform_offset = batch * plan.num_nodes();
+    const std::vector<double> host_uniforms(variates.begin() + uniform_offset,
+                                            variates.begin() + uniform_offset +
+                                                plan.num_nodes());
+    const std::vector<std::size_t> expected = tree_hmm::PosteriorSample(
+        {plan, kStates, host_nodes, host_edges}, host_uniforms);
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      if (actual.states[batch * plan.num_nodes() + node] != expected[node]) {
+        throw std::runtime_error(std::string(name) +
+                                 " posterior sample disagrees with CPU");
+      }
+    }
+  }
+  staged_uniforms[0] = 1.0f;
+  bool invalid_uniform_rejected = false;
+  try {
+    static_cast<void>(solve(static_cast<tree_hmm::BatchedModelView>(staged),
+                            staged_uniforms));
+  } catch (const std::invalid_argument &) {
+    invalid_uniform_rejected = true;
+  }
+  if (!invalid_uniform_rejected) {
+    throw std::runtime_error(std::string(name) +
+                             " accepted an invalid posterior uniform");
   }
 }
 

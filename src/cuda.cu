@@ -178,6 +178,65 @@ __device__ std::size_t CompressionChoiceIndex(const Params &params,
          child_state;
 }
 
+__device__ std::size_t RakePathTapeIndex(const Params &params,
+                                         std::size_t batch, std::size_t branch,
+                                         std::size_t entry) {
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  return (branch * params.batch + batch) * matrix + entry;
+}
+
+__device__ std::size_t RakeLeafTapeIndex(const Params &params,
+                                         std::size_t batch, std::size_t branch,
+                                         std::size_t state) {
+  return (branch * params.batch + batch) * params.states + state;
+}
+
+__device__ std::size_t CompressionMatrixTapeIndex(const Params &params,
+                                                  std::size_t batch,
+                                                  std::size_t tape,
+                                                  std::size_t entry) {
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  return (tape * params.batch + batch) * matrix + entry;
+}
+
+__device__ std::size_t CompressionVectorTapeIndex(const Params &params,
+                                                  std::size_t batch,
+                                                  std::size_t tape,
+                                                  std::size_t state) {
+  return (tape * params.batch + batch) * params.states + state;
+}
+
+__device__ std::uint32_t SampleContiguous(const float *weights,
+                                          std::uint32_t states, float uniform) {
+  float total = 0.0f;
+  for (std::uint32_t state = 0; state < states; ++state)
+    total += weights[state];
+  const float threshold = uniform * total;
+  float cumulative = 0.0f;
+  std::uint32_t fallback = 0;
+  for (std::uint32_t state = 0; state < states; ++state) {
+    const float value = weights[state];
+    if (value > 0.0f)
+      fallback = state;
+    cumulative += value;
+    if (threshold < cumulative)
+      return state;
+  }
+  return fallback;
+}
+
+__device__ float LogProduct(float left, float right) {
+  return left > 0.0f && right > 0.0f ? logf(left) + logf(right) : -INFINITY;
+}
+
+__device__ float LogProduct(float left, float middle, float right) {
+  return left > 0.0f && middle > 0.0f && right > 0.0f
+             ? logf(left) + logf(middle) + logf(right)
+             : -INFINITY;
+}
+
 // Transpose the public [batch, node, state] input into the internal
 // [node, batch, state] layout without constraining the state count.
 constexpr std::size_t kTransposeTile = 32;
@@ -291,6 +350,206 @@ __global__ void TakeLogs(float *values, std::size_t count) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index < count)
     values[index] = values[index] > 0.0f ? logf(values[index]) : -INFINITY;
+}
+
+__global__ void SaveRakeTapes(const btrc::Rake *operations, const float *nodes,
+                              const float *paths, float *path_tape,
+                              float *leaf_tape, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+  for (std::size_t entry = 0; entry < matrix; ++entry) {
+    path_tape[RakePathTapeIndex(params, batch, operation.branch, entry)] =
+        paths[path_base + entry];
+  }
+  for (std::size_t state = 0; state < params.states; ++state) {
+    leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch, state)] =
+        nodes[node_base + state];
+  }
+}
+
+__global__ void SaveCompressionTapes(const btrc::Compression *operations,
+                                     const float *nodes, const float *paths,
+                                     float *left_tape, float *middle_tape,
+                                     float *right_tape, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  const std::size_t left_base =
+      PathIndex(params, batch, operation.left_edge, 0, 0);
+  const std::size_t right_base =
+      PathIndex(params, batch, operation.right_edge, 0, 0);
+  const std::size_t middle_base = NodeIndex(params, batch, operation.middle, 0);
+  for (std::size_t entry = 0; entry < matrix; ++entry) {
+    const std::size_t tape_index =
+        CompressionMatrixTapeIndex(params, batch, operation.tape, entry);
+    left_tape[tape_index] = paths[left_base + entry];
+    right_tape[tape_index] = paths[right_base + entry];
+  }
+  for (std::size_t state = 0; state < params.states; ++state) {
+    middle_tape[CompressionVectorTapeIndex(params, batch, operation.tape,
+                                           state)] = nodes[middle_base + state];
+  }
+}
+
+__global__ void SeedRootSamples(const float *nodes, const float *uniforms,
+                                std::uint32_t *assignments, Params params) {
+  const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch >= params.batch)
+    return;
+  assignments[AssignmentIndex(params, batch, params.root)] = SampleContiguous(
+      nodes + NodeIndex(params, batch, params.root, 0), params.states,
+      uniforms[AssignmentIndex(params, batch, params.root)]);
+}
+
+__global__ void ExpandSampleRakes(const btrc::Rake *operations,
+                                  const float *path_tape,
+                                  const float *leaf_tape, const float *uniforms,
+                                  std::uint32_t *assignments, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::uint32_t parent_state =
+      assignments[AssignmentIndex(params, batch, operation.parent)];
+  float maximum = -INFINITY;
+  for (std::uint32_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    maximum =
+        fmaxf(maximum,
+              LogProduct(path_tape[RakePathTapeIndex(
+                             params, batch, operation.branch,
+                             parent_state * params.states + child_state)],
+                         leaf_tape[RakeLeafTapeIndex(
+                             params, batch, operation.branch, child_state)]));
+  }
+  float total = 0.0f;
+  for (std::uint32_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    total +=
+        expf(LogProduct(path_tape[RakePathTapeIndex(
+                            params, batch, operation.branch,
+                            parent_state * params.states + child_state)],
+                        leaf_tape[RakeLeafTapeIndex(
+                            params, batch, operation.branch, child_state)]) -
+             maximum);
+  }
+  const float threshold =
+      uniforms[AssignmentIndex(params, batch, operation.leaf)] * total;
+  float cumulative = 0.0f;
+  std::uint32_t choice = 0;
+  for (std::uint32_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    const float value =
+        expf(LogProduct(path_tape[RakePathTapeIndex(
+                            params, batch, operation.branch,
+                            parent_state * params.states + child_state)],
+                        leaf_tape[RakeLeafTapeIndex(
+                            params, batch, operation.branch, child_state)]) -
+             maximum);
+    if (value > 0.0f)
+      choice = child_state;
+    cumulative += value;
+    if (threshold < cumulative) {
+      choice = child_state;
+      break;
+    }
+  }
+  assignments[AssignmentIndex(params, batch, operation.leaf)] = choice;
+}
+
+__global__ void
+ExpandSampleCompressions(const btrc::Compression *operations,
+                         const float *left_tape, const float *middle_tape,
+                         const float *right_tape, const float *uniforms,
+                         std::uint32_t *assignments, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::uint32_t parent_state =
+      assignments[AssignmentIndex(params, batch, operation.parent)];
+  const std::uint32_t child_state =
+      assignments[AssignmentIndex(params, batch, operation.child)];
+  float maximum = -INFINITY;
+  for (std::uint32_t middle_state = 0; middle_state < params.states;
+       ++middle_state) {
+    maximum = fmaxf(
+        maximum, LogProduct(left_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                parent_state * params.states + middle_state)],
+                            middle_tape[CompressionVectorTapeIndex(
+                                params, batch, operation.tape, middle_state)],
+                            right_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                middle_state * params.states + child_state)]));
+  }
+  float total = 0.0f;
+  for (std::uint32_t middle_state = 0; middle_state < params.states;
+       ++middle_state) {
+    total += expf(LogProduct(left_tape[CompressionMatrixTapeIndex(
+                                 params, batch, operation.tape,
+                                 parent_state * params.states + middle_state)],
+                             middle_tape[CompressionVectorTapeIndex(
+                                 params, batch, operation.tape, middle_state)],
+                             right_tape[CompressionMatrixTapeIndex(
+                                 params, batch, operation.tape,
+                                 middle_state * params.states + child_state)]) -
+                  maximum);
+  }
+  const float threshold =
+      uniforms[AssignmentIndex(params, batch, operation.middle)] * total;
+  float cumulative = 0.0f;
+  std::uint32_t choice = 0;
+  for (std::uint32_t middle_state = 0; middle_state < params.states;
+       ++middle_state) {
+    const float value =
+        expf(LogProduct(left_tape[CompressionMatrixTapeIndex(
+                            params, batch, operation.tape,
+                            parent_state * params.states + middle_state)],
+                        middle_tape[CompressionVectorTapeIndex(
+                            params, batch, operation.tape, middle_state)],
+                        right_tape[CompressionMatrixTapeIndex(
+                            params, batch, operation.tape,
+                            middle_state * params.states + child_state)]) -
+             maximum);
+    if (value > 0.0f)
+      choice = middle_state;
+    cumulative += value;
+    if (threshold < cumulative) {
+      choice = middle_state;
+      break;
+    }
+  }
+  assignments[AssignmentIndex(params, batch, operation.middle)] = choice;
 }
 
 __global__ void MaximumRakeSerial(const btrc::Rake *operations,
@@ -966,6 +1225,7 @@ struct Workspace::Impl {
   float *host_edges = nullptr;
   float *host_output = nullptr;
   std::uint32_t *host_assignments = nullptr;
+  float *host_uniforms = nullptr;
   std::uint8_t *host_observations = nullptr;
   float *host_root_potential = nullptr;
   float *host_emission_potentials = nullptr;
@@ -986,10 +1246,17 @@ struct Workspace::Impl {
   std::uint32_t *rake_choices = nullptr;
   std::uint32_t *compression_choices = nullptr;
   std::uint32_t *assignments = nullptr;
+  float *uniforms = nullptr;
+  float *rake_path_tape = nullptr;
+  float *rake_leaf_tape = nullptr;
+  float *compression_left_tape = nullptr;
+  float *compression_middle_tape = nullptr;
+  float *compression_right_tape = nullptr;
   std::vector<btrc::Index> observation_nodes;
   std::size_t categories = 0;
   bool categorical = false;
-  bool bidirectional = false;
+  bool maximum = false;
+  bool sum_product = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -1017,10 +1284,17 @@ struct Workspace::Impl {
     DeviceFree(rake_choices);
     DeviceFree(compression_choices);
     DeviceFree(assignments);
+    DeviceFree(uniforms);
+    DeviceFree(rake_path_tape);
+    DeviceFree(rake_leaf_tape);
+    DeviceFree(compression_left_tape);
+    DeviceFree(compression_middle_tape);
+    DeviceFree(compression_right_tape);
     HostFree(host_nodes);
     HostFree(host_edges);
     HostFree(host_output);
     HostFree(host_assignments);
+    HostFree(host_uniforms);
     HostFree(host_observations);
     HostFree(host_root_potential);
     HostFree(host_emission_potentials);
@@ -1039,7 +1313,8 @@ struct Workspace::Impl {
     observation_nodes.clear();
     categories = 0;
     categorical = false;
-    bidirectional = false;
+    maximum = false;
+    sum_product = false;
   }
 
   ~Impl() { Clear(); }
@@ -1142,11 +1417,19 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
   DeviceAllocate(storage.output, batch);
 }
 
-void ReserveRecovery(Workspace::Impl &storage) {
+void ReserveAssignments(Workspace::Impl &storage) {
   const btrc::Plan &plan = *storage.plan;
-  HostAllocate(storage.host_assignments,
-               CheckedProduct({storage.batch, plan.num_nodes()},
-                              "host MAP assignments"));
+  HostAllocate(
+      storage.host_assignments,
+      CheckedProduct({storage.batch, plan.num_nodes()}, "host assignments"));
+  DeviceAllocate(
+      storage.assignments,
+      CheckedProduct({storage.batch, plan.num_nodes()}, "assignments"));
+}
+
+void ReserveMaximumRecovery(Workspace::Impl &storage) {
+  ReserveAssignments(storage);
+  const btrc::Plan &plan = *storage.plan;
   DeviceAllocate(
       storage.rake_choices,
       CheckedProduct({storage.batch, plan.num_branches(), storage.states},
@@ -1155,10 +1438,34 @@ void ReserveRecovery(Workspace::Impl &storage) {
                  CheckedProduct({storage.batch, plan.num_compressions(),
                                  storage.states, storage.states},
                                 "MAP compression choices"));
-  DeviceAllocate(
-      storage.assignments,
-      CheckedProduct({storage.batch, plan.num_nodes()}, "MAP assignments"));
-  storage.bidirectional = true;
+  storage.maximum = true;
+}
+
+void ReserveSumProductRecovery(Workspace::Impl &storage) {
+  ReserveAssignments(storage);
+  const btrc::Plan &plan = *storage.plan;
+  const std::size_t matrix =
+      CheckedProduct({storage.states, storage.states}, "state matrix");
+  const std::size_t rake_matrices = CheckedProduct(
+      {storage.batch, plan.num_branches(), matrix}, "rake matrix tape");
+  const std::size_t rake_vectors = CheckedProduct(
+      {storage.batch, plan.num_branches(), storage.states}, "rake vector tape");
+  const std::size_t compression_matrices =
+      CheckedProduct({storage.batch, plan.num_compressions(), matrix},
+                     "compression matrix tape");
+  const std::size_t compression_vectors =
+      CheckedProduct({storage.batch, plan.num_compressions(), storage.states},
+                     "compression vector tape");
+  const std::size_t assignment_count =
+      CheckedProduct({storage.batch, plan.num_nodes()}, "posterior uniforms");
+  HostAllocate(storage.host_uniforms, assignment_count);
+  DeviceAllocate(storage.uniforms, assignment_count);
+  DeviceAllocate(storage.rake_path_tape, rake_matrices);
+  DeviceAllocate(storage.rake_leaf_tape, rake_vectors);
+  DeviceAllocate(storage.compression_left_tape, compression_matrices);
+  DeviceAllocate(storage.compression_middle_tape, compression_vectors);
+  DeviceAllocate(storage.compression_right_tape, compression_matrices);
+  storage.sum_product = true;
 }
 
 } // namespace
@@ -1226,19 +1533,34 @@ void Workspace::ReserveCategorical(
   Check(cudaStreamSynchronize(storage.stream), "categorical topology upload");
 }
 
-void Workspace::ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
-                                     std::size_t batch, int device) {
+void Workspace::ReserveMaximum(const btrc::Plan &plan, std::size_t states,
+                               std::size_t batch, int device) {
   Reserve(plan, states, batch, device);
-  ReserveRecovery(*impl_);
+  ReserveMaximumRecovery(*impl_);
 }
 
-void Workspace::ReserveCategoricalBidirectional(
+void Workspace::ReserveCategoricalMaximum(
     const btrc::Plan &plan, std::size_t states, std::size_t batch,
     std::size_t categories, std::span<const btrc::Index> observation_nodes,
     int device) {
   ReserveCategorical(plan, states, batch, categories, observation_nodes,
                      device);
-  ReserveRecovery(*impl_);
+  ReserveMaximumRecovery(*impl_);
+}
+
+void Workspace::ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+                                  std::size_t batch, int device) {
+  Reserve(plan, states, batch, device);
+  ReserveSumProductRecovery(*impl_);
+}
+
+void Workspace::ReserveCategoricalSumProduct(
+    const btrc::Plan &plan, std::size_t states, std::size_t batch,
+    std::size_t categories, std::span<const btrc::Index> observation_nodes,
+    int device) {
+  ReserveCategorical(plan, states, batch, categories, observation_nodes,
+                     device);
+  ReserveSumProductRecovery(*impl_);
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
@@ -1299,13 +1621,30 @@ Workspace::CategoricalInputs(std::size_t batch) {
           {storage.host_edges, edge_values}};
 }
 
+std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
+
+std::span<float> Workspace::Uniforms(std::size_t batch) {
+  Impl &storage = *impl_;
+  if (!storage.sum_product) {
+    throw std::logic_error(
+        "CUDA Workspace::ReserveSumProduct must precede Uniforms");
+  }
+  if (batch == 0 || batch > storage.batch)
+    throw std::invalid_argument(
+        "CUDA uniform batch exceeds the reserved capacity");
+  return {storage.host_uniforms,
+          CheckedProduct({batch, storage.plan->num_nodes()},
+                         "CUDA posterior uniforms")};
+}
+
 namespace {
 
 template <class StageInputs, class UploadInputs, class InitializeNodeData>
 tree_hmm::PartitionView
 RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
             std::span<const float> edge_potentials, Workspace::Impl &storage,
-            bool scaled, StageInputs stage_inputs, UploadInputs upload_inputs,
+            bool scaled, std::span<const float> uniforms,
+            StageInputs stage_inputs, UploadInputs upload_inputs,
             InitializeNodeData initialize_node_data) {
   const auto wall_start = Clock::now();
   if (storage.plan != &plan || storage.states != states || batch == 0 ||
@@ -1320,10 +1659,28 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
       CheckedProduct({plan.num_edges(), matrix}, "edge inputs");
   if (edge_potentials.size() != edge_values)
     throw std::invalid_argument("CUDA edge input shape is wrong");
+  const bool sampling = !uniforms.empty();
+  const std::size_t assignment_count =
+      CheckedProduct({batch, plan.num_nodes()}, "posterior assignments");
+  if (sampling &&
+      (!storage.sum_product || uniforms.size() != assignment_count)) {
+    throw std::invalid_argument(
+        "prepared CUDA posterior sampling requires ReserveSumProduct and one "
+        "uniform variate per batch item and node");
+  }
+  for (const float uniform : uniforms) {
+    if (!std::isfinite(uniform) || uniform < 0.0f || uniform >= 1.0f) {
+      throw std::invalid_argument(
+          "posterior-sampling variates must lie in [0, 1)");
+    }
+  }
   stage_inputs();
   if (edge_potentials.data() != storage.host_edges) {
     std::memcpy(storage.host_edges, edge_potentials.data(),
                 edge_potentials.size_bytes());
+  }
+  if (sampling && uniforms.data() != storage.host_uniforms) {
+    std::memcpy(storage.host_uniforms, uniforms.data(), uniforms.size_bytes());
   }
 
   Check(cudaEventRecord(storage.upload_start, storage.stream),
@@ -1333,6 +1690,12 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
                         edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
                         storage.stream),
         "cudaMemcpyAsync edge upload");
+  if (sampling) {
+    Check(cudaMemcpyAsync(storage.uniforms, storage.host_uniforms,
+                          uniforms.size_bytes(), cudaMemcpyHostToDevice,
+                          storage.stream),
+          "cudaMemcpyAsync posterior-uniform upload");
+  }
   Check(cudaEventRecord(storage.upload_stop, storage.stream),
         "cudaEventRecord upload stop");
 
@@ -1375,6 +1738,18 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
     const std::uint32_t operation_blocks =
         CheckedU32(operations, "primitive CUDA grid");
     const std::uint32_t serial_blocks = Blocks(operations, kThreads);
+    if (sampling && primitive_batch.primitive == btrc::Primitive::kRake) {
+      SaveRakeTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
+          storage.rakes, storage.nodes, storage.paths, storage.rake_path_tape,
+          storage.rake_leaf_tape, params);
+    }
+    if (sampling &&
+        primitive_batch.primitive == btrc::Primitive::kCompression) {
+      SaveCompressionTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
+          storage.compressions, storage.nodes, storage.paths,
+          storage.compression_left_tape, storage.compression_middle_tape,
+          storage.compression_right_tape, params);
+    }
     switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
       if (states <= 8) {
@@ -1427,6 +1802,37 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   }
   FinishRoot<<<CheckedU32(batch, "root CUDA grid"), 1, 0, storage.stream>>>(
       storage.nodes, storage.node_scales, storage.output, base_params);
+  if (sampling) {
+    SeedRootSamples<<<Blocks(batch, kThreads), kThreads, 0, storage.stream>>>(
+        storage.nodes, storage.uniforms, storage.assignments, base_params);
+    for (std::size_t index = plan.primitive_batches().size(); index-- > 0;) {
+      const btrc::PrimitiveBatch &primitive_batch =
+          plan.primitive_batches()[index];
+      Params params = base_params;
+      params.operation_offset = primitive_batch.offset;
+      params.operation_count = primitive_batch.count;
+      const std::size_t operations = CheckedProduct(
+          {batch, primitive_batch.count}, "posterior expansion grid");
+      switch (primitive_batch.primitive) {
+      case btrc::Primitive::kRake:
+        ExpandSampleRakes<<<Blocks(operations, kThreads), kThreads, 0,
+                            storage.stream>>>(
+            storage.rakes, storage.rake_path_tape, storage.rake_leaf_tape,
+            storage.uniforms, storage.assignments, params);
+        break;
+      case btrc::Primitive::kCompression:
+        ExpandSampleCompressions<<<Blocks(operations, kThreads), kThreads, 0,
+                                   storage.stream>>>(
+            storage.compressions, storage.compression_left_tape,
+            storage.compression_middle_tape, storage.compression_right_tape,
+            storage.uniforms, storage.assignments, params);
+        break;
+      case btrc::Primitive::kBranchCombination:
+      case btrc::Primitive::kBranchAbsorption:
+        break;
+      }
+    }
+  }
   Check(cudaGetLastError(), "tree-HMM CUDA kernel launch");
   Check(cudaEventRecord(storage.kernel_stop, storage.stream),
         "cudaEventRecord kernel stop");
@@ -1437,9 +1843,23 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
                         batch * sizeof(float), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync output download");
+  if (sampling) {
+    Check(cudaMemcpyAsync(storage.host_assignments, storage.assignments,
+                          assignment_count * sizeof(std::uint32_t),
+                          cudaMemcpyDeviceToHost, storage.stream),
+          "cudaMemcpyAsync posterior-sample download");
+  }
   Check(cudaEventRecord(storage.download_stop, storage.stream),
         "cudaEventRecord download stop");
   Check(cudaEventSynchronize(storage.download_stop), "tree-HMM CUDA execution");
+  if (sampling) {
+    for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+      if (!std::isfinite(storage.host_output[batch_index])) {
+        throw std::domain_error(
+            "the tree HMM has a nonpositive partition function");
+      }
+    }
+  }
 
   float upload_ms = 0.0f;
   float kernel_ms = 0.0f;
@@ -1468,10 +1888,10 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
                    UploadInputs upload_inputs,
                    InitializeNodeData initialize_node_data) {
   const auto wall_start = Clock::now();
-  if (!storage.bidirectional || storage.plan != &plan ||
-      storage.states != states || batch == 0 || batch > storage.batch) {
+  if (!storage.maximum || storage.plan != &plan || storage.states != states ||
+      batch == 0 || batch > storage.batch) {
     throw std::invalid_argument(
-        "prepared CUDA MAP inference requires a bidirectional workspace for "
+        "prepared CUDA MAP inference requires ReserveMaximum for "
         "this plan, state count, and batch capacity");
   }
   Check(cudaSetDevice(storage.device), "cudaSetDevice");
@@ -1653,7 +2073,8 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
 }
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
-                            Workspace::Impl &storage, bool scaled) {
+                            Workspace::Impl &storage, bool scaled,
+                            std::span<const float> uniforms = {}) {
   if (storage.categorical)
     throw std::invalid_argument(
         "dense CUDA inference cannot use a categorical workspace");
@@ -1663,7 +2084,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     throw std::invalid_argument("CUDA node input shape is wrong");
   return RunPrepared(
       model.plan, model.states, model.batch, model.edge_potentials, storage,
-      scaled,
+      scaled, uniforms,
       [&] {
         if (model.node_potentials.data() != storage.host_nodes) {
           std::memcpy(storage.host_nodes, model.node_potentials.data(),
@@ -1687,7 +2108,8 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
 }
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
-                            Workspace::Impl &storage, bool scaled) {
+                            Workspace::Impl &storage, bool scaled,
+                            std::span<const float> uniforms = {}) {
   if (!storage.categorical || model.categories != storage.categories ||
       model.observation_nodes.size() != storage.observation_nodes.size() ||
       !std::equal(model.observation_nodes.begin(),
@@ -1708,7 +2130,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
   }
   return RunPrepared(
       model.plan, model.states, model.batch, model.edge_potentials, storage,
-      scaled,
+      scaled, uniforms,
       [&] {
         if (model.observations.data() != storage.host_observations) {
           std::memcpy(storage.host_observations, model.observations.data(),
@@ -1921,6 +2343,26 @@ tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
                            Workspace &workspace) {
   return RunMaximum(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
+                        std::span<const float> uniforms, Workspace &workspace) {
+  const tree_hmm::PartitionView result =
+      Run(model, *workspace.impl_, true, uniforms);
+  return {
+      {workspace.impl_->host_assignments, model.batch * model.plan.num_nodes()},
+      result.timings};
+}
+
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
+                        std::span<const float> uniforms, Workspace &workspace) {
+  const tree_hmm::PartitionView result =
+      Run(model, *workspace.impl_, true, uniforms);
+  return {
+      {workspace.impl_->host_assignments, model.batch * model.plan.num_nodes()},
+      result.timings};
 }
 
 } // namespace tree_hmm::cuda

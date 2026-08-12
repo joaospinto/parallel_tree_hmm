@@ -89,6 +89,12 @@ public:
     initialize_nodes_ = Pipeline(library, @"initialize_nodes");
     initialize_paths_ = Pipeline(library, @"initialize_paths");
     take_logs_ = Pipeline(library, @"take_logs");
+    save_rake_tapes_ = Pipeline(library, @"save_rake_tapes");
+    save_compression_tapes_ = Pipeline(library, @"save_compression_tapes");
+    seed_root_samples_ = Pipeline(library, @"seed_root_samples");
+    expand_sample_rakes_ = Pipeline(library, @"expand_sample_rakes");
+    expand_sample_compressions_ =
+        Pipeline(library, @"expand_sample_compressions");
     maximum_rake_ = Pipeline(library, @"maximum_rake");
     maximum_combine_ = Pipeline(library, @"maximum_combine_branches");
     maximum_absorb_ = Pipeline(library, @"maximum_absorb_branches");
@@ -122,6 +128,21 @@ public:
     return initialize_paths_;
   }
   id<MTLComputePipelineState> take_logs() const { return take_logs_; }
+  id<MTLComputePipelineState> save_rake_tapes() const {
+    return save_rake_tapes_;
+  }
+  id<MTLComputePipelineState> save_compression_tapes() const {
+    return save_compression_tapes_;
+  }
+  id<MTLComputePipelineState> seed_root_samples() const {
+    return seed_root_samples_;
+  }
+  id<MTLComputePipelineState> expand_sample_rakes() const {
+    return expand_sample_rakes_;
+  }
+  id<MTLComputePipelineState> expand_sample_compressions() const {
+    return expand_sample_compressions_;
+  }
   id<MTLComputePipelineState> maximum_rake() const { return maximum_rake_; }
   id<MTLComputePipelineState> maximum_combine() const {
     return maximum_combine_;
@@ -170,6 +191,11 @@ private:
   id<MTLComputePipelineState> initialize_nodes_;
   id<MTLComputePipelineState> initialize_paths_;
   id<MTLComputePipelineState> take_logs_;
+  id<MTLComputePipelineState> save_rake_tapes_;
+  id<MTLComputePipelineState> save_compression_tapes_;
+  id<MTLComputePipelineState> seed_root_samples_;
+  id<MTLComputePipelineState> expand_sample_rakes_;
+  id<MTLComputePipelineState> expand_sample_compressions_;
   id<MTLComputePipelineState> maximum_rake_;
   id<MTLComputePipelineState> maximum_combine_;
   id<MTLComputePipelineState> maximum_absorb_;
@@ -242,7 +268,14 @@ struct Workspace::Impl {
   id<MTLBuffer> rake_choices;
   id<MTLBuffer> compression_choices;
   id<MTLBuffer> assignments;
-  bool bidirectional = false;
+  id<MTLBuffer> uniforms;
+  id<MTLBuffer> rake_path_tape;
+  id<MTLBuffer> rake_leaf_tape;
+  id<MTLBuffer> compression_left_tape;
+  id<MTLBuffer> compression_middle_tape;
+  id<MTLBuffer> compression_right_tape;
+  bool maximum = false;
+  bool sum_product = false;
 };
 
 bool Available() {
@@ -299,7 +332,14 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
     storage.rake_choices = nil;
     storage.compression_choices = nil;
     storage.assignments = nil;
-    storage.bidirectional = false;
+    storage.uniforms = nil;
+    storage.rake_path_tape = nil;
+    storage.rake_leaf_tape = nil;
+    storage.compression_left_tape = nil;
+    storage.compression_middle_tape = nil;
+    storage.compression_right_tape = nil;
+    storage.maximum = false;
+    storage.sum_product = false;
 
     storage.rakes = MakeDataBuffer(runtime.device(), plan.rakes());
     storage.combinations =
@@ -349,8 +389,8 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
   }
 }
 
-void Workspace::ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
-                                     std::size_t batch) {
+void Workspace::ReserveMaximum(const btrc::Plan &plan, std::size_t states,
+                               std::size_t batch) {
   Reserve(plan, states, batch);
   @autoreleasepool {
     Impl &storage = *impl_;
@@ -368,7 +408,46 @@ void Workspace::ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
         runtime.device(),
         CheckedProduct({batch, plan.num_nodes(), sizeof(std::uint32_t)},
                        "Metal assignment workspace"));
-    storage.bidirectional = true;
+    storage.maximum = true;
+  }
+}
+
+void Workspace::ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+                                  std::size_t batch) {
+  Reserve(plan, states, batch);
+  @autoreleasepool {
+    Impl &storage = *impl_;
+    Runtime &runtime = Runtime::Get();
+    const std::size_t matrix_size = CheckedProduct({states, states}, "matrix");
+    storage.assignments = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({batch, plan.num_nodes(), sizeof(std::uint32_t)},
+                       "Metal assignment workspace"));
+    storage.uniforms =
+        MakeBuffer(runtime.device(),
+                   CheckedProduct({batch, plan.num_nodes(), sizeof(float)},
+                                  "Metal posterior uniforms"));
+    storage.rake_path_tape = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({batch, plan.num_branches(), matrix_size, sizeof(float)},
+                       "Metal rake matrix tape"));
+    storage.rake_leaf_tape = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({batch, plan.num_branches(), states, sizeof(float)},
+                       "Metal rake vector tape"));
+    storage.compression_left_tape = MakeBuffer(
+        runtime.device(), CheckedProduct({batch, plan.num_compressions(),
+                                          matrix_size, sizeof(float)},
+                                         "Metal compression-left tape"));
+    storage.compression_middle_tape = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({batch, plan.num_compressions(), states, sizeof(float)},
+                       "Metal compression-middle tape"));
+    storage.compression_right_tape = MakeBuffer(
+        runtime.device(), CheckedProduct({batch, plan.num_compressions(),
+                                          matrix_size, sizeof(float)},
+                                         "Metal compression-right tape"));
+    storage.sum_product = true;
   }
 }
 
@@ -398,10 +477,29 @@ tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
   }
 }
 
+std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
+
+std::span<float> Workspace::Uniforms(std::size_t batch) {
+  @autoreleasepool {
+    Impl &storage = *impl_;
+    if (!storage.sum_product) {
+      throw std::logic_error(
+          "Metal Workspace::ReserveSumProduct must precede Uniforms");
+    }
+    if (batch == 0 || batch > storage.batch)
+      throw std::invalid_argument(
+          "Metal uniform batch exceeds the reserved capacity");
+    return {static_cast<float *>(storage.uniforms.contents),
+            CheckedProduct({batch, storage.plan->num_nodes()},
+                           "Metal posterior uniforms")};
+  }
+}
+
 namespace {
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
-                            Workspace::Impl &storage, bool scaled) {
+                            Workspace::Impl &storage, bool scaled,
+                            std::span<const float> uniforms = {}) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (storage.plan != &model.plan || storage.states != model.states ||
@@ -421,6 +519,21 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
       throw std::invalid_argument(
           "Metal input shapes do not match the workspace");
     }
+    const bool sampling = !uniforms.empty();
+    const std::size_t assignment_count = CheckedProduct(
+        {model.batch, model.plan.num_nodes()}, "Metal posterior assignments");
+    if (sampling &&
+        (!storage.sum_product || uniforms.size() != assignment_count)) {
+      throw std::invalid_argument(
+          "prepared Metal posterior sampling requires ReserveSumProduct and "
+          "one uniform variate per batch item and node");
+    }
+    for (const float uniform : uniforms) {
+      if (!std::isfinite(uniform) || uniform < 0.0f || uniform >= 1.0f) {
+        throw std::invalid_argument(
+            "posterior-sampling variates must lie in [0, 1)");
+      }
+    }
 
     const auto upload_start = Clock::now();
     if (model.node_potentials.data() != storage.input_nodes.contents) {
@@ -430,6 +543,10 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     if (model.edge_potentials.data() != storage.input_edges.contents) {
       std::memcpy(storage.input_edges.contents, model.edge_potentials.data(),
                   model.edge_potentials.size_bytes());
+    }
+    if (sampling && uniforms.data() != storage.uniforms.contents) {
+      std::memcpy(storage.uniforms.contents, uniforms.data(),
+                  uniforms.size_bytes());
     }
     const auto upload_end = Clock::now();
 
@@ -503,6 +620,34 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
       Params params = base_params;
       params.operation_offset = primitive_batch.offset;
       params.operation_count = primitive_batch.count;
+      if (sampling && primitive_batch.primitive == btrc::Primitive::kRake) {
+        [encoder setComputePipelineState:runtime.save_rake_tapes()];
+        [encoder setBuffer:storage.rakes offset:0 atIndex:0];
+        [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+        [encoder setBuffer:storage.paths offset:0 atIndex:2];
+        [encoder setBuffer:storage.rake_path_tape offset:0 atIndex:3];
+        [encoder setBuffer:storage.rake_leaf_tape offset:0 atIndex:4];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+        DispatchOneDimensional(
+            encoder, runtime.save_rake_tapes(),
+            CheckedProduct({model.batch, primitive_batch.count},
+                           "Metal rake-tape saves"));
+      }
+      if (sampling &&
+          primitive_batch.primitive == btrc::Primitive::kCompression) {
+        [encoder setComputePipelineState:runtime.save_compression_tapes()];
+        [encoder setBuffer:storage.compressions offset:0 atIndex:0];
+        [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+        [encoder setBuffer:storage.paths offset:0 atIndex:2];
+        [encoder setBuffer:storage.compression_left_tape offset:0 atIndex:3];
+        [encoder setBuffer:storage.compression_middle_tape offset:0 atIndex:4];
+        [encoder setBuffer:storage.compression_right_tape offset:0 atIndex:5];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:6];
+        DispatchOneDimensional(
+            encoder, runtime.save_compression_tapes(),
+            CheckedProduct({model.batch, primitive_batch.count},
+                           "Metal compression-tape saves"));
+      }
       switch (primitive_batch.primitive) {
       case btrc::Primitive::kRake: {
         const bool serial = model.states <= 8;
@@ -613,6 +758,57 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     [encoder setBuffer:storage.output offset:0 atIndex:2];
     [encoder setBytes:&base_params length:sizeof(Params) atIndex:3];
     DispatchOneDimensional(encoder, runtime.finish_root(), model.batch);
+    if (sampling) {
+      [encoder setComputePipelineState:runtime.seed_root_samples()];
+      [encoder setBuffer:storage.nodes offset:0 atIndex:0];
+      [encoder setBuffer:storage.uniforms offset:0 atIndex:1];
+      [encoder setBuffer:storage.assignments offset:0 atIndex:2];
+      [encoder setBytes:&base_params length:sizeof(Params) atIndex:3];
+      DispatchOneDimensional(encoder, runtime.seed_root_samples(), model.batch);
+      for (std::size_t index = model.plan.primitive_batches().size();
+           index-- > 0;) {
+        const btrc::PrimitiveBatch &primitive_batch =
+            model.plan.primitive_batches()[index];
+        Params params = base_params;
+        params.operation_offset = primitive_batch.offset;
+        params.operation_count = primitive_batch.count;
+        switch (primitive_batch.primitive) {
+        case btrc::Primitive::kRake:
+          [encoder setComputePipelineState:runtime.expand_sample_rakes()];
+          [encoder setBuffer:storage.rakes offset:0 atIndex:0];
+          [encoder setBuffer:storage.rake_path_tape offset:0 atIndex:1];
+          [encoder setBuffer:storage.rake_leaf_tape offset:0 atIndex:2];
+          [encoder setBuffer:storage.uniforms offset:0 atIndex:3];
+          [encoder setBuffer:storage.assignments offset:0 atIndex:4];
+          [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+          DispatchOneDimensional(
+              encoder, runtime.expand_sample_rakes(),
+              CheckedProduct({model.batch, primitive_batch.count},
+                             "Metal posterior rake expansion"));
+          break;
+        case btrc::Primitive::kCompression:
+          [encoder
+              setComputePipelineState:runtime.expand_sample_compressions()];
+          [encoder setBuffer:storage.compressions offset:0 atIndex:0];
+          [encoder setBuffer:storage.compression_left_tape offset:0 atIndex:1];
+          [encoder setBuffer:storage.compression_middle_tape
+                      offset:0
+                     atIndex:2];
+          [encoder setBuffer:storage.compression_right_tape offset:0 atIndex:3];
+          [encoder setBuffer:storage.uniforms offset:0 atIndex:4];
+          [encoder setBuffer:storage.assignments offset:0 atIndex:5];
+          [encoder setBytes:&params length:sizeof(Params) atIndex:6];
+          DispatchOneDimensional(
+              encoder, runtime.expand_sample_compressions(),
+              CheckedProduct({model.batch, primitive_batch.count},
+                             "Metal posterior compression expansion"));
+          break;
+        case btrc::Primitive::kBranchCombination:
+        case btrc::Primitive::kBranchAbsorption:
+          break;
+        }
+      }
+    }
     [encoder endEncoding];
 
     [command commit];
@@ -631,6 +827,14 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     const double kernel_ms =
         1000.0 * (command.GPUEndTime - command.GPUStartTime);
     const auto *output = static_cast<const float *>(storage.output.contents);
+    if (sampling) {
+      for (std::size_t batch = 0; batch < model.batch; ++batch) {
+        if (!std::isfinite(output[batch])) {
+          throw std::domain_error(
+              "the tree HMM has a nonpositive partition function");
+        }
+      }
+    }
     return {{output, model.batch}, {upload_ms, kernel_ms, 0.0, wall_ms}};
   }
 }
@@ -639,11 +843,11 @@ tree_hmm::BatchedMaximumAssignmentView
 RunMaximum(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
-    if (!storage.bidirectional || storage.plan != &model.plan ||
+    if (!storage.maximum || storage.plan != &model.plan ||
         storage.states != model.states || model.batch == 0 ||
         model.batch > storage.batch) {
       throw std::invalid_argument(
-          "prepared Metal MAP inference requires ReserveBidirectional for "
+          "prepared Metal MAP inference requires ReserveMaximum for "
           "this plan, state count, and batch capacity");
     }
     const std::size_t expected_nodes =
@@ -875,6 +1079,16 @@ tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace) {
   return RunMaximum(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
+                        std::span<const float> uniforms, Workspace &workspace) {
+  const tree_hmm::PartitionView result =
+      Run(model, *workspace.impl_, true, uniforms);
+  const auto *assignments =
+      static_cast<const std::uint32_t *>(workspace.impl_->assignments.contents);
+  return {{assignments, model.batch * model.plan.num_nodes()}, result.timings};
 }
 
 } // namespace tree_hmm::metal

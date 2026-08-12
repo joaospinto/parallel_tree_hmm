@@ -27,13 +27,17 @@ public:
   // allocate nothing.
   void Reserve(const btrc::Plan &plan, std::size_t states,
                std::size_t batch_capacity);
-  void ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
-                            std::size_t batch_capacity);
+  void ReserveMaximum(const btrc::Plan &plan, std::size_t states,
+                      std::size_t batch_capacity);
+  void ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+                         std::size_t batch_capacity);
 
   // Returns shared host/device storage owned by this workspace. Preparing
   // factors directly into it eliminates an otherwise redundant copy.
   tree_hmm::MutableBatchedModelView Inputs();
   tree_hmm::MutableBatchedModelView Inputs(std::size_t batch);
+  std::span<float> Uniforms();
+  std::span<float> Uniforms(std::size_t batch);
 
 private:
   friend tree_hmm::PartitionView
@@ -42,6 +46,9 @@ private:
   LogPartitionFunctionPrepared(tree_hmm::BatchedModelView, Workspace &);
   friend tree_hmm::BatchedMaximumAssignmentView
   MaximumAPosterioriPrepared(tree_hmm::BatchedModelView, Workspace &);
+  friend tree_hmm::BatchedPosteriorSampleView
+  PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const float>,
+                          Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -54,6 +61,9 @@ LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace);
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
+                        std::span<const float> uniforms, Workspace &workspace);
 
 } // namespace tree_hmm::metal
 

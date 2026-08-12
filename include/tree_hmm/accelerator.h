@@ -105,6 +105,13 @@ struct BatchedMaximumAssignmentView {
   AcceleratorTimings timings;
 };
 
+// One posterior draw per batch item. States have shape [batch, node] and are
+// owned by the backend workspace.
+struct BatchedPosteriorSampleView {
+  std::span<const std::uint32_t> states;
+  AcceleratorTimings timings;
+};
+
 } // namespace tree_hmm
 
 #endif // TREE_HMM_ACCELERATOR_H_
