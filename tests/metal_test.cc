@@ -4,6 +4,7 @@
 
 int main() {
   tree_hmm::metal::Workspace workspace;
+  tree_hmm::metal::Workspace dense_workspace;
   TestAccelerator(
       "Metal", tree_hmm::metal::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
@@ -15,6 +16,47 @@ int main() {
       },
       [&](tree_hmm::BatchedModelView model) {
         return tree_hmm::metal::LogPartitionFunctionPrepared(model, workspace);
+      });
+  TestCategoricalAccelerator(
+      "Metal", tree_hmm::metal::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategoricalMaximum(plan, states, batch, categories,
+                                            observation_nodes);
+      },
+      [&](std::size_t batch) { return workspace.CategoricalInputs(batch); },
+      [&](tree_hmm::BatchedCategoricalModelView model) {
+        return tree_hmm::metal::LogPartitionFunctionPrepared(model, workspace);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model) {
+        return tree_hmm::metal::MaximumAPosterioriPrepared(model, workspace);
+      },
+      [&](tree_hmm::BatchedModelView model) {
+        dense_workspace.Reserve(model.plan, model.states, model.batch);
+        return tree_hmm::metal::LogPartitionFunctionPrepared(model,
+                                                             dense_workspace);
+      },
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategoricalSampling(plan, states, batch, categories,
+                                             observation_nodes);
+      },
+      [&](std::size_t batch) { return workspace.Uniforms(batch); },
+      [&](tree_hmm::BatchedCategoricalModelView model,
+          std::span<const float> uniforms) {
+        return tree_hmm::metal::PosteriorSamplePrepared(model, uniforms,
+                                                        workspace);
+      },
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategoricalMarginals(plan, states, batch, categories,
+                                              observation_nodes);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model) {
+        return tree_hmm::metal::PosteriorMarginalsPrepared(model, workspace);
       });
   TestMaximumAccelerator(
       "Metal", tree_hmm::metal::Available(),

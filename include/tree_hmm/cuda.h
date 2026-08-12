@@ -23,9 +23,10 @@ public:
   Workspace(const Workspace &) = delete;
   Workspace &operator=(const Workspace &) = delete;
 
-  // Allocates device and pinned-host storage for up to batch_capacity items
-  // and uploads the topology plan. Repeated prepared calls do not allocate
-  // memory or rebuild the plan.
+  // Allocates device and pinned-host numerical storage for up to
+  // batch_capacity items and uploads the topology plan. Repeated prepared
+  // calls allocate no numerical workspace storage and do not rebuild the
+  // plan.
   void Reserve(const btrc::Plan &plan, std::size_t states,
                std::size_t batch_capacity, int device = 0);
 

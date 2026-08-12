@@ -3,10 +3,10 @@
 Discrete sum-product and posterior inference on arbitrary hidden Markov trees.
 This repository owns the numerical algebras and public inference API; topology
 planning and traversal come from the separate
-[`bidirectional_tree_rake_compress`](../bidirectional_tree_rake_compress)
+[`bidirectional_tree_rake_compress`](https://github.com/joaospinto/bidirectional_tree_rake_compress)
 package.
 
-The first vertical slice provides:
+The package provides:
 
 - a dense finite-state model with node and directed-edge potentials;
 - a sum-product contraction for the partition function;
@@ -31,14 +31,14 @@ inference. Contraction records the local conditional data required for
 reconstruction, and reverse traversal restores all eliminated states in
 dependency order. CPU prepared calls return workspace-backed views and allocate
 no memory. The CUDA and Metal APIs provide the same marginal, MAP, and
-posterior-sampling behavior for batches. Operation-specific workspace
-reservations own only the choice tapes, conditional-factor tapes, or reverse
-adjoints required by the requested result, so likelihood-only workspaces do not
-pay recovery storage costs. Posterior sampling accepts one `U[0,1)` variate per
-node so random-number generation remains external, reproducible, and
-independent of execution order. Posterior-marginal calls return workspace-backed
-batch-major node and edge probabilities together with one log partition
-function per batch item.
+posterior-sampling behavior for batches. Accelerator operation-specific
+workspace reservations own only the choice tapes, conditional-factor tapes, or
+reverse adjoints required by the requested result, so likelihood-only
+accelerator workspaces do not pay recovery storage costs. Posterior sampling
+accepts one `U[0,1)` variate per node so random-number generation remains
+external, reproducible, and independent of execution order. Posterior-marginal
+calls return workspace-backed batch-major node and edge probabilities together
+with one log partition function per batch item.
 
 CUDA and Metal pack independent operations into full threadgroups for small
 state spaces, with a generic-state fallback. Each accelerator workspace also
@@ -46,12 +46,15 @@ exposes a mutable model view through `Inputs()`. Applications can prepare
 factors directly in the workspace's pinned CUDA storage or shared Metal
 storage, then pass the resulting ordinary `BatchedModelView` to the same
 inference call. This avoids a full-batch staging copy without introducing a
-separate numerical path.
+separate numerical path. Both backends also expose `CategoricalInputs()` for
+models in which selected nodes carry byte-valued observations. Those inputs
+remain compact: an initialization kernel combines the observations with a
+shared emission table directly in the inference workspace instead of
+materializing a batch of dense node factors on the host.
 
 The CUDA device algebra is exercised on every host build by an emulation test.
 Real CUDA compilation, launch semantics, and performance still require an
 NVIDIA system. The Metal kernels are compiled and tested directly on macOS.
-Language bindings are a later milestone.
 
 ## Build
 

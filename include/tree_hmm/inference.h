@@ -81,7 +81,8 @@ MaximumAssignment Materialize(MaximumAssignmentView view);
 
 // uniforms contains one independent U[0,1) variate per original node. Keeping
 // random-number generation outside the inference algebra makes sampling
-// reproducible and permits allocation-free CPU or accelerator execution.
+// reproducible and avoids allocating random-number-generator state within
+// CPU or accelerator inference.
 std::span<const std::size_t>
 PosteriorSamplePrepared(ModelView model, std::span<const double> uniforms,
                         Workspace &workspace);

@@ -194,6 +194,36 @@ kernel void initialize_nodes(
   }
 }
 
+kernel void initialize_categorical_nodes(
+    device const uchar *observations [[buffer(0)]],
+    device const uint *observation_index_by_node [[buffer(1)]],
+    device const float *root_potential [[buffer(2)]],
+    device const float *emission_potentials [[buffer(3)]],
+    device float *nodes [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    constant uint &observation_count [[buffer(6)]],
+    constant uint &categories [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.nodes * p.batch;
+  if (index >= count)
+    return;
+  const uint batch = index % p.batch;
+  const uint node = index / p.batch;
+  const uint observation = observation_index_by_node[node];
+  const bool observed = observation != UINT_MAX;
+  const uchar category =
+      observed ? observations[batch * observation_count + observation] : 0;
+  for (uint state = 0; state < p.states; ++state) {
+    const float base = node == p.root ? root_potential[state] : 1.0f;
+    const float emission =
+        !observed ? 1.0f
+                  : category < categories
+                        ? emission_potentials[uint(category) * p.states + state]
+                        : 0.0f;
+    nodes[node_index(p, batch, node, state)] = base * emission;
+  }
+}
+
 kernel void initialize_paths(
     device const float *input [[buffer(0)]],
     device float *paths [[buffer(1)]],
