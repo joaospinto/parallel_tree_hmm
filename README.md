@@ -15,7 +15,8 @@ The first vertical slice provides:
 - log-domain max-product contraction followed by MAP-state reconstruction;
 - exact posterior sampling from caller-supplied uniform variates;
 - stable scaled log-partition evaluation for long trees;
-- batched Metal and CUDA likelihood backends sharing one accelerator API;
+- batched Metal and CUDA likelihood and MAP-reconstruction backends sharing
+  one accelerator API;
 - brute-force, device-emulation, and accelerator cross-validation.
 
 The CPU implementation uses nonnegative double-precision factors. Likelihoods
@@ -25,12 +26,15 @@ scale propagation attached to every intermediate node, edge, and branch
 factor. Prepared CPU and accelerator APIs allocate all problem storage in
 `Workspace::Reserve`; repeated numerical calls reuse it.
 
-MAP assignments and posterior samples use the same topology plan as
-sum-product inference. Contraction records the local conditional data required
-for reconstruction, and `btrc::Expand` restores all eliminated states in
-reverse dependency order. The prepared calls return workspace-backed views and
-allocate no memory. Posterior sampling accepts one `U[0,1)` variate per node so
-random-number generation remains external, reproducible, and independent of
+MAP assignments and posterior samples use the same topology plan as sum-product
+inference. Contraction records the local conditional data required for
+reconstruction, and reverse traversal restores all eliminated states in
+dependency order. CPU prepared calls return workspace-backed views and allocate
+no memory. The CUDA and Metal MAP APIs provide the same behavior for batches;
+their explicitly bidirectional workspace reservations own the additional
+choice tapes and recovered assignments, so likelihood-only workspaces do not
+pay that storage cost. Posterior sampling accepts one `U[0,1)` variate per node
+so random-number generation remains external, reproducible, and independent of
 execution order.
 
 CUDA and Metal pack independent operations into full threadgroups for small
@@ -44,8 +48,8 @@ separate numerical path.
 The CUDA device algebra is exercised on every host build by an emulation test.
 Real CUDA compilation, launch semantics, and performance still require an
 NVIDIA system. The Metal kernels are compiled and tested directly on macOS.
-Accelerator marginals, accelerator reconstruction, and language bindings are
-later milestones.
+Accelerator marginals, posterior sampling, and language bindings are later
+milestones.
 
 ## Build
 

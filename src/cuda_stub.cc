@@ -27,6 +27,20 @@ void Workspace::ReserveCategorical(const btrc::Plan &, std::size_t, std::size_t,
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
+void Workspace::ReserveBidirectional(const btrc::Plan &, std::size_t,
+                                     std::size_t, int) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+void Workspace::ReserveCategoricalBidirectional(const btrc::Plan &, std::size_t,
+                                                std::size_t, std::size_t,
+                                                std::span<const btrc::Index>,
+                                                int) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
@@ -69,6 +83,18 @@ PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView,
                              Workspace &) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedModelView, Workspace &) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }

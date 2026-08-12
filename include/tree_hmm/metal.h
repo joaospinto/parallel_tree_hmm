@@ -27,6 +27,8 @@ public:
   // allocate nothing.
   void Reserve(const btrc::Plan &plan, std::size_t states,
                std::size_t batch_capacity);
+  void ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
+                            std::size_t batch_capacity);
 
   // Returns shared host/device storage owned by this workspace. Preparing
   // factors directly into it eliminates an otherwise redundant copy.
@@ -38,6 +40,8 @@ private:
   PartitionFunctionPrepared(tree_hmm::BatchedModelView, Workspace &);
   friend tree_hmm::PartitionView
   LogPartitionFunctionPrepared(tree_hmm::BatchedModelView, Workspace &);
+  friend tree_hmm::BatchedMaximumAssignmentView
+  MaximumAPosterioriPrepared(tree_hmm::BatchedModelView, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -47,6 +51,9 @@ PartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
                              Workspace &workspace);
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace);
 
 } // namespace tree_hmm::metal
 

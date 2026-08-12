@@ -96,6 +96,15 @@ struct PartitionView {
   AcceleratorTimings timings;
 };
 
+// One joint maximum-weight assignment per batch item. Log weights have shape
+// [batch], and states have shape [batch, node]. The spans are owned by the
+// backend workspace and follow the same lifetime rules as PartitionView.
+struct BatchedMaximumAssignmentView {
+  std::span<const float> log_weights;
+  std::span<const std::uint32_t> states;
+  AcceleratorTimings timings;
+};
+
 } // namespace tree_hmm
 
 #endif // TREE_HMM_ACCELERATOR_H_

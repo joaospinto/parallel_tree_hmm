@@ -4,6 +4,7 @@
 
 int main() {
   tree_hmm::cuda::Workspace workspace;
+  tree_hmm::cuda::Workspace dense_workspace;
   TestAccelerator(
       "CUDA", tree_hmm::cuda::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
@@ -21,11 +22,28 @@ int main() {
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
           std::size_t categories,
           std::span<const btrc::Index> observation_nodes) {
-        workspace.ReserveCategorical(plan, states, batch, categories,
-                                     observation_nodes);
+        workspace.ReserveCategoricalBidirectional(
+            plan, states, batch, categories, observation_nodes);
       },
       [&](std::size_t batch) { return workspace.CategoricalInputs(batch); },
       [&](tree_hmm::BatchedCategoricalModelView model) {
         return tree_hmm::cuda::LogPartitionFunctionPrepared(model, workspace);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model) {
+        return tree_hmm::cuda::MaximumAPosterioriPrepared(model, workspace);
+      },
+      [&](tree_hmm::BatchedModelView model) {
+        dense_workspace.Reserve(model.plan, model.states, model.batch);
+        return tree_hmm::cuda::LogPartitionFunctionPrepared(model,
+                                                            dense_workspace);
+      });
+  TestMaximumAccelerator(
+      "CUDA", tree_hmm::cuda::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
+        workspace.ReserveBidirectional(plan, states, batch);
+      },
+      [&](std::size_t batch) { return workspace.Inputs(batch); },
+      [&](tree_hmm::BatchedModelView model) {
+        return tree_hmm::cuda::MaximumAPosterioriPrepared(model, workspace);
       });
 }

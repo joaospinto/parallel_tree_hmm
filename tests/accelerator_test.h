@@ -226,10 +226,12 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   }
 }
 
-template <class Reserve, class Inputs, class SolveLog>
+template <class Reserve, class Inputs, class SolveLog, class SolveMaximum,
+          class SolveDense>
 void TestCategoricalAccelerator(const char *name, bool available,
                                 Reserve reserve, Inputs inputs,
-                                SolveLog solve_log) {
+                                SolveLog solve_log, SolveMaximum solve_maximum,
+                                SolveDense solve_dense) {
   if (!available)
     return;
   const btrc::Plan plan =
@@ -276,6 +278,28 @@ void TestCategoricalAccelerator(const char *name, bool available,
   std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
   const tree_hmm::PartitionView result =
       solve_log(static_cast<tree_hmm::BatchedCategoricalModelView>(staged));
+  const std::vector<float> log_values(result.values.begin(),
+                                      result.values.end());
+  const tree_hmm::BatchedMaximumAssignmentView maximum =
+      solve_maximum(static_cast<tree_hmm::BatchedCategoricalModelView>(staged));
+  std::vector<float> dense_nodes(kBatch * plan.num_nodes() * kStates, 1.0f);
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    std::copy(root_potential.begin(), root_potential.end(),
+              dense_nodes.begin() + batch * plan.num_nodes() * kStates);
+    for (std::size_t observation = 0; observation < observation_nodes.size();
+         ++observation) {
+      const std::uint8_t category =
+          observations[batch * observation_nodes.size() + observation];
+      for (std::size_t state = 0; state < kStates; ++state) {
+        dense_nodes[(batch * plan.num_nodes() +
+                     observation_nodes[observation]) *
+                        kStates +
+                    state] *= emissions[category * kStates + state];
+      }
+    }
+  }
+  const tree_hmm::PartitionView dense =
+      solve_dense({plan, kStates, kBatch, dense_nodes, edges});
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
     std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
@@ -291,11 +315,30 @@ void TestCategoricalAccelerator(const char *name, bool available,
     const std::vector<double> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::LogPartitionFunction({plan, kStates, nodes, host_edges});
-    const double actual = result.values[batch];
+    const double actual = log_values[batch];
     if (std::abs(actual - expected) >
         5e-5 * std::max({1.0, std::abs(actual), std::abs(expected)})) {
       throw std::runtime_error(std::string(name) +
                                " categorical inference disagrees with CPU");
+    }
+    if (dense.values[batch] != log_values[batch]) {
+      throw std::runtime_error(std::string(name) +
+                               " categorical and dense inference differ");
+    }
+    const tree_hmm::MaximumAssignment expected_maximum =
+        tree_hmm::MaximumAPosteriori({plan, kStates, nodes, host_edges});
+    if (std::abs(maximum.log_weights[batch] - expected_maximum.log_weight) >
+        2e-5) {
+      throw std::runtime_error(std::string(name) +
+                               " categorical MAP weight disagrees with CPU");
+    }
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      if (maximum.states[batch * plan.num_nodes() + node] !=
+          expected_maximum.states[node]) {
+        throw std::runtime_error(
+            std::string(name) +
+            " categorical MAP assignment disagrees with CPU");
+      }
     }
   }
 
@@ -304,6 +347,68 @@ void TestCategoricalAccelerator(const char *name, bool available,
   if (tail.observations.size() != kTailBatch * observation_nodes.size()) {
     throw std::runtime_error(std::string(name) +
                              " categorical tail shape is wrong");
+  }
+}
+
+template <class Reserve, class Inputs, class Solve>
+void TestMaximumAccelerator(const char *name, bool available, Reserve reserve,
+                            Inputs inputs, Solve solve) {
+  if (!available)
+    return;
+  const btrc::Plan plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kBatch = 5;
+  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      for (std::size_t state = 0; state < kStates; ++state) {
+        nodes[(batch * plan.num_nodes() + node) * kStates + state] =
+            0.11f +
+            0.013f * static_cast<float>(1 + 3 * batch + 5 * node + state);
+      }
+    }
+  }
+  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    for (std::size_t parent = 0; parent < kStates; ++parent) {
+      for (std::size_t child = 0; child < kStates; ++child) {
+        edges[(edge * kStates + parent) * kStates + child] =
+            0.03f +
+            0.007f * static_cast<float>(1 + edge + 2 * parent + 3 * child);
+      }
+    }
+  }
+
+  reserve(plan, kStates, kBatch);
+  tree_hmm::MutableBatchedModelView staged = inputs(kBatch);
+  std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  const tree_hmm::BatchedMaximumAssignmentView actual =
+      solve(static_cast<tree_hmm::BatchedModelView>(staged));
+  if (actual.log_weights.size() != kBatch ||
+      actual.states.size() != kBatch * plan.num_nodes()) {
+    throw std::runtime_error(std::string(name) + " MAP output shape is wrong");
+  }
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    const std::size_t node_values = plan.num_nodes() * kStates;
+    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
+                                         nodes.begin() +
+                                             (batch + 1) * node_values);
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const tree_hmm::MaximumAssignment expected =
+        tree_hmm::MaximumAPosteriori({plan, kStates, host_nodes, host_edges});
+    if (std::abs(actual.log_weights[batch] - expected.log_weight) > 2e-5) {
+      throw std::runtime_error(std::string(name) +
+                               " MAP weight disagrees with CPU inference");
+    }
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      if (actual.states[batch * plan.num_nodes() + node] !=
+          expected.states[node]) {
+        throw std::runtime_error(
+            std::string(name) + " MAP assignment disagrees with CPU inference");
+      }
+    }
   }
 }
 

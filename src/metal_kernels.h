@@ -82,6 +82,26 @@ inline uint branch_scale_index(constant Params &p, uint batch, uint branch) {
   return branch * p.batch + batch;
 }
 
+inline uint assignment_index(constant Params &p, uint batch, uint node) {
+  return batch * p.nodes + node;
+}
+
+inline uint rake_choice_index(constant Params &p, uint batch, uint branch,
+                              uint parent_state) {
+  return (branch * p.batch + batch) * p.states + parent_state;
+}
+
+inline uint compression_choice_index(constant Params &p, uint batch,
+                                     uint tape, uint parent_state,
+                                     uint child_state) {
+  return ((tape * p.batch + batch) * p.states + parent_state) * p.states +
+         child_state;
+}
+
+inline float potential_log(float value) {
+  return value > 0.0f ? log(value) : -INFINITY;
+}
+
 kernel void initialize_nodes(
     device const float *input [[buffer(0)]],
     device float *nodes [[buffer(1)]],
@@ -131,6 +151,174 @@ kernel void initialize_paths(
   const uint source = edge * matrix_size;
   for (uint entry = 0; entry < matrix_size; ++entry)
     paths[destination + entry] = input[source + entry];
+}
+
+kernel void take_logs(device float *values [[buffer(0)]],
+                      constant uint &count [[buffer(1)]],
+                      uint index [[thread_position_in_grid]]) {
+  if (index < count)
+    values[index] = potential_log(values[index]);
+}
+
+kernel void maximum_rake(
+    device const Rake *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device const float *paths [[buffer(2)]],
+    device float *branches [[buffer(3)]],
+    device uint *choices [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const Rake op = operations[p.operation_offset + gid.y];
+  const uint node_base = node_index(p, gid.z, op.leaf, 0);
+  const uint path_base = path_index(p, gid.z, op.edge, 0, 0);
+  float best = paths[path_base + gid.x * p.states] + nodes[node_base];
+  uint choice = 0;
+  for (uint child_state = 1; child_state < p.states; ++child_state) {
+    const float candidate =
+        paths[path_base + gid.x * p.states + child_state] +
+        nodes[node_base + child_state];
+    if (candidate > best) {
+      best = candidate;
+      choice = child_state;
+    }
+  }
+  branches[branch_index(p, gid.z, op.branch, gid.x)] = best;
+  choices[rake_choice_index(p, gid.z, op.branch, gid.x)] = choice;
+}
+
+kernel void maximum_combine_branches(
+    device const BranchCombination *operations [[buffer(0)]],
+    device float *branches [[buffer(1)]],
+    constant Params &p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const BranchCombination op = operations[p.operation_offset + gid.y];
+  branches[branch_index(p, gid.z, op.destination, gid.x)] +=
+      branches[branch_index(p, gid.z, op.source, gid.x)];
+}
+
+kernel void maximum_absorb_branches(
+    device const BranchAbsorption *operations [[buffer(0)]],
+    device float *nodes [[buffer(1)]],
+    device const float *branches [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const BranchAbsorption op = operations[p.operation_offset + gid.y];
+  nodes[node_index(p, gid.z, op.parent, gid.x)] +=
+      branches[branch_index(p, gid.z, op.branch, gid.x)];
+}
+
+kernel void maximum_compress(
+    device const Compression *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device float *paths [[buffer(2)]],
+    device uint *choices [[buffer(3)]],
+    constant Params &p [[buffer(4)]],
+    threadgroup float *scratch [[threadgroup(0)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+  if (group.x >= p.operation_count || group.y >= p.batch)
+    return;
+  const Compression op = operations[p.operation_offset + group.x];
+  const uint matrix_size = p.states * p.states;
+  threadgroup float *left = scratch;
+  threadgroup float *middle = left + matrix_size;
+  threadgroup float *right = middle + p.states;
+  const uint left_base = path_index(p, group.y, op.left_edge, 0, 0);
+  const uint right_base = path_index(p, group.y, op.right_edge, 0, 0);
+  const uint middle_base = node_index(p, group.y, op.middle, 0);
+  if (thread_index < matrix_size) {
+    left[thread_index] = paths[left_base + thread_index];
+    right[thread_index] = paths[right_base + thread_index];
+  }
+  if (thread_index < p.states)
+    middle[thread_index] = nodes[middle_base + thread_index];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index >= matrix_size)
+    return;
+
+  const uint parent_state = thread_index / p.states;
+  const uint child_state = thread_index % p.states;
+  float best = left[parent_state * p.states] + middle[0] +
+               right[child_state];
+  uint choice = 0;
+  for (uint middle_state = 1; middle_state < p.states; ++middle_state) {
+    const float candidate =
+        left[parent_state * p.states + middle_state] + middle[middle_state] +
+        right[middle_state * p.states + child_state];
+    if (candidate > best) {
+      best = candidate;
+      choice = middle_state;
+    }
+  }
+  paths[left_base + thread_index] = best;
+  choices[compression_choice_index(p, group.y, op.tape, parent_state,
+                                   child_state)] = choice;
+}
+
+kernel void finish_maximum(
+    device const float *nodes [[buffer(0)]],
+    device float *log_weights [[buffer(1)]],
+    device uint *assignments [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint batch_index [[thread_position_in_grid]]) {
+  if (batch_index >= p.batch)
+    return;
+  const uint root_base = node_index(p, batch_index, p.root, 0);
+  float best = nodes[root_base];
+  uint choice = 0;
+  for (uint state = 1; state < p.states; ++state) {
+    if (nodes[root_base + state] > best) {
+      best = nodes[root_base + state];
+      choice = state;
+    }
+  }
+  log_weights[batch_index] = best;
+  assignments[assignment_index(p, batch_index, p.root)] = choice;
+}
+
+kernel void expand_maximum_rakes(
+    device const Rake *operations [[buffer(0)]],
+    device const uint *choices [[buffer(1)]],
+    device uint *assignments [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Rake op = operations[p.operation_offset + operation_index];
+  const uint parent_state =
+      assignments[assignment_index(p, batch_index, op.parent)];
+  assignments[assignment_index(p, batch_index, op.leaf)] =
+      choices[rake_choice_index(p, batch_index, op.branch, parent_state)];
+}
+
+kernel void expand_maximum_compressions(
+    device const Compression *operations [[buffer(0)]],
+    device const uint *choices [[buffer(1)]],
+    device uint *assignments [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint batch_index = index % p.batch;
+  const uint operation_index = index / p.batch;
+  const Compression op = operations[p.operation_offset + operation_index];
+  const uint parent_state =
+      assignments[assignment_index(p, batch_index, op.parent)];
+  const uint child_state =
+      assignments[assignment_index(p, batch_index, op.child)];
+  assignments[assignment_index(p, batch_index, op.middle)] =
+      choices[compression_choice_index(p, batch_index, op.tape, parent_state,
+                                       child_state)];
 }
 
 kernel void rake(

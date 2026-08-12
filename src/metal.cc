@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -87,6 +88,15 @@ public:
                                ErrorText(error));
     initialize_nodes_ = Pipeline(library, @"initialize_nodes");
     initialize_paths_ = Pipeline(library, @"initialize_paths");
+    take_logs_ = Pipeline(library, @"take_logs");
+    maximum_rake_ = Pipeline(library, @"maximum_rake");
+    maximum_combine_ = Pipeline(library, @"maximum_combine_branches");
+    maximum_absorb_ = Pipeline(library, @"maximum_absorb_branches");
+    maximum_compress_ = Pipeline(library, @"maximum_compress");
+    finish_maximum_ = Pipeline(library, @"finish_maximum");
+    expand_maximum_rakes_ = Pipeline(library, @"expand_maximum_rakes");
+    expand_maximum_compressions_ =
+        Pipeline(library, @"expand_maximum_compressions");
     rake_ = Pipeline(library, @"rake");
     rake_serial_ = Pipeline(library, @"rake_serial");
     combine_ = Pipeline(library, @"combine_branches");
@@ -110,6 +120,22 @@ public:
   }
   id<MTLComputePipelineState> initialize_paths() const {
     return initialize_paths_;
+  }
+  id<MTLComputePipelineState> take_logs() const { return take_logs_; }
+  id<MTLComputePipelineState> maximum_rake() const { return maximum_rake_; }
+  id<MTLComputePipelineState> maximum_combine() const {
+    return maximum_combine_;
+  }
+  id<MTLComputePipelineState> maximum_absorb() const { return maximum_absorb_; }
+  id<MTLComputePipelineState> maximum_compress() const {
+    return maximum_compress_;
+  }
+  id<MTLComputePipelineState> finish_maximum() const { return finish_maximum_; }
+  id<MTLComputePipelineState> expand_maximum_rakes() const {
+    return expand_maximum_rakes_;
+  }
+  id<MTLComputePipelineState> expand_maximum_compressions() const {
+    return expand_maximum_compressions_;
   }
   id<MTLComputePipelineState> rake() const { return rake_; }
   id<MTLComputePipelineState> rake_serial() const { return rake_serial_; }
@@ -143,6 +169,14 @@ private:
   id<MTLCommandQueue> queue_;
   id<MTLComputePipelineState> initialize_nodes_;
   id<MTLComputePipelineState> initialize_paths_;
+  id<MTLComputePipelineState> take_logs_;
+  id<MTLComputePipelineState> maximum_rake_;
+  id<MTLComputePipelineState> maximum_combine_;
+  id<MTLComputePipelineState> maximum_absorb_;
+  id<MTLComputePipelineState> maximum_compress_;
+  id<MTLComputePipelineState> finish_maximum_;
+  id<MTLComputePipelineState> expand_maximum_rakes_;
+  id<MTLComputePipelineState> expand_maximum_compressions_;
   id<MTLComputePipelineState> rake_;
   id<MTLComputePipelineState> rake_serial_;
   id<MTLComputePipelineState> combine_;
@@ -205,6 +239,10 @@ struct Workspace::Impl {
   id<MTLBuffer> path_scales;
   id<MTLBuffer> branch_scales;
   id<MTLBuffer> output;
+  id<MTLBuffer> rake_choices;
+  id<MTLBuffer> compression_choices;
+  id<MTLBuffer> assignments;
+  bool bidirectional = false;
 };
 
 bool Available() {
@@ -258,6 +296,10 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
         0,
         plan.num_compressions() == 0 ? 0U : 1U,
     };
+    storage.rake_choices = nil;
+    storage.compression_choices = nil;
+    storage.assignments = nil;
+    storage.bidirectional = false;
 
     storage.rakes = MakeDataBuffer(runtime.device(), plan.rakes());
     storage.combinations =
@@ -304,6 +346,29 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
     storage.output =
         MakeBuffer(runtime.device(),
                    CheckedProduct({batch, sizeof(float)}, "Metal output"));
+  }
+}
+
+void Workspace::ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
+                                     std::size_t batch) {
+  Reserve(plan, states, batch);
+  @autoreleasepool {
+    Impl &storage = *impl_;
+    Runtime &runtime = Runtime::Get();
+    storage.rake_choices = MakeBuffer(
+        runtime.device(), CheckedProduct({plan.num_branches(), batch, states,
+                                          sizeof(std::uint32_t)},
+                                         "Metal rake-choice tape"));
+    storage.compression_choices =
+        MakeBuffer(runtime.device(),
+                   CheckedProduct({plan.num_compressions(), batch, states,
+                                   states, sizeof(std::uint32_t)},
+                                  "Metal compression-choice tape"));
+    storage.assignments = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({batch, plan.num_nodes(), sizeof(std::uint32_t)},
+                       "Metal assignment workspace"));
+    storage.bidirectional = true;
   }
 }
 
@@ -570,6 +635,228 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   }
 }
 
+tree_hmm::BatchedMaximumAssignmentView
+RunMaximum(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
+  @autoreleasepool {
+    const auto wall_start = Clock::now();
+    if (!storage.bidirectional || storage.plan != &model.plan ||
+        storage.states != model.states || model.batch == 0 ||
+        model.batch > storage.batch) {
+      throw std::invalid_argument(
+          "prepared Metal MAP inference requires ReserveBidirectional for "
+          "this plan, state count, and batch capacity");
+    }
+    const std::size_t expected_nodes =
+        CheckedProduct({model.batch, model.plan.num_nodes(), model.states},
+                       "Metal node inputs");
+    const std::size_t expected_edges =
+        CheckedProduct({model.plan.num_edges(), model.states, model.states},
+                       "Metal edge inputs");
+    if (model.node_potentials.size() != expected_nodes ||
+        model.edge_potentials.size() != expected_edges) {
+      throw std::invalid_argument(
+          "Metal MAP input shapes do not match the workspace");
+    }
+
+    const auto upload_start = Clock::now();
+    if (model.node_potentials.data() != storage.input_nodes.contents) {
+      std::memcpy(storage.input_nodes.contents, model.node_potentials.data(),
+                  model.node_potentials.size_bytes());
+    }
+    if (model.edge_potentials.data() != storage.input_edges.contents) {
+      std::memcpy(storage.input_edges.contents, model.edge_potentials.data(),
+                  model.edge_potentials.size_bytes());
+    }
+    const auto upload_end = Clock::now();
+
+    Runtime &runtime = Runtime::Get();
+    id<MTLCommandBuffer> command = [runtime.queue() commandBuffer];
+    if (command == nil)
+      throw std::runtime_error("failed to create a Metal command buffer");
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    if (encoder == nil)
+      throw std::runtime_error("failed to create a Metal compute encoder");
+
+    Params base_params = storage.params;
+    base_params.batch = CheckedU32(model.batch, "batch count");
+    base_params.scaled = 0;
+    [encoder setComputePipelineState:runtime.initialize_nodes()];
+    [encoder setBuffer:storage.input_nodes offset:0 atIndex:0];
+    [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+    [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
+    constexpr NSUInteger kTransposeTile = 32;
+    constexpr NSUInteger kTransposeRows = 8;
+    [encoder setThreadgroupMemoryLength:kTransposeTile * (kTransposeTile + 1) *
+                                        sizeof(float)
+                                atIndex:0];
+    [encoder
+         dispatchThreadgroups:MTLSizeMake((model.plan.num_nodes() +
+                                           kTransposeTile - 1) /
+                                              kTransposeTile,
+                                          (model.batch + kTransposeTile - 1) /
+                                              kTransposeTile,
+                                          1)
+        threadsPerThreadgroup:MTLSizeMake(kTransposeTile, kTransposeRows, 1)];
+
+    [encoder setComputePipelineState:runtime.initialize_paths()];
+    [encoder setBuffer:storage.input_edges offset:0 atIndex:0];
+    [encoder setBuffer:storage.paths offset:0 atIndex:1];
+    [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
+    const std::size_t path_batches =
+        base_params.paths_batched ? model.batch : 1;
+    DispatchOneDimensional(
+        encoder, runtime.initialize_paths(),
+        CheckedProduct({path_batches, model.plan.num_edges()},
+                       "Metal path initialization"));
+
+    [encoder setComputePipelineState:runtime.take_logs()];
+    [encoder setBuffer:storage.nodes offset:0 atIndex:0];
+    std::uint32_t value_count = CheckedU32(
+        CheckedProduct({model.batch, model.plan.num_nodes(), model.states},
+                       "Metal log nodes"),
+        "Metal log node count");
+    [encoder setBytes:&value_count length:sizeof(value_count) atIndex:1];
+    DispatchOneDimensional(encoder, runtime.take_logs(), value_count);
+    [encoder setBuffer:storage.paths offset:0 atIndex:0];
+    value_count =
+        CheckedU32(CheckedProduct({path_batches, model.plan.num_edges(),
+                                   model.states, model.states},
+                                  "Metal log paths"),
+                   "Metal log path count");
+    [encoder setBytes:&value_count length:sizeof(value_count) atIndex:1];
+    DispatchOneDimensional(encoder, runtime.take_logs(), value_count);
+
+    for (const btrc::PrimitiveBatch &primitive_batch :
+         model.plan.primitive_batches()) {
+      Params params = base_params;
+      params.operation_offset = primitive_batch.offset;
+      params.operation_count = primitive_batch.count;
+      switch (primitive_batch.primitive) {
+      case btrc::Primitive::kRake:
+        [encoder setComputePipelineState:runtime.maximum_rake()];
+        [encoder setBuffer:storage.rakes offset:0 atIndex:0];
+        [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+        [encoder setBuffer:storage.paths offset:0 atIndex:2];
+        [encoder setBuffer:storage.branches offset:0 atIndex:3];
+        [encoder setBuffer:storage.rake_choices offset:0 atIndex:4];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+        [encoder dispatchThreads:MTLSizeMake(model.states,
+                                             primitive_batch.count, model.batch)
+            threadsPerThreadgroup:MTLSizeMake(model.states, 1, 1)];
+        break;
+      case btrc::Primitive::kBranchCombination:
+        [encoder setComputePipelineState:runtime.maximum_combine()];
+        [encoder setBuffer:storage.combinations offset:0 atIndex:0];
+        [encoder setBuffer:storage.branches offset:0 atIndex:1];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:2];
+        [encoder dispatchThreads:MTLSizeMake(model.states,
+                                             primitive_batch.count, model.batch)
+            threadsPerThreadgroup:MTLSizeMake(model.states, 1, 1)];
+        break;
+      case btrc::Primitive::kBranchAbsorption:
+        [encoder setComputePipelineState:runtime.maximum_absorb()];
+        [encoder setBuffer:storage.absorptions offset:0 atIndex:0];
+        [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+        [encoder setBuffer:storage.branches offset:0 atIndex:2];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:3];
+        [encoder dispatchThreads:MTLSizeMake(model.states,
+                                             primitive_batch.count, model.batch)
+            threadsPerThreadgroup:MTLSizeMake(model.states, 1, 1)];
+        break;
+      case btrc::Primitive::kCompression: {
+        [encoder setComputePipelineState:runtime.maximum_compress()];
+        [encoder setBuffer:storage.compressions offset:0 atIndex:0];
+        [encoder setBuffer:storage.nodes offset:0 atIndex:1];
+        [encoder setBuffer:storage.paths offset:0 atIndex:2];
+        [encoder setBuffer:storage.compression_choices offset:0 atIndex:3];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:4];
+        const std::size_t matrix = model.states * model.states;
+        [encoder setThreadgroupMemoryLength:(2 * matrix + model.states) *
+                                            sizeof(float)
+                                    atIndex:0];
+        [encoder dispatchThreadgroups:MTLSizeMake(primitive_batch.count,
+                                                  model.batch, 1)
+                threadsPerThreadgroup:MTLSizeMake(matrix, 1, 1)];
+        break;
+      }
+      }
+    }
+
+    [encoder setComputePipelineState:runtime.finish_maximum()];
+    [encoder setBuffer:storage.nodes offset:0 atIndex:0];
+    [encoder setBuffer:storage.output offset:0 atIndex:1];
+    [encoder setBuffer:storage.assignments offset:0 atIndex:2];
+    [encoder setBytes:&base_params length:sizeof(Params) atIndex:3];
+    DispatchOneDimensional(encoder, runtime.finish_maximum(), model.batch);
+
+    for (std::size_t index = model.plan.primitive_batches().size();
+         index-- > 0;) {
+      const btrc::PrimitiveBatch &primitive_batch =
+          model.plan.primitive_batches()[index];
+      Params params = base_params;
+      params.operation_offset = primitive_batch.offset;
+      params.operation_count = primitive_batch.count;
+      switch (primitive_batch.primitive) {
+      case btrc::Primitive::kRake:
+        [encoder setComputePipelineState:runtime.expand_maximum_rakes()];
+        [encoder setBuffer:storage.rakes offset:0 atIndex:0];
+        [encoder setBuffer:storage.rake_choices offset:0 atIndex:1];
+        [encoder setBuffer:storage.assignments offset:0 atIndex:2];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:3];
+        DispatchOneDimensional(
+            encoder, runtime.expand_maximum_rakes(),
+            CheckedProduct({model.batch, primitive_batch.count},
+                           "Metal MAP rake expansion"));
+        break;
+      case btrc::Primitive::kCompression:
+        [encoder setComputePipelineState:runtime.expand_maximum_compressions()];
+        [encoder setBuffer:storage.compressions offset:0 atIndex:0];
+        [encoder setBuffer:storage.compression_choices offset:0 atIndex:1];
+        [encoder setBuffer:storage.assignments offset:0 atIndex:2];
+        [encoder setBytes:&params length:sizeof(Params) atIndex:3];
+        DispatchOneDimensional(
+            encoder, runtime.expand_maximum_compressions(),
+            CheckedProduct({model.batch, primitive_batch.count},
+                           "Metal MAP compression expansion"));
+        break;
+      case btrc::Primitive::kBranchCombination:
+      case btrc::Primitive::kBranchAbsorption:
+        break;
+      }
+    }
+    [encoder endEncoding];
+
+    [command commit];
+    [command waitUntilCompleted];
+    if (command.status == MTLCommandBufferStatusError) {
+      throw std::runtime_error("Metal tree-HMM MAP execution failed: " +
+                               ErrorText(command.error));
+    }
+    const auto wall_end = Clock::now();
+    const auto *log_weights =
+        static_cast<const float *>(storage.output.contents);
+    for (std::size_t batch = 0; batch < model.batch; ++batch) {
+      if (!std::isfinite(log_weights[batch])) {
+        throw std::domain_error(
+            "the tree HMM has no positive-weight assignment");
+      }
+    }
+    const double upload_ms =
+        std::chrono::duration<double, std::milli>(upload_end - upload_start)
+            .count();
+    const double wall_ms =
+        std::chrono::duration<double, std::milli>(wall_end - wall_start)
+            .count();
+    const double kernel_ms =
+        1000.0 * (command.GPUEndTime - command.GPUStartTime);
+    const auto *assignments =
+        static_cast<const std::uint32_t *>(storage.assignments.contents);
+    return {{log_weights, model.batch},
+            {assignments, model.batch * model.plan.num_nodes()},
+            {upload_ms, kernel_ms, 0.0, wall_ms}};
+  }
+}
+
 } // namespace
 
 tree_hmm::PartitionView
@@ -582,6 +869,12 @@ tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
                              Workspace &workspace) {
   return Run(model, *workspace.impl_, true);
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace) {
+  return RunMaximum(model, *workspace.impl_);
 }
 
 } // namespace tree_hmm::metal

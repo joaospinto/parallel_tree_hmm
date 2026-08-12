@@ -16,4 +16,13 @@ int main() {
       [&](tree_hmm::BatchedModelView model) {
         return tree_hmm::metal::LogPartitionFunctionPrepared(model, workspace);
       });
+  TestMaximumAccelerator(
+      "Metal", tree_hmm::metal::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
+        workspace.ReserveBidirectional(plan, states, batch);
+      },
+      [&](std::size_t batch) { return workspace.Inputs(batch); },
+      [&](tree_hmm::BatchedModelView model) {
+        return tree_hmm::metal::MaximumAPosterioriPrepared(model, workspace);
+      });
 }

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -156,6 +157,27 @@ __device__ std::size_t BranchScaleIndex(const Params &params, std::size_t batch,
   return branch * params.batch + batch;
 }
 
+__device__ std::size_t AssignmentIndex(const Params &params, std::size_t batch,
+                                       std::size_t node) {
+  return batch * params.nodes + node;
+}
+
+__device__ std::size_t RakeChoiceIndex(const Params &params, std::size_t batch,
+                                       std::size_t branch,
+                                       std::size_t parent_state) {
+  return (branch * params.batch + batch) * params.states + parent_state;
+}
+
+__device__ std::size_t CompressionChoiceIndex(const Params &params,
+                                              std::size_t batch,
+                                              std::size_t tape,
+                                              std::size_t parent_state,
+                                              std::size_t child_state) {
+  return ((tape * params.batch + batch) * params.states + parent_state) *
+             params.states +
+         child_state;
+}
+
 // Transpose the public [batch, node, state] input into the internal
 // [node, batch, state] layout without constraining the state count.
 constexpr std::size_t kTransposeTile = 32;
@@ -263,6 +285,302 @@ __global__ void InitializePaths(const float *input, float *paths,
   const std::size_t source = edge * matrix;
   for (std::size_t entry = 0; entry < matrix; ++entry)
     paths[output + entry] = input[source + entry];
+}
+
+__global__ void TakeLogs(float *values, std::size_t count) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  if (index < count)
+    values[index] = values[index] > 0.0f ? logf(values[index]) : -INFINITY;
+}
+
+__global__ void MaximumRakeSerial(const btrc::Rake *operations,
+                                  const float *nodes, const float *paths,
+                                  float *branches, std::uint32_t *choices,
+                                  Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  for (std::size_t parent_state = 0; parent_state < params.states;
+       ++parent_state) {
+    float best =
+        paths[path_base + parent_state * params.states] + nodes[node_base];
+    std::uint32_t choice = 0;
+    for (std::uint32_t child_state = 1; child_state < params.states;
+         ++child_state) {
+      const float candidate =
+          paths[path_base + parent_state * params.states + child_state] +
+          nodes[node_base + child_state];
+      if (candidate > best) {
+        best = candidate;
+        choice = child_state;
+      }
+    }
+    branches[BranchIndex(params, batch, operation.branch, parent_state)] = best;
+    choices[RakeChoiceIndex(params, batch, operation.branch, parent_state)] =
+        choice;
+  }
+}
+
+__global__ void MaximumRake(const btrc::Rake *operations, const float *nodes,
+                            const float *paths, float *branches,
+                            std::uint32_t *choices, Params params) {
+  const std::size_t parent_state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (parent_state >= params.states || batch >= params.batch)
+    return;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  float best =
+      paths[path_base + parent_state * params.states] + nodes[node_base];
+  std::uint32_t choice = 0;
+  for (std::uint32_t child_state = 1; child_state < params.states;
+       ++child_state) {
+    const float candidate =
+        paths[path_base + parent_state * params.states + child_state] +
+        nodes[node_base + child_state];
+    if (candidate > best) {
+      best = candidate;
+      choice = child_state;
+    }
+  }
+  branches[BranchIndex(params, batch, operation.branch, parent_state)] = best;
+  choices[RakeChoiceIndex(params, batch, operation.branch, parent_state)] =
+      choice;
+}
+
+__global__ void
+MaximumCombineBranchesSerial(const btrc::BranchCombination *operations,
+                             float *branches, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::BranchCombination operation =
+      operations[params.operation_offset + operation_in_batch];
+  for (std::size_t state = 0; state < params.states; ++state) {
+    branches[BranchIndex(params, batch, operation.destination, state)] +=
+        branches[BranchIndex(params, batch, operation.source, state)];
+  }
+}
+
+__global__ void
+MaximumCombineBranches(const btrc::BranchCombination *operations,
+                       float *branches, Params params) {
+  const std::size_t state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (state >= params.states || batch >= params.batch)
+    return;
+  const btrc::BranchCombination operation =
+      operations[params.operation_offset + operation_in_batch];
+  branches[BranchIndex(params, batch, operation.destination, state)] +=
+      branches[BranchIndex(params, batch, operation.source, state)];
+}
+
+__global__ void
+MaximumAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
+                            float *nodes, const float *branches,
+                            Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::BranchAbsorption operation =
+      operations[params.operation_offset + operation_in_batch];
+  for (std::size_t state = 0; state < params.states; ++state) {
+    nodes[NodeIndex(params, batch, operation.parent, state)] +=
+        branches[BranchIndex(params, batch, operation.branch, state)];
+  }
+}
+
+__global__ void MaximumAbsorbBranches(const btrc::BranchAbsorption *operations,
+                                      float *nodes, const float *branches,
+                                      Params params) {
+  const std::size_t state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (state >= params.states || batch >= params.batch)
+    return;
+  const btrc::BranchAbsorption operation =
+      operations[params.operation_offset + operation_in_batch];
+  nodes[NodeIndex(params, batch, operation.parent, state)] +=
+      branches[BranchIndex(params, batch, operation.branch, state)];
+}
+
+__global__ void MaximumCompressSerial4(const btrc::Compression *operations,
+                                       const float *nodes, float *paths,
+                                       std::uint32_t *choices, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kMatrix = kStates * kStates;
+  float left[kMatrix];
+  float right[kMatrix];
+  float middle[kStates];
+  const std::size_t left_base =
+      PathIndex(params, batch, operation.left_edge, 0, 0);
+  const std::size_t right_base =
+      PathIndex(params, batch, operation.right_edge, 0, 0);
+  const std::size_t middle_base = NodeIndex(params, batch, operation.middle, 0);
+  for (std::size_t entry = 0; entry < kMatrix; ++entry) {
+    left[entry] = paths[left_base + entry];
+    right[entry] = paths[right_base + entry];
+  }
+  for (std::size_t state = 0; state < kStates; ++state)
+    middle[state] = nodes[middle_base + state];
+  for (std::size_t parent_state = 0; parent_state < kStates; ++parent_state) {
+    for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
+      float best =
+          left[parent_state * kStates] + middle[0] + right[child_state];
+      std::uint32_t choice = 0;
+      for (std::uint32_t middle_state = 1; middle_state < kStates;
+           ++middle_state) {
+        const float candidate = left[parent_state * kStates + middle_state] +
+                                middle[middle_state] +
+                                right[middle_state * kStates + child_state];
+        if (candidate > best) {
+          best = candidate;
+          choice = middle_state;
+        }
+      }
+      paths[left_base + parent_state * kStates + child_state] = best;
+      choices[CompressionChoiceIndex(params, batch, operation.tape,
+                                     parent_state, child_state)] = choice;
+    }
+  }
+}
+
+__global__ void MaximumCompress(const btrc::Compression *operations,
+                                const float *nodes, float *paths,
+                                std::uint32_t *choices, Params params) {
+  extern __shared__ float storage[];
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  float *left = storage;
+  float *right = left + matrix;
+  float *middle = right + matrix;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  const std::size_t entry = threadIdx.x;
+  if (batch >= params.batch)
+    return;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  if (entry < matrix) {
+    const std::size_t parent_state = entry / params.states;
+    const std::size_t child_state = entry % params.states;
+    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
+                                  parent_state, child_state)];
+    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
+                                   parent_state, child_state)];
+  }
+  if (entry < params.states)
+    middle[entry] = nodes[NodeIndex(params, batch, operation.middle, entry)];
+  __syncthreads();
+  if (entry >= matrix)
+    return;
+
+  const std::size_t parent_state = entry / params.states;
+  const std::size_t child_state = entry % params.states;
+  float best =
+      left[parent_state * params.states] + middle[0] + right[child_state];
+  std::uint32_t choice = 0;
+  for (std::uint32_t middle_state = 1; middle_state < params.states;
+       ++middle_state) {
+    const float candidate = left[parent_state * params.states + middle_state] +
+                            middle[middle_state] +
+                            right[middle_state * params.states + child_state];
+    if (candidate > best) {
+      best = candidate;
+      choice = middle_state;
+    }
+  }
+  paths[PathIndex(params, batch, operation.left_edge, parent_state,
+                  child_state)] = best;
+  choices[CompressionChoiceIndex(params, batch, operation.tape, parent_state,
+                                 child_state)] = choice;
+}
+
+__global__ void FinishMaximum(const float *nodes, float *log_weights,
+                              std::uint32_t *assignments, Params params) {
+  const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch >= params.batch)
+    return;
+  const std::size_t root_base = NodeIndex(params, batch, params.root, 0);
+  float best = nodes[root_base];
+  std::uint32_t choice = 0;
+  for (std::uint32_t state = 1; state < params.states; ++state) {
+    if (nodes[root_base + state] > best) {
+      best = nodes[root_base + state];
+      choice = state;
+    }
+  }
+  log_weights[batch] = best;
+  assignments[AssignmentIndex(params, batch, params.root)] = choice;
+}
+
+__global__ void ExpandMaximumRakes(const btrc::Rake *operations,
+                                   const std::uint32_t *choices,
+                                   std::uint32_t *assignments, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::uint32_t parent_state =
+      assignments[AssignmentIndex(params, batch, operation.parent)];
+  assignments[AssignmentIndex(params, batch, operation.leaf)] =
+      choices[RakeChoiceIndex(params, batch, operation.branch, parent_state)];
+}
+
+__global__ void ExpandMaximumCompressions(const btrc::Compression *operations,
+                                          const std::uint32_t *choices,
+                                          std::uint32_t *assignments,
+                                          Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::uint32_t parent_state =
+      assignments[AssignmentIndex(params, batch, operation.parent)];
+  const std::uint32_t child_state =
+      assignments[AssignmentIndex(params, batch, operation.child)];
+  assignments[AssignmentIndex(params, batch, operation.middle)] =
+      choices[CompressionChoiceIndex(params, batch, operation.tape,
+                                     parent_state, child_state)];
 }
 
 __global__ void Rake(const btrc::Rake *operations, const float *nodes,
@@ -647,6 +965,7 @@ struct Workspace::Impl {
   float *host_nodes = nullptr;
   float *host_edges = nullptr;
   float *host_output = nullptr;
+  std::uint32_t *host_assignments = nullptr;
   std::uint8_t *host_observations = nullptr;
   float *host_root_potential = nullptr;
   float *host_emission_potentials = nullptr;
@@ -664,9 +983,13 @@ struct Workspace::Impl {
   float *path_scales = nullptr;
   float *branch_scales = nullptr;
   float *output = nullptr;
+  std::uint32_t *rake_choices = nullptr;
+  std::uint32_t *compression_choices = nullptr;
+  std::uint32_t *assignments = nullptr;
   std::vector<btrc::Index> observation_nodes;
   std::size_t categories = 0;
   bool categorical = false;
+  bool bidirectional = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -691,9 +1014,13 @@ struct Workspace::Impl {
     DeviceFree(path_scales);
     DeviceFree(branch_scales);
     DeviceFree(output);
+    DeviceFree(rake_choices);
+    DeviceFree(compression_choices);
+    DeviceFree(assignments);
     HostFree(host_nodes);
     HostFree(host_edges);
     HostFree(host_output);
+    HostFree(host_assignments);
     HostFree(host_observations);
     HostFree(host_root_potential);
     HostFree(host_emission_potentials);
@@ -712,6 +1039,7 @@ struct Workspace::Impl {
     observation_nodes.clear();
     categories = 0;
     categorical = false;
+    bidirectional = false;
   }
 
   ~Impl() { Clear(); }
@@ -814,6 +1142,25 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
   DeviceAllocate(storage.output, batch);
 }
 
+void ReserveRecovery(Workspace::Impl &storage) {
+  const btrc::Plan &plan = *storage.plan;
+  HostAllocate(storage.host_assignments,
+               CheckedProduct({storage.batch, plan.num_nodes()},
+                              "host MAP assignments"));
+  DeviceAllocate(
+      storage.rake_choices,
+      CheckedProduct({storage.batch, plan.num_branches(), storage.states},
+                     "MAP rake choices"));
+  DeviceAllocate(storage.compression_choices,
+                 CheckedProduct({storage.batch, plan.num_compressions(),
+                                 storage.states, storage.states},
+                                "MAP compression choices"));
+  DeviceAllocate(
+      storage.assignments,
+      CheckedProduct({storage.batch, plan.num_nodes()}, "MAP assignments"));
+  storage.bidirectional = true;
+}
+
 } // namespace
 
 void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
@@ -877,6 +1224,21 @@ void Workspace::ReserveCategorical(
          std::span<const btrc::Index>(observation_index_by_node),
          storage.stream);
   Check(cudaStreamSynchronize(storage.stream), "categorical topology upload");
+}
+
+void Workspace::ReserveBidirectional(const btrc::Plan &plan, std::size_t states,
+                                     std::size_t batch, int device) {
+  Reserve(plan, states, batch, device);
+  ReserveRecovery(*impl_);
+}
+
+void Workspace::ReserveCategoricalBidirectional(
+    const btrc::Plan &plan, std::size_t states, std::size_t batch,
+    std::size_t categories, std::span<const btrc::Index> observation_nodes,
+    int device) {
+  ReserveCategorical(plan, states, batch, categories, observation_nodes,
+                     device);
+  ReserveRecovery(*impl_);
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
@@ -1098,6 +1460,198 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
           {upload_ms, kernel_ms, download_ms, wall_ms}};
 }
 
+template <class StageInputs, class UploadInputs, class InitializeNodeData>
+tree_hmm::BatchedMaximumAssignmentView
+RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
+                   std::size_t batch, std::span<const float> edge_potentials,
+                   Workspace::Impl &storage, StageInputs stage_inputs,
+                   UploadInputs upload_inputs,
+                   InitializeNodeData initialize_node_data) {
+  const auto wall_start = Clock::now();
+  if (!storage.bidirectional || storage.plan != &plan ||
+      storage.states != states || batch == 0 || batch > storage.batch) {
+    throw std::invalid_argument(
+        "prepared CUDA MAP inference requires a bidirectional workspace for "
+        "this plan, state count, and batch capacity");
+  }
+  Check(cudaSetDevice(storage.device), "cudaSetDevice");
+  const std::size_t matrix = CheckedProduct({states, states}, "state matrix");
+  const std::size_t edge_values =
+      CheckedProduct({plan.num_edges(), matrix}, "edge inputs");
+  if (edge_potentials.size() != edge_values)
+    throw std::invalid_argument("CUDA edge input shape is wrong");
+  stage_inputs();
+  if (edge_potentials.data() != storage.host_edges) {
+    std::memcpy(storage.host_edges, edge_potentials.data(),
+                edge_potentials.size_bytes());
+  }
+
+  Check(cudaEventRecord(storage.upload_start, storage.stream),
+        "cudaEventRecord upload start");
+  upload_inputs();
+  Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
+                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                        storage.stream),
+        "cudaMemcpyAsync edge upload");
+  Check(cudaEventRecord(storage.upload_stop, storage.stream),
+        "cudaEventRecord upload stop");
+
+  constexpr std::size_t kThreads = 256;
+  Check(cudaEventRecord(storage.kernel_start, storage.stream),
+        "cudaEventRecord kernel start");
+  Params base_params = storage.params;
+  base_params.batch = CheckedU32(batch, "batch count");
+  base_params.scaled = 0;
+  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
+  initialize_node_data(base_params);
+  const std::size_t path_matrices =
+      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
+  if (path_matrices != 0) {
+    InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
+                      storage.stream>>>(storage.input_edges, storage.paths,
+                                        base_params);
+  }
+  const std::size_t node_values =
+      CheckedProduct({batch, plan.num_nodes(), states}, "MAP node values");
+  TakeLogs<<<Blocks(node_values, kThreads), kThreads, 0, storage.stream>>>(
+      storage.nodes, node_values);
+  const std::size_t path_values = CheckedProduct(
+      {path_batches, plan.num_edges(), matrix}, "MAP path values");
+  if (path_values != 0) {
+    TakeLogs<<<Blocks(path_values, kThreads), kThreads, 0, storage.stream>>>(
+        storage.paths, path_values);
+  }
+
+  for (const btrc::PrimitiveBatch &primitive_batch : plan.primitive_batches()) {
+    Params params = base_params;
+    params.operation_offset = primitive_batch.offset;
+    params.operation_count = primitive_batch.count;
+    const std::size_t operations =
+        CheckedProduct({batch, primitive_batch.count}, "MAP primitive grid");
+    const std::uint32_t operation_blocks =
+        CheckedU32(operations, "MAP primitive grid");
+    const std::uint32_t serial_blocks = Blocks(operations, kThreads);
+    switch (primitive_batch.primitive) {
+    case btrc::Primitive::kRake:
+      if (states <= 8) {
+        MaximumRakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.rakes, storage.nodes, storage.paths, storage.branches,
+            storage.rake_choices, params);
+      } else {
+        MaximumRake<<<operation_blocks, states, 0, storage.stream>>>(
+            storage.rakes, storage.nodes, storage.paths, storage.branches,
+            storage.rake_choices, params);
+      }
+      break;
+    case btrc::Primitive::kBranchCombination:
+      if (states <= 8) {
+        MaximumCombineBranchesSerial<<<serial_blocks, kThreads, 0,
+                                       storage.stream>>>(
+            storage.combinations, storage.branches, params);
+      } else {
+        MaximumCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
+            storage.combinations, storage.branches, params);
+      }
+      break;
+    case btrc::Primitive::kBranchAbsorption:
+      if (states <= 8) {
+        MaximumAbsorbBranchesSerial<<<serial_blocks, kThreads, 0,
+                                      storage.stream>>>(
+            storage.absorptions, storage.nodes, storage.branches, params);
+      } else {
+        MaximumAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
+            storage.absorptions, storage.nodes, storage.branches, params);
+      }
+      break;
+    case btrc::Primitive::kCompression:
+      if (states == 4) {
+        MaximumCompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.compressions, storage.nodes, storage.paths,
+            storage.compression_choices, params);
+      } else {
+        MaximumCompress<<<operation_blocks, matrix,
+                          (2 * matrix + states) * sizeof(float),
+                          storage.stream>>>(
+            storage.compressions, storage.nodes, storage.paths,
+            storage.compression_choices, params);
+      }
+      break;
+    }
+  }
+
+  FinishMaximum<<<Blocks(batch, kThreads), kThreads, 0, storage.stream>>>(
+      storage.nodes, storage.output, storage.assignments, base_params);
+  for (std::size_t index = plan.primitive_batches().size(); index-- > 0;) {
+    const btrc::PrimitiveBatch &primitive_batch =
+        plan.primitive_batches()[index];
+    Params params = base_params;
+    params.operation_offset = primitive_batch.offset;
+    params.operation_count = primitive_batch.count;
+    const std::size_t operations =
+        CheckedProduct({batch, primitive_batch.count}, "MAP expansion grid");
+    switch (primitive_batch.primitive) {
+    case btrc::Primitive::kRake:
+      ExpandMaximumRakes<<<Blocks(operations, kThreads), kThreads, 0,
+                           storage.stream>>>(
+          storage.rakes, storage.rake_choices, storage.assignments, params);
+      break;
+    case btrc::Primitive::kCompression:
+      ExpandMaximumCompressions<<<Blocks(operations, kThreads), kThreads, 0,
+                                  storage.stream>>>(
+          storage.compressions, storage.compression_choices,
+          storage.assignments, params);
+      break;
+    case btrc::Primitive::kBranchCombination:
+    case btrc::Primitive::kBranchAbsorption:
+      break;
+    }
+  }
+  Check(cudaGetLastError(), "tree-HMM CUDA MAP kernel launch");
+  Check(cudaEventRecord(storage.kernel_stop, storage.stream),
+        "cudaEventRecord kernel stop");
+
+  Check(cudaEventRecord(storage.download_start, storage.stream),
+        "cudaEventRecord download start");
+  Check(cudaMemcpyAsync(storage.host_output, storage.output,
+                        batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        storage.stream),
+        "cudaMemcpyAsync MAP-weight download");
+  const std::size_t assignment_count =
+      CheckedProduct({batch, plan.num_nodes()}, "MAP assignment download");
+  Check(cudaMemcpyAsync(storage.host_assignments, storage.assignments,
+                        assignment_count * sizeof(std::uint32_t),
+                        cudaMemcpyDeviceToHost, storage.stream),
+        "cudaMemcpyAsync MAP-assignment download");
+  Check(cudaEventRecord(storage.download_stop, storage.stream),
+        "cudaEventRecord download stop");
+  Check(cudaEventSynchronize(storage.download_stop),
+        "tree-HMM CUDA MAP execution");
+
+  for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+    if (!std::isfinite(storage.host_output[batch_index])) {
+      throw std::domain_error("the tree HMM has no positive-weight assignment");
+    }
+  }
+  float upload_ms = 0.0f;
+  float kernel_ms = 0.0f;
+  float download_ms = 0.0f;
+  Check(cudaEventElapsedTime(&upload_ms, storage.upload_start,
+                             storage.upload_stop),
+        "cudaEventElapsedTime MAP upload");
+  Check(cudaEventElapsedTime(&kernel_ms, storage.kernel_start,
+                             storage.kernel_stop),
+        "cudaEventElapsedTime MAP kernels");
+  Check(cudaEventElapsedTime(&download_ms, storage.download_start,
+                             storage.download_stop),
+        "cudaEventElapsedTime MAP download");
+  const double wall_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - wall_start)
+          .count();
+  return {{storage.host_output, batch},
+          {storage.host_assignments, assignment_count},
+          {upload_ms, kernel_ms, download_ms, wall_ms}};
+}
+
 tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                             Workspace::Impl &storage, bool scaled) {
   if (storage.categorical)
@@ -1215,6 +1769,122 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
       });
 }
 
+tree_hmm::BatchedMaximumAssignmentView
+RunMaximum(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
+  if (storage.categorical)
+    throw std::invalid_argument(
+        "dense CUDA inference cannot use a categorical workspace");
+  const std::size_t node_values = CheckedProduct(
+      {model.batch, model.plan.num_nodes(), model.states}, "node inputs");
+  if (model.node_potentials.size() != node_values)
+    throw std::invalid_argument("CUDA node input shape is wrong");
+  return RunMaximumPrepared(
+      model.plan, model.states, model.batch, model.edge_potentials, storage,
+      [&] {
+        if (model.node_potentials.data() != storage.host_nodes) {
+          std::memcpy(storage.host_nodes, model.node_potentials.data(),
+                      model.node_potentials.size_bytes());
+        }
+      },
+      [&] {
+        Check(cudaMemcpyAsync(storage.input_nodes, storage.host_nodes,
+                              model.node_potentials.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync node upload");
+      },
+      [&](const Params &params) {
+        const dim3 threads(kTransposeTile, kTransposeRows);
+        const dim3 blocks((model.plan.num_nodes() + kTransposeTile - 1) /
+                              kTransposeTile,
+                          (model.batch + kTransposeTile - 1) / kTransposeTile);
+        InitializeNodes<<<blocks, threads, 0, storage.stream>>>(
+            storage.input_nodes, storage.nodes, params);
+      });
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+RunMaximum(tree_hmm::BatchedCategoricalModelView model,
+           Workspace::Impl &storage) {
+  if (!storage.categorical || model.categories != storage.categories ||
+      model.observation_nodes.size() != storage.observation_nodes.size() ||
+      !std::equal(model.observation_nodes.begin(),
+                  model.observation_nodes.end(),
+                  storage.observation_nodes.begin())) {
+    throw std::invalid_argument(
+        "categorical CUDA model does not match the reserved workspace");
+  }
+  const std::size_t observation_values =
+      CheckedProduct({model.batch, model.observation_nodes.size()},
+                     "categorical observations");
+  const std::size_t emission_values =
+      CheckedProduct({model.categories, model.states}, "categorical emissions");
+  if (model.observations.size() != observation_values ||
+      model.root_potential.size() != model.states ||
+      model.emission_potentials.size() != emission_values) {
+    throw std::invalid_argument("CUDA categorical input shapes are wrong");
+  }
+  return RunMaximumPrepared(
+      model.plan, model.states, model.batch, model.edge_potentials, storage,
+      [&] {
+        if (model.observations.data() != storage.host_observations) {
+          std::memcpy(storage.host_observations, model.observations.data(),
+                      model.observations.size_bytes());
+        }
+        if (model.root_potential.data() != storage.host_root_potential) {
+          std::memcpy(storage.host_root_potential, model.root_potential.data(),
+                      model.root_potential.size_bytes());
+        }
+        if (model.emission_potentials.data() !=
+            storage.host_emission_potentials) {
+          std::memcpy(storage.host_emission_potentials,
+                      model.emission_potentials.data(),
+                      model.emission_potentials.size_bytes());
+        }
+      },
+      [&] {
+        Check(cudaMemcpyAsync(storage.input_observations,
+                              storage.host_observations,
+                              model.observations.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync categorical observation upload");
+        Check(cudaMemcpyAsync(storage.input_root_potential,
+                              storage.host_root_potential,
+                              model.root_potential.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync root-potential upload");
+        Check(cudaMemcpyAsync(storage.input_emission_potentials,
+                              storage.host_emission_potentials,
+                              model.emission_potentials.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync emission-potential upload");
+      },
+      [&](const Params &params) {
+        constexpr std::size_t kThreads = 256;
+        const std::size_t node_batches =
+            CheckedProduct({model.plan.num_nodes(), model.batch},
+                           "categorical node initialization");
+        InitializeCategoricalBase<<<Blocks(node_batches, kThreads), kThreads, 0,
+                                    storage.stream>>>(
+            storage.input_root_potential,
+            storage.categorical_observation_index_by_node, storage.nodes,
+            params);
+        if (!model.observation_nodes.empty()) {
+          const dim3 threads(kTransposeTile, kTransposeRows);
+          const dim3 blocks(
+              (model.observation_nodes.size() + kTransposeTile - 1) /
+                  kTransposeTile,
+              (model.batch + kTransposeTile - 1) / kTransposeTile);
+          ApplyCategoricalObservations<<<blocks, threads, 0, storage.stream>>>(
+              storage.input_observations, storage.categorical_observation_nodes,
+              storage.input_root_potential, storage.input_emission_potentials,
+              storage.nodes, params,
+              CheckedU32(model.observation_nodes.size(),
+                         "categorical observation count"),
+              CheckedU32(model.categories, "category count"));
+        }
+      });
+}
+
 } // namespace
 
 tree_hmm::PartitionView
@@ -1239,6 +1909,18 @@ tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
                              Workspace &workspace) {
   return Run(model, *workspace.impl_, true);
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace) {
+  return RunMaximum(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
+  return RunMaximum(model, *workspace.impl_);
 }
 
 } // namespace tree_hmm::cuda
