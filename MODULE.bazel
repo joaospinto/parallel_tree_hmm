@@ -1,0 +1,12 @@
+module(
+    name = "parallel_tree_hmm",
+    version = "0.1.0",
+)
+
+bazel_dep(name = "rules_cc", version = "0.2.17")
+bazel_dep(name = "bidirectional_tree_rake_compress", version = "0.1.0")
+
+local_path_override(
+    module_name = "bidirectional_tree_rake_compress",
+    path = "../bidirectional_tree_rake_compress",
+)

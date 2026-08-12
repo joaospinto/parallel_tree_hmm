@@ -1,0 +1,17 @@
+load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("@rules_cc//cc:cc_test.bzl", "cc_test")
+
+cc_library(
+    name = "tree_hmm",
+    srcs = ["src/inference.cc"],
+    hdrs = ["include/tree_hmm/inference.h"],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = ["@bidirectional_tree_rake_compress//:btrc"],
+)
+
+cc_test(
+    name = "inference_test",
+    srcs = ["tests/inference_test.cc"],
+    deps = [":tree_hmm"],
+)
