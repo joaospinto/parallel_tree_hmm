@@ -16,8 +16,6 @@ struct Workspace::Impl {
   const btrc::Plan *plan = nullptr;
   std::size_t states = 0;
 
-  std::vector<double> original_nodes;
-  std::vector<double> original_paths;
   std::vector<double> nodes;
   std::vector<double> paths;
   std::vector<double> branches;
@@ -30,10 +28,6 @@ struct Workspace::Impl {
 
   std::vector<double> rake_paths;
   std::vector<double> rake_leaves;
-  std::vector<double> combination_left;
-  std::vector<double> combination_right;
-  std::vector<double> absorption_left;
-  std::vector<double> absorption_right;
   std::vector<double> compression_left;
   std::vector<double> compression_middle;
   std::vector<double> compression_right;
@@ -42,6 +36,7 @@ struct Workspace::Impl {
   std::vector<double> marginal_nodes;
   std::vector<double> marginal_edges;
   double partition = 0.0;
+  double log_partition = 0.0;
 };
 
 namespace {
@@ -60,8 +55,8 @@ void Validate(ModelView model) {
       CheckedProduct(model.states, model.states, "state matrix size");
   const std::size_t expected_nodes =
       CheckedProduct(model.plan.num_nodes(), model.states, "node potentials");
-  const std::size_t expected_edges = CheckedProduct(
-      model.plan.num_edges(), matrix_size, "edge potentials");
+  const std::size_t expected_edges =
+      CheckedProduct(model.plan.num_edges(), matrix_size, "edge potentials");
   if (model.node_potentials.size() != expected_nodes)
     throw std::invalid_argument("node-potential shape does not match the plan");
   if (model.edge_potentials.size() != expected_edges)
@@ -86,12 +81,8 @@ Workspace::Impl &Prepare(ModelView model, Workspace::Impl &storage) {
         "state count");
   }
   std::copy(model.node_potentials.begin(), model.node_potentials.end(),
-            storage.original_nodes.begin());
-  std::copy(model.edge_potentials.begin(), model.edge_potentials.end(),
-            storage.original_paths.begin());
-  std::copy(storage.original_nodes.begin(), storage.original_nodes.end(),
             storage.nodes.begin());
-  std::copy(storage.original_paths.begin(), storage.original_paths.end(),
+  std::copy(model.edge_potentials.begin(), model.edge_potentials.end(),
             storage.paths.begin());
   std::fill(storage.branches.begin(), storage.branches.end(), 0.0);
   std::fill(storage.node_adjoints.begin(), storage.node_adjoints.end(), 0.0);
@@ -99,7 +90,25 @@ Workspace::Impl &Prepare(ModelView model, Workspace::Impl &storage) {
   std::fill(storage.branch_adjoints.begin(), storage.branch_adjoints.end(),
             0.0);
   storage.partition = 0.0;
+  storage.log_partition = 0.0;
   return storage;
+}
+
+double PotentialLog(double value) {
+  return value > 0.0 ? std::log(value)
+                     : -std::numeric_limits<double>::infinity();
+}
+
+template <class Term> double LogSumExp(std::size_t size, Term term) {
+  double maximum = -std::numeric_limits<double>::infinity();
+  for (std::size_t index = 0; index < size; ++index)
+    maximum = std::max(maximum, term(index));
+  if (!std::isfinite(maximum))
+    return maximum;
+  double sum = 0.0;
+  for (std::size_t index = 0; index < size; ++index)
+    sum += std::exp(term(index) - maximum);
+  return maximum + std::log(sum);
 }
 
 class SumProductDispatcher {
@@ -113,18 +122,14 @@ public:
     for (const auto &operation : operations) {
       const double *path = Path(operation.edge);
       const double *leaf = Node(operation.leaf);
-      std::copy(path, path + matrix_size_,
-                storage_.rake_paths.begin() + operation.branch * matrix_size_);
-      std::copy(leaf, leaf + states_,
-                storage_.rake_leaves.begin() + operation.branch * states_);
       double *message = Branch(operation.branch);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         double value = 0.0;
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          value += path[parent_state * states_ + child_state] *
-                   leaf[child_state];
+          value +=
+              path[parent_state * states_ + child_state] * leaf[child_state];
         }
         message[parent_state] = value;
       }
@@ -135,10 +140,6 @@ public:
     for (const auto &operation : operations) {
       double *left = Branch(operation.destination);
       const double *right = Branch(operation.source);
-      std::copy(left, left + states_,
-                storage_.combination_left.begin() + operation.tape * states_);
-      std::copy(right, right + states_,
-                storage_.combination_right.begin() + operation.tape * states_);
       for (std::size_t state = 0; state < states_; ++state)
         left[state] *= right[state];
     }
@@ -148,10 +149,6 @@ public:
     for (const auto &operation : operations) {
       double *node = Node(operation.parent);
       const double *branch = Branch(operation.branch);
-      std::copy(node, node + states_,
-                storage_.absorption_left.begin() + operation.tape * states_);
-      std::copy(branch, branch + states_,
-                storage_.absorption_right.begin() + operation.tape * states_);
       for (std::size_t state = 0; state < states_; ++state)
         node[state] *= branch[state];
     }
@@ -194,9 +191,129 @@ public:
     return storage_.partition;
   }
 
+private:
+  double *Node(btrc::Index node) {
+    return storage_.nodes.data() + node * states_;
+  }
+  const double *Node(btrc::Index node) const {
+    return storage_.nodes.data() + node * states_;
+  }
+  double *Path(btrc::Index edge) {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  const double *Path(btrc::Index edge) const {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  double *Branch(btrc::Index branch) {
+    return storage_.branches.data() + branch * states_;
+  }
+  const double *Branch(btrc::Index branch) const {
+    return storage_.branches.data() + branch * states_;
+  }
+  const btrc::Plan &plan_;
+  std::size_t states_;
+  std::size_t matrix_size_;
+  Workspace::Impl &storage_;
+};
+
+class LogSumProductDispatcher {
+public:
+  LogSumProductDispatcher(const btrc::Plan &plan, std::size_t states,
+                          Workspace::Impl &storage)
+      : plan_(plan), states_(states), matrix_size_(states * states),
+        storage_(storage) {
+    std::transform(storage_.nodes.begin(), storage_.nodes.end(),
+                   storage_.nodes.begin(), PotentialLog);
+    std::transform(storage_.paths.begin(), storage_.paths.end(),
+                   storage_.paths.begin(), PotentialLog);
+    std::fill(storage_.branches.begin(), storage_.branches.end(),
+              -std::numeric_limits<double>::infinity());
+  }
+
+  void Rake(std::span<const btrc::Rake> operations) {
+    for (const auto &operation : operations) {
+      const double *path = Path(operation.edge);
+      const double *leaf = Node(operation.leaf);
+      std::copy(path, path + matrix_size_,
+                storage_.rake_paths.begin() + operation.branch * matrix_size_);
+      std::copy(leaf, leaf + states_,
+                storage_.rake_leaves.begin() + operation.branch * states_);
+      double *message = Branch(operation.branch);
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        message[parent_state] =
+            LogSumExp(states_, [&](std::size_t child_state) {
+              return path[parent_state * states_ + child_state] +
+                     leaf[child_state];
+            });
+      }
+    }
+  }
+
+  void CombineBranches(std::span<const btrc::BranchCombination> operations) {
+    for (const auto &operation : operations) {
+      double *destination = Branch(operation.destination);
+      const double *source = Branch(operation.source);
+      for (std::size_t state = 0; state < states_; ++state)
+        destination[state] += source[state];
+    }
+  }
+
+  void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
+    for (const auto &operation : operations) {
+      double *node = Node(operation.parent);
+      const double *branch = Branch(operation.branch);
+      for (std::size_t state = 0; state < states_; ++state)
+        node[state] += branch[state];
+    }
+  }
+
+  void Compress(std::span<const btrc::Compression> operations) {
+    for (const auto &operation : operations) {
+      double *left = Path(operation.left_edge);
+      const double *middle = Node(operation.middle);
+      const double *right = Path(operation.right_edge);
+      double *saved_left =
+          storage_.compression_left.data() + operation.tape * matrix_size_;
+      double *saved_middle =
+          storage_.compression_middle.data() + operation.tape * states_;
+      double *saved_right =
+          storage_.compression_right.data() + operation.tape * matrix_size_;
+      std::copy(left, left + matrix_size_, saved_left);
+      std::copy(middle, middle + states_, saved_middle);
+      std::copy(right, right + matrix_size_, saved_right);
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        for (std::size_t child_state = 0; child_state < states_;
+             ++child_state) {
+          left[parent_state * states_ + child_state] =
+              LogSumExp(states_, [&](std::size_t middle_state) {
+                return saved_left[parent_state * states_ + middle_state] +
+                       saved_middle[middle_state] +
+                       saved_right[middle_state * states_ + child_state];
+              });
+        }
+      }
+    }
+  }
+
+  double FinishRoot() {
+    const double *root = Node(plan_.root());
+    storage_.log_partition =
+        LogSumExp(states_, [&](std::size_t state) { return root[state]; });
+    if (!std::isfinite(storage_.log_partition)) {
+      throw std::domain_error(
+          "the tree HMM has a nonpositive partition function");
+    }
+    storage_.partition = std::exp(storage_.log_partition);
+    return storage_.log_partition;
+  }
+
   void SeedRootAdjoint() {
+    const double *root = Node(plan_.root());
     double *root_adjoint = NodeAdjoint(plan_.root());
-    std::fill(root_adjoint, root_adjoint + states_, 1.0);
+    for (std::size_t state = 0; state < states_; ++state)
+      root_adjoint[state] = std::exp(root[state] - storage_.log_partition);
   }
 
   void ReverseCompressions(std::span<const btrc::Compression> operations) {
@@ -217,20 +334,30 @@ public:
            ++parent_state) {
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          const double adjoint =
-              output_adjoint[parent_state * states_ + child_state];
+          const std::size_t output_index = parent_state * states_ + child_state;
+          const double adjoint = output_adjoint[output_index];
+          const double output =
+              LogSumExp(states_, [&](std::size_t middle_state) {
+                return left[parent_state * states_ + middle_state] +
+                       middle[middle_state] +
+                       right[middle_state * states_ + child_state];
+              });
+          if (adjoint == 0.0 || !std::isfinite(output))
+            continue;
           for (std::size_t middle_state = 0; middle_state < states_;
                ++middle_state) {
             const std::size_t left_index =
                 parent_state * states_ + middle_state;
             const std::size_t right_index =
                 middle_state * states_ + child_state;
-            storage_.reverse_scratch[left_index] +=
-                adjoint * middle[middle_state] * right[right_index];
-            middle_adjoint[middle_state] +=
-                adjoint * left[left_index] * right[right_index];
-            right_adjoint[right_index] +=
-                adjoint * left[left_index] * middle[middle_state];
+            const double term =
+                left[left_index] + middle[middle_state] + right[right_index];
+            if (!std::isfinite(term))
+              continue;
+            const double contribution = adjoint * std::exp(term - output);
+            storage_.reverse_scratch[left_index] += contribution;
+            middle_adjoint[middle_state] += contribution;
+            right_adjoint[right_index] += contribution;
           }
         }
       }
@@ -239,37 +366,25 @@ public:
     }
   }
 
-  void ReverseAbsorbBranches(
-      std::span<const btrc::BranchAbsorption> operations) {
+  void
+  ReverseAbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *old_node =
-          storage_.absorption_left.data() + operation.tape * states_;
-      const double *branch =
-          storage_.absorption_right.data() + operation.tape * states_;
-      double *node_adjoint = NodeAdjoint(operation.parent);
+      const double *node_adjoint = NodeAdjoint(operation.parent);
       double *branch_adjoint = BranchAdjoint(operation.branch);
-      for (std::size_t state = 0; state < states_; ++state) {
-        branch_adjoint[state] += node_adjoint[state] * old_node[state];
-        node_adjoint[state] *= branch[state];
-      }
+      for (std::size_t state = 0; state < states_; ++state)
+        branch_adjoint[state] += node_adjoint[state];
     }
   }
 
-  void ReverseCombineBranches(
-      std::span<const btrc::BranchCombination> operations) {
+  void
+  ReverseCombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *left =
-          storage_.combination_left.data() + operation.tape * states_;
-      const double *right =
-          storage_.combination_right.data() + operation.tape * states_;
-      double *destination_adjoint = BranchAdjoint(operation.destination);
+      const double *destination_adjoint = BranchAdjoint(operation.destination);
       double *source_adjoint = BranchAdjoint(operation.source);
-      for (std::size_t state = 0; state < states_; ++state) {
-        source_adjoint[state] += destination_adjoint[state] * left[state];
-        destination_adjoint[state] *= right[state];
-      }
+      for (std::size_t state = 0; state < states_; ++state)
+        source_adjoint[state] += destination_adjoint[state];
     }
   }
 
@@ -285,36 +400,32 @@ public:
       double *leaf_adjoint = NodeAdjoint(operation.leaf);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
+        const double message = LogSumExp(states_, [&](std::size_t child_state) {
+          return path[parent_state * states_ + child_state] + leaf[child_state];
+        });
+        if (!std::isfinite(message))
+          continue;
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          path_adjoint[parent_state * states_ + child_state] +=
-              message_adjoint[parent_state] * leaf[child_state];
-          leaf_adjoint[child_state] +=
-              message_adjoint[parent_state] *
-              path[parent_state * states_ + child_state];
+          const std::size_t path_index = parent_state * states_ + child_state;
+          const double term = path[path_index] + leaf[child_state];
+          if (!std::isfinite(term))
+            continue;
+          const double contribution =
+              message_adjoint[parent_state] * std::exp(term - message);
+          path_adjoint[path_index] += contribution;
+          leaf_adjoint[child_state] += contribution;
         }
       }
     }
   }
 
   MarginalView BuildMarginals() {
-    if (!(storage_.partition > 0.0) || !std::isfinite(storage_.partition)) {
-      throw std::domain_error(
-          "the tree HMM has a nonpositive partition function");
-    }
-    for (std::size_t index = 0; index < storage_.marginal_nodes.size();
-         ++index) {
-      storage_.marginal_nodes[index] =
-          storage_.original_nodes[index] * storage_.node_adjoints[index] /
-          storage_.partition;
-    }
-    for (std::size_t index = 0; index < storage_.marginal_edges.size();
-         ++index) {
-      storage_.marginal_edges[index] =
-          storage_.original_paths[index] * storage_.path_adjoints[index] /
-          storage_.partition;
-    }
-    return {storage_.partition, storage_.marginal_nodes,
+    std::copy(storage_.node_adjoints.begin(), storage_.node_adjoints.end(),
+              storage_.marginal_nodes.begin());
+    std::copy(storage_.path_adjoints.begin(), storage_.path_adjoints.end(),
+              storage_.marginal_edges.begin());
+    return {storage_.partition, storage_.log_partition, storage_.marginal_nodes,
             storage_.marginal_edges};
   }
 
@@ -334,10 +445,10 @@ private:
   double *Branch(btrc::Index branch) {
     return storage_.branches.data() + branch * states_;
   }
-  const double *Branch(btrc::Index branch) const {
-    return storage_.branches.data() + branch * states_;
-  }
   double *NodeAdjoint(btrc::Index node) {
+    return storage_.node_adjoints.data() + node * states_;
+  }
+  const double *NodeAdjoint(btrc::Index node) const {
     return storage_.node_adjoints.data() + node * states_;
   }
   double *PathAdjoint(btrc::Index edge) {
@@ -373,14 +484,14 @@ public:
         double value = 0.0;
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          value += path[parent_state * states_ + child_state] *
-                   leaf[child_state];
+          value +=
+              path[parent_state * states_ + child_state] * leaf[child_state];
         }
         message[parent_state] = value;
       }
       BranchScale(operation.branch) =
-          Normalize(message, states_, PathScale(operation.edge) +
-                                          NodeScale(operation.leaf));
+          Normalize(message, states_,
+                    PathScale(operation.edge) + NodeScale(operation.leaf));
     }
   }
 
@@ -391,8 +502,8 @@ public:
       for (std::size_t state = 0; state < states_; ++state)
         destination[state] *= source[state];
       BranchScale(operation.destination) = Normalize(
-          destination, states_, BranchScale(operation.destination) +
-                                    BranchScale(operation.source));
+          destination, states_,
+          BranchScale(operation.destination) + BranchScale(operation.source));
     }
   }
 
@@ -403,8 +514,8 @@ public:
       for (std::size_t state = 0; state < states_; ++state)
         node[state] *= branch[state];
       NodeScale(operation.parent) = Normalize(
-          node, states_, NodeScale(operation.parent) +
-                             BranchScale(operation.branch));
+          node, states_,
+          NodeScale(operation.parent) + BranchScale(operation.branch));
     }
   }
 
@@ -421,18 +532,19 @@ public:
           double value = 0.0;
           for (std::size_t middle_state = 0; middle_state < states_;
                ++middle_state) {
-            value += storage_.reverse_scratch[parent_state * states_ +
-                                              middle_state] *
-                     middle[middle_state] *
-                     right[middle_state * states_ + child_state];
+            value +=
+                storage_
+                    .reverse_scratch[parent_state * states_ + middle_state] *
+                middle[middle_state] *
+                right[middle_state * states_ + child_state];
           }
           left[parent_state * states_ + child_state] = value;
         }
       }
       PathScale(operation.left_edge) = Normalize(
-          left, matrix_size_, PathScale(operation.left_edge) +
-                                  NodeScale(operation.middle) +
-                                  PathScale(operation.right_edge));
+          left, matrix_size_,
+          PathScale(operation.left_edge) + NodeScale(operation.middle) +
+              PathScale(operation.right_edge));
     }
   }
 
@@ -475,15 +587,11 @@ private:
   const double *Branch(btrc::Index branch) const {
     return storage_.branches.data() + branch * states_;
   }
-  double &NodeScale(btrc::Index node) {
-    return storage_.node_log_scales[node];
-  }
+  double &NodeScale(btrc::Index node) { return storage_.node_log_scales[node]; }
   double NodeScale(btrc::Index node) const {
     return storage_.node_log_scales[node];
   }
-  double &PathScale(btrc::Index edge) {
-    return storage_.path_log_scales[edge];
-  }
+  double &PathScale(btrc::Index edge) { return storage_.path_log_scales[edge]; }
   double PathScale(btrc::Index edge) const {
     return storage_.path_log_scales[edge];
   }
@@ -521,17 +629,11 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
       CheckedProduct(plan.num_edges(), matrix_size, "path workspace");
   const std::size_t branch_values =
       CheckedProduct(plan.num_branches(), states, "branch workspace");
-  const std::size_t combination_values = CheckedProduct(
-      plan.num_branch_combinations(), states, "combination tape");
-  const std::size_t absorption_values = CheckedProduct(
-      plan.num_branch_absorptions(), states, "absorption tape");
   const std::size_t compression_matrices = CheckedProduct(
       plan.num_compressions(), matrix_size, "compression matrix tape");
   const std::size_t compression_vectors = CheckedProduct(
       plan.num_compressions(), states, "compression vector tape");
 
-  storage.original_nodes.resize(node_values);
-  storage.original_paths.resize(path_values);
   storage.nodes.resize(node_values);
   storage.paths.resize(path_values);
   storage.branches.resize(branch_values);
@@ -544,10 +646,6 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
   storage.rake_paths.resize(
       CheckedProduct(plan.num_branches(), matrix_size, "rake matrix tape"));
   storage.rake_leaves.resize(branch_values);
-  storage.combination_left.resize(combination_values);
-  storage.combination_right.resize(combination_values);
-  storage.absorption_left.resize(absorption_values);
-  storage.absorption_right.resize(absorption_values);
   storage.compression_left.resize(compression_matrices);
   storage.compression_middle.resize(compression_vectors);
   storage.compression_right.resize(compression_matrices);
@@ -576,10 +674,9 @@ double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace) {
   return dispatcher.FinishRoot();
 }
 
-MarginalView PosteriorMarginalsPrepared(ModelView model,
-                                        Workspace &workspace) {
+MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
-  SumProductDispatcher dispatcher(model.plan, model.states, storage);
+  LogSumProductDispatcher dispatcher(model.plan, model.states, storage);
   btrc::Contract(model.plan, dispatcher);
   dispatcher.FinishRoot();
   dispatcher.SeedRootAdjoint();
@@ -590,6 +687,7 @@ MarginalView PosteriorMarginalsPrepared(ModelView model,
 Marginals Materialize(MarginalView view) {
   return {
       .partition = view.partition,
+      .log_partition = view.log_partition,
       .nodes = std::vector<double>(view.nodes.begin(), view.nodes.end()),
       .edges = std::vector<double>(view.edges.begin(), view.edges.end()),
   };

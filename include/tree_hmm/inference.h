@@ -22,12 +22,14 @@ struct ModelView {
 
 struct Marginals {
   double partition = 0.0;
+  double log_partition = 0.0;
   std::vector<double> nodes;
   std::vector<double> edges;
 };
 
 struct MarginalView {
   double partition = 0.0;
+  double log_partition = 0.0;
   std::span<const double> nodes;
   std::span<const double> edges;
 };
@@ -61,9 +63,9 @@ Marginals Materialize(MarginalView view);
 double PartitionFunction(ModelView model);
 double LogPartitionFunction(ModelView model);
 
-// Returns normalized p(x_i) and p(x_parent, x_child). The initial CPU
-// reference differentiates the contraction analytically; no division by
-// intermediate messages is used.
+// Returns normalized p(x_i) and p(x_parent, x_child). Log-domain contraction
+// and analytic reverse contraction avoid underflow and division by
+// intermediate messages, including messages containing zeros.
 Marginals PosteriorMarginals(ModelView model);
 
 } // namespace tree_hmm

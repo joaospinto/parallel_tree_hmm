@@ -7,13 +7,15 @@
 #include <cstdlib>
 #include <memory>
 #include <new>
+#include <numeric>
 #include <stdexcept>
+#include <string>
 #include <vector>
 
 namespace {
 bool g_count_allocations = false;
 std::size_t g_allocations = 0;
-}
+} // namespace
 
 void *operator new(std::size_t size) {
   if (g_count_allocations)
@@ -24,7 +26,9 @@ void *operator new(std::size_t size) {
 }
 
 void operator delete(void *pointer) noexcept { std::free(pointer); }
-void operator delete(void *pointer, std::size_t) noexcept { std::free(pointer); }
+void operator delete(void *pointer, std::size_t) noexcept {
+  std::free(pointer);
+}
 
 namespace {
 
@@ -33,15 +37,17 @@ bool Near(double left, double right, double tolerance = 1e-11) {
          tolerance * std::max({1.0, std::abs(left), std::abs(right)});
 }
 
-void Check(bool condition) {
+void CheckImpl(bool condition, int line) {
   if (!condition)
-    throw std::runtime_error("tree-HMM inference test failed");
+    throw std::runtime_error("tree-HMM inference test failed at line " +
+                             std::to_string(line));
 }
 
-tree_hmm::Marginals BruteForce(
-    const btrc::Plan &plan, std::size_t states,
-    const std::vector<double> &node_potentials,
-    const std::vector<double> &edge_potentials) {
+#define Check(condition) CheckImpl((condition), __LINE__)
+
+tree_hmm::Marginals BruteForce(const btrc::Plan &plan, std::size_t states,
+                               const std::vector<double> &node_potentials,
+                               const std::vector<double> &edge_potentials) {
   tree_hmm::Marginals result;
   result.nodes.assign(node_potentials.size(), 0.0);
   result.edges.assign(edge_potentials.size(), 0.0);
@@ -78,7 +84,18 @@ tree_hmm::Marginals BruteForce(
     value /= result.partition;
   for (double &value : result.edges)
     value /= result.partition;
+  result.log_partition = std::log(result.partition);
   return result;
+}
+
+void CheckMarginals(const tree_hmm::Marginals &actual,
+                    const tree_hmm::Marginals &expected) {
+  Check(Near(actual.partition, expected.partition));
+  Check(Near(actual.log_partition, expected.log_partition));
+  for (std::size_t index = 0; index < actual.nodes.size(); ++index)
+    Check(Near(actual.nodes[index], expected.nodes[index]));
+  for (std::size_t index = 0; index < actual.edges.size(); ++index)
+    Check(Near(actual.edges[index], expected.edges[index]));
 }
 
 } // namespace
@@ -91,27 +108,36 @@ int main() {
       0.55, 0.45, 0.9, 0.2, 0.4, 0.8, 0.7, 0.3, 0.1, 0.95,
   };
   const std::vector<double> edges{
-      0.8, 0.2, 0.3, 0.7, 0.9, 0.1, 0.25, 0.75,
-      0.6, 0.4, 0.15, 0.85, 0.7, 0.3, 0.2, 0.8,
+      0.8, 0.2, 0.3,  0.7,  0.9, 0.1, 0.25, 0.75,
+      0.6, 0.4, 0.15, 0.85, 0.7, 0.3, 0.2,  0.8,
   };
   const tree_hmm::ModelView model{plan, kStates, nodes, edges};
-  const tree_hmm::Marginals expected =
-      BruteForce(plan, kStates, nodes, edges);
+  const tree_hmm::Marginals expected = BruteForce(plan, kStates, nodes, edges);
   const tree_hmm::Marginals actual = tree_hmm::PosteriorMarginals(model);
   Check(Near(tree_hmm::PartitionFunction(model), expected.partition));
   Check(Near(tree_hmm::LogPartitionFunction(model),
              std::log(expected.partition)));
-  Check(Near(actual.partition, expected.partition));
-  for (std::size_t index = 0; index < actual.nodes.size(); ++index)
-    Check(Near(actual.nodes[index], expected.nodes[index]));
-  for (std::size_t index = 0; index < actual.edges.size(); ++index)
-    Check(Near(actual.edges[index], expected.edges[index]));
+  CheckMarginals(actual, expected);
+
+  const std::vector<double> zero_nodes{
+      0.55, 0.45, 1.0, 0.0, 0.0, 1.0, 0.7, 0.3, 0.0, 1.0,
+  };
+  const std::vector<double> zero_edges{
+      0.8, 0.2, 0.3, 0.7, 1.0, 0.0, 0.25, 0.75,
+      0.6, 0.4, 0.0, 1.0, 0.7, 0.3, 0.2,  0.8,
+  };
+  const tree_hmm::Marginals zero_expected =
+      BruteForce(plan, kStates, zero_nodes, zero_edges);
+  CheckMarginals(
+      tree_hmm::PosteriorMarginals({plan, kStates, zero_nodes, zero_edges}),
+      zero_expected);
 
   tree_hmm::Workspace workspace;
   workspace.Reserve(plan, kStates);
   const tree_hmm::MarginalView prepared =
       tree_hmm::PosteriorMarginalsPrepared(model, workspace);
   Check(Near(prepared.partition, expected.partition));
+  Check(Near(prepared.log_partition, std::log(expected.partition)));
   g_allocations = 0;
   g_count_allocations = true;
   for (int repeat = 0; repeat < 10; ++repeat) {
@@ -132,7 +158,45 @@ int main() {
   const btrc::Plan long_plan = btrc::MakePlan(long_parents);
   const std::vector<double> long_nodes(kLongNodes, 0.5);
   const std::vector<double> long_edges(kLongNodes - 1, 1.0);
-  const double log_partition = tree_hmm::LogPartitionFunction(
-      {long_plan, 1, long_nodes, long_edges});
+  const double log_partition =
+      tree_hmm::LogPartitionFunction({long_plan, 1, long_nodes, long_edges});
   Check(Near(log_partition, kLongNodes * std::log(0.5), 1e-10));
+  const tree_hmm::Marginals long_marginals =
+      tree_hmm::PosteriorMarginals({long_plan, 1, long_nodes, long_edges});
+  Check(long_marginals.partition == 0.0);
+  Check(Near(long_marginals.log_partition, log_partition, 1e-10));
+  Check(std::all_of(long_marginals.nodes.begin(), long_marginals.nodes.end(),
+                    [](double value) { return Near(value, 1.0); }));
+  Check(std::all_of(long_marginals.edges.begin(), long_marginals.edges.end(),
+                    [](double value) { return Near(value, 1.0); }));
+
+  const std::vector<double> long_binary_nodes(kLongNodes * 2, 0.5);
+  std::vector<double> long_binary_edges((kLongNodes - 1) * 4);
+  for (std::size_t edge = 0; edge < kLongNodes - 1; ++edge) {
+    std::copy_n(std::array<double, 4>{0.9, 0.1, 0.2, 0.8}.begin(), 4,
+                long_binary_edges.begin() + edge * 4);
+  }
+  const tree_hmm::Marginals long_binary_marginals =
+      tree_hmm::PosteriorMarginals(
+          {long_plan, 2, long_binary_nodes, long_binary_edges});
+  Check(long_binary_marginals.partition == 0.0);
+  Check(Near(long_binary_marginals.log_partition,
+             (kLongNodes - 1) * std::log(0.5), 1e-10));
+  for (std::size_t node = 0; node < kLongNodes; ++node) {
+    Check(Near(long_binary_marginals.nodes[node * 2] +
+                   long_binary_marginals.nodes[node * 2 + 1],
+               1.0));
+  }
+  for (std::size_t edge = 0; edge < kLongNodes - 1; ++edge) {
+    const double *joint = long_binary_marginals.edges.data() + edge * 4;
+    Check(Near(std::accumulate(joint, joint + 4, 0.0), 1.0));
+    const btrc::Index parent = long_plan.edge_parents()[edge];
+    const btrc::Index child = long_plan.edge_children()[edge];
+    Check(Near(joint[0] + joint[1], long_binary_marginals.nodes[parent * 2]));
+    Check(
+        Near(joint[2] + joint[3], long_binary_marginals.nodes[parent * 2 + 1]));
+    Check(Near(joint[0] + joint[2], long_binary_marginals.nodes[child * 2]));
+    Check(
+        Near(joint[1] + joint[3], long_binary_marginals.nodes[child * 2 + 1]));
+  }
 }
