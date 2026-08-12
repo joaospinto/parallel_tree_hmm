@@ -31,6 +31,8 @@ public:
                       std::size_t batch_capacity);
   void ReserveSampling(const btrc::Plan &plan, std::size_t states,
                        std::size_t batch_capacity);
+  void ReserveMarginals(const btrc::Plan &plan, std::size_t states,
+                        std::size_t batch_capacity);
 
   // Returns shared host/device storage owned by this workspace. Preparing
   // factors directly into it eliminates an otherwise redundant copy.
@@ -49,6 +51,8 @@ private:
   friend tree_hmm::BatchedPosteriorSampleView
   PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const float>,
                           Workspace &);
+  friend tree_hmm::BatchedMarginalView
+  PosteriorMarginalsPrepared(tree_hmm::BatchedModelView, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -64,6 +68,9 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
                         std::span<const float> uniforms, Workspace &workspace);
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace);
 
 } // namespace tree_hmm::metal
 

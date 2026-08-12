@@ -208,6 +208,23 @@ __device__ std::size_t CompressionVectorTapeIndex(const Params &params,
   return (tape * params.batch + batch) * params.states + state;
 }
 
+__device__ std::size_t NodeMarginalIndex(const Params &params,
+                                         std::size_t batch,
+                                         std::size_t node,
+                                         std::size_t state) {
+  return (batch * params.nodes + node) * params.states + state;
+}
+
+__device__ std::size_t EdgeMarginalIndex(const Params &params,
+                                         std::size_t batch,
+                                         std::size_t edge,
+                                         std::size_t parent_state,
+                                         std::size_t child_state) {
+  return ((batch * params.edges + edge) * params.states + parent_state) *
+             params.states +
+         child_state;
+}
+
 __device__ std::uint32_t SampleContiguous(const float *weights,
                                           std::uint32_t states, float uniform) {
   float total = 0.0f;
@@ -235,6 +252,10 @@ __device__ float LogProduct(float left, float middle, float right) {
   return left > 0.0f && middle > 0.0f && right > 0.0f
              ? logf(left) + logf(middle) + logf(right)
              : -INFINITY;
+}
+
+__device__ bool Finite(float value) {
+  return value > -INFINITY && value < INFINITY;
 }
 
 // Transpose the public [batch, node, state] input into the internal
@@ -350,6 +371,344 @@ __global__ void TakeLogs(float *values, std::size_t count) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index < count)
     values[index] = values[index] > 0.0f ? logf(values[index]) : -INFINITY;
+}
+
+__global__ void LogRake(const btrc::Rake *operations, const float *nodes,
+                        const float *paths, float *branches,
+                        float *path_tape, float *leaf_tape,
+                        float *message_tape, Params params) {
+  const std::size_t parent_state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (parent_state >= params.states || batch >= params.batch)
+    return;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch, parent_state)] =
+      nodes[node_base + parent_state];
+  for (std::size_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    path_tape[RakePathTapeIndex(
+        params, batch, operation.branch,
+        parent_state * params.states + child_state)] =
+        paths[path_base + parent_state * params.states + child_state];
+  }
+
+  float maximum = -INFINITY;
+  for (std::size_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    maximum = fmaxf(
+        maximum,
+        paths[path_base + parent_state * params.states + child_state] +
+            nodes[node_base + child_state]);
+  }
+  float message = maximum;
+  if (Finite(maximum)) {
+    float total = 0.0f;
+    for (std::size_t child_state = 0; child_state < params.states;
+         ++child_state) {
+      total += expf(paths[path_base + parent_state * params.states +
+                                child_state] +
+                    nodes[node_base + child_state] - maximum);
+    }
+    message += logf(total);
+  }
+  branches[BranchIndex(params, batch, operation.branch, parent_state)] =
+      message;
+  message_tape[RakeLeafTapeIndex(params, batch, operation.branch,
+                                 parent_state)] = message;
+}
+
+__global__ void LogCompress(const btrc::Compression *operations,
+                            const float *nodes, float *paths,
+                            float *left_tape, float *middle_tape,
+                            float *right_tape, float *output_tape,
+                            Params params) {
+  extern __shared__ float storage[];
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  float *left = storage;
+  float *right = left + matrix;
+  float *middle = right + matrix;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  const std::size_t entry = threadIdx.x;
+  if (batch >= params.batch)
+    return;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  if (entry < matrix) {
+    const std::size_t parent_state = entry / params.states;
+    const std::size_t child_state = entry % params.states;
+    const std::size_t tape_index = CompressionMatrixTapeIndex(
+        params, batch, operation.tape, entry);
+    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
+                                  parent_state, child_state)];
+    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
+                                   parent_state, child_state)];
+    left_tape[tape_index] = left[entry];
+    right_tape[tape_index] = right[entry];
+  }
+  if (entry < params.states) {
+    middle[entry] = nodes[NodeIndex(params, batch, operation.middle, entry)];
+    middle_tape[CompressionVectorTapeIndex(params, batch, operation.tape,
+                                           entry)] = middle[entry];
+  }
+  __syncthreads();
+  if (entry >= matrix)
+    return;
+
+  const std::size_t parent_state = entry / params.states;
+  const std::size_t child_state = entry % params.states;
+  float maximum = -INFINITY;
+  for (std::size_t middle_state = 0; middle_state < params.states;
+       ++middle_state) {
+    maximum = fmaxf(maximum,
+                    left[parent_state * params.states + middle_state] +
+                        middle[middle_state] +
+                        right[middle_state * params.states + child_state]);
+  }
+  float output = maximum;
+  if (Finite(maximum)) {
+    float total = 0.0f;
+    for (std::size_t middle_state = 0; middle_state < params.states;
+         ++middle_state) {
+      total += expf(left[parent_state * params.states + middle_state] +
+                    middle[middle_state] +
+                    right[middle_state * params.states + child_state] -
+                    maximum);
+    }
+    output += logf(total);
+  }
+  paths[PathIndex(params, batch, operation.left_edge, parent_state,
+                  child_state)] = output;
+  output_tape[CompressionMatrixTapeIndex(params, batch, operation.tape,
+                                         entry)] = output;
+}
+
+__global__ void FinishLogRootAndSeedMarginals(const float *nodes,
+                                               float *log_partitions,
+                                               float *node_marginals,
+                                               Params params) {
+  const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
+  if (batch >= params.batch)
+    return;
+  const std::size_t root_base = NodeIndex(params, batch, params.root, 0);
+  float maximum = -INFINITY;
+  for (std::size_t state = 0; state < params.states; ++state)
+    maximum = fmaxf(maximum, nodes[root_base + state]);
+  float log_partition = maximum;
+  if (Finite(maximum)) {
+    float total = 0.0f;
+    for (std::size_t state = 0; state < params.states; ++state)
+      total += expf(nodes[root_base + state] - maximum);
+    log_partition += logf(total);
+  }
+  log_partitions[batch] = log_partition;
+  for (std::size_t state = 0; state < params.states; ++state) {
+    node_marginals[NodeMarginalIndex(params, batch, params.root, state)] =
+        Finite(log_partition)
+            ? expf(nodes[root_base + state] - log_partition)
+            : 0.0f;
+  }
+}
+
+__global__ void ReverseLogCompressions(
+    const btrc::Compression *operations, const float *left_tape,
+    const float *middle_tape, const float *right_tape,
+    const float *output_tape, float *node_marginals, float *edge_marginals,
+    Params params) {
+  extern __shared__ float output_adjoints[];
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  const std::size_t entry = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (batch >= params.batch)
+    return;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  if (entry < matrix) {
+    const std::size_t parent_state = entry / params.states;
+    const std::size_t child_state = entry % params.states;
+    const std::size_t output_index = EdgeMarginalIndex(
+        params, batch, operation.left_edge, parent_state, child_state);
+    output_adjoints[entry] = edge_marginals[output_index];
+    edge_marginals[output_index] = 0.0f;
+  }
+  __syncthreads();
+  if (entry >= matrix)
+    return;
+
+  const std::size_t first_state = entry / params.states;
+  const std::size_t second_state = entry % params.states;
+  const std::size_t left_tape_index = CompressionMatrixTapeIndex(
+      params, batch, operation.tape, entry);
+  const float left = left_tape[left_tape_index];
+  float left_adjoint = 0.0f;
+  for (std::size_t child_state = 0; child_state < params.states;
+       ++child_state) {
+    const std::size_t output_entry =
+        first_state * params.states + child_state;
+    const float output = output_tape[CompressionMatrixTapeIndex(
+        params, batch, operation.tape, output_entry)];
+    const float term =
+        left + middle_tape[CompressionVectorTapeIndex(
+                   params, batch, operation.tape, second_state)] +
+        right_tape[CompressionMatrixTapeIndex(
+            params, batch, operation.tape,
+            second_state * params.states + child_state)];
+    if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
+        Finite(output)) {
+      left_adjoint += output_adjoints[output_entry] * expf(term - output);
+    }
+  }
+  edge_marginals[EdgeMarginalIndex(params, batch, operation.left_edge,
+                                   first_state, second_state)] = left_adjoint;
+
+  const float right = right_tape[left_tape_index];
+  float right_adjoint = 0.0f;
+  for (std::size_t parent_state = 0; parent_state < params.states;
+       ++parent_state) {
+    const std::size_t output_entry =
+        parent_state * params.states + second_state;
+    const float output = output_tape[CompressionMatrixTapeIndex(
+        params, batch, operation.tape, output_entry)];
+    const float term =
+        left_tape[CompressionMatrixTapeIndex(
+            params, batch, operation.tape,
+            parent_state * params.states + first_state)] +
+        middle_tape[CompressionVectorTapeIndex(
+            params, batch, operation.tape, first_state)] +
+        right;
+    if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
+        Finite(output)) {
+      right_adjoint += output_adjoints[output_entry] * expf(term - output);
+    }
+  }
+  edge_marginals[EdgeMarginalIndex(params, batch, operation.right_edge,
+                                   first_state, second_state)] += right_adjoint;
+
+  if (entry < params.states) {
+    const std::size_t middle_state = entry;
+    const float middle = middle_tape[CompressionVectorTapeIndex(
+        params, batch, operation.tape, middle_state)];
+    float middle_adjoint = 0.0f;
+    for (std::size_t parent_state = 0; parent_state < params.states;
+         ++parent_state) {
+      for (std::size_t child_state = 0; child_state < params.states;
+           ++child_state) {
+        const std::size_t output_entry =
+            parent_state * params.states + child_state;
+        const float output = output_tape[CompressionMatrixTapeIndex(
+            params, batch, operation.tape, output_entry)];
+        const float term =
+            left_tape[CompressionMatrixTapeIndex(
+                params, batch, operation.tape,
+                parent_state * params.states + middle_state)] +
+            middle +
+            right_tape[CompressionMatrixTapeIndex(
+                params, batch, operation.tape,
+                middle_state * params.states + child_state)];
+        if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
+            Finite(output)) {
+          middle_adjoint +=
+              output_adjoints[output_entry] * expf(term - output);
+        }
+      }
+    }
+    node_marginals[NodeMarginalIndex(params, batch, operation.middle,
+                                     middle_state)] += middle_adjoint;
+  }
+}
+
+__global__ void ReverseLogAbsorptions(
+    const btrc::BranchAbsorption *operations, const float *node_marginals,
+    float *branch_marginals, Params params) {
+  const std::size_t state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (state >= params.states || batch >= params.batch)
+    return;
+  const btrc::BranchAbsorption operation =
+      operations[params.operation_offset + operation_in_batch];
+  branch_marginals[BranchIndex(params, batch, operation.branch, state)] +=
+      node_marginals[NodeMarginalIndex(params, batch, operation.parent,
+                                       state)];
+}
+
+__global__ void ReverseLogCombinations(
+    const btrc::BranchCombination *operations, float *branch_marginals,
+    Params params) {
+  const std::size_t state = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (state >= params.states || batch >= params.batch)
+    return;
+  const btrc::BranchCombination operation =
+      operations[params.operation_offset + operation_in_batch];
+  branch_marginals[BranchIndex(params, batch, operation.source, state)] +=
+      branch_marginals[BranchIndex(params, batch, operation.destination,
+                                   state)];
+}
+
+__global__ void ReverseLogRakes(
+    const btrc::Rake *operations, const float *path_tape,
+    const float *leaf_tape, const float *message_tape,
+    const float *branch_marginals, float *node_marginals,
+    float *edge_marginals, Params params) {
+  const std::size_t matrix =
+      static_cast<std::size_t>(params.states) * params.states;
+  const std::size_t entry = threadIdx.x;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
+  if (batch >= params.batch || entry >= matrix)
+    return;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t parent_state = entry / params.states;
+  const std::size_t child_state = entry % params.states;
+  const float message = message_tape[RakeLeafTapeIndex(
+      params, batch, operation.branch, parent_state)];
+  const float term =
+      path_tape[RakePathTapeIndex(params, batch, operation.branch, entry)] +
+      leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch,
+                                  child_state)];
+  float contribution = 0.0f;
+  if (Finite(term) && Finite(message)) {
+    contribution =
+        branch_marginals[BranchIndex(params, batch, operation.branch,
+                                     parent_state)] *
+        expf(term - message);
+  }
+  edge_marginals[EdgeMarginalIndex(params, batch, operation.edge,
+                                   parent_state, child_state)] += contribution;
+
+  if (entry < params.states) {
+    const std::size_t leaf_state = entry;
+    float leaf_adjoint = 0.0f;
+    for (std::size_t rake_parent_state = 0;
+         rake_parent_state < params.states; ++rake_parent_state) {
+      const float rake_message = message_tape[RakeLeafTapeIndex(
+          params, batch, operation.branch, rake_parent_state)];
+      const float rake_term =
+          path_tape[RakePathTapeIndex(
+              params, batch, operation.branch,
+              rake_parent_state * params.states + leaf_state)] +
+          leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch,
+                                      leaf_state)];
+      if (Finite(rake_term) && Finite(rake_message)) {
+        leaf_adjoint +=
+            branch_marginals[BranchIndex(params, batch, operation.branch,
+                                         rake_parent_state)] *
+            expf(rake_term - rake_message);
+      }
+    }
+    node_marginals[NodeMarginalIndex(params, batch, operation.leaf,
+                                     leaf_state)] += leaf_adjoint;
+  }
 }
 
 __global__ void SaveRakeTapes(const btrc::Rake *operations, const float *nodes,
@@ -619,8 +978,8 @@ __global__ void MaximumRake(const btrc::Rake *operations, const float *nodes,
 }
 
 __global__ void
-MaximumCombineBranchesSerial(const btrc::BranchCombination *operations,
-                             float *branches, Params params) {
+LogCombineBranchesSerial(const btrc::BranchCombination *operations,
+                         float *branches, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -637,8 +996,8 @@ MaximumCombineBranchesSerial(const btrc::BranchCombination *operations,
 }
 
 __global__ void
-MaximumCombineBranches(const btrc::BranchCombination *operations,
-                       float *branches, Params params) {
+LogCombineBranches(const btrc::BranchCombination *operations,
+                   float *branches, Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -651,9 +1010,8 @@ MaximumCombineBranches(const btrc::BranchCombination *operations,
 }
 
 __global__ void
-MaximumAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
-                            float *nodes, const float *branches,
-                            Params params) {
+LogAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
+                        float *nodes, const float *branches, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -669,9 +1027,9 @@ MaximumAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
   }
 }
 
-__global__ void MaximumAbsorbBranches(const btrc::BranchAbsorption *operations,
-                                      float *nodes, const float *branches,
-                                      Params params) {
+__global__ void LogAbsorbBranches(const btrc::BranchAbsorption *operations,
+                                  float *nodes, const float *branches,
+                                  Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -1226,6 +1584,8 @@ struct Workspace::Impl {
   float *host_output = nullptr;
   std::uint32_t *host_assignments = nullptr;
   float *host_uniforms = nullptr;
+  float *host_node_marginals = nullptr;
+  float *host_edge_marginals = nullptr;
   std::uint8_t *host_observations = nullptr;
   float *host_root_potential = nullptr;
   float *host_emission_potentials = nullptr;
@@ -1252,11 +1612,17 @@ struct Workspace::Impl {
   float *compression_left_tape = nullptr;
   float *compression_middle_tape = nullptr;
   float *compression_right_tape = nullptr;
+  float *rake_message_tape = nullptr;
+  float *compression_output_tape = nullptr;
+  float *node_marginals = nullptr;
+  float *edge_marginals = nullptr;
+  float *branch_marginals = nullptr;
   std::vector<btrc::Index> observation_nodes;
   std::size_t categories = 0;
   bool categorical = false;
   bool maximum = false;
   bool sampling = false;
+  bool marginals = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -1290,11 +1656,18 @@ struct Workspace::Impl {
     DeviceFree(compression_left_tape);
     DeviceFree(compression_middle_tape);
     DeviceFree(compression_right_tape);
+    DeviceFree(rake_message_tape);
+    DeviceFree(compression_output_tape);
+    DeviceFree(node_marginals);
+    DeviceFree(edge_marginals);
+    DeviceFree(branch_marginals);
     HostFree(host_nodes);
     HostFree(host_edges);
     HostFree(host_output);
     HostFree(host_assignments);
     HostFree(host_uniforms);
+    HostFree(host_node_marginals);
+    HostFree(host_edge_marginals);
     HostFree(host_observations);
     HostFree(host_root_potential);
     HostFree(host_emission_potentials);
@@ -1315,6 +1688,7 @@ struct Workspace::Impl {
     categorical = false;
     maximum = false;
     sampling = false;
+    marginals = false;
   }
 
   ~Impl() { Clear(); }
@@ -1441,8 +1815,7 @@ void ReserveMaximumRecovery(Workspace::Impl &storage) {
   storage.maximum = true;
 }
 
-void ReserveSamplingRecovery(Workspace::Impl &storage) {
-  ReserveAssignments(storage);
+void ReserveConditionalTapes(Workspace::Impl &storage) {
   const btrc::Plan &plan = *storage.plan;
   const std::size_t matrix =
       CheckedProduct({storage.states, storage.states}, "state matrix");
@@ -1456,16 +1829,46 @@ void ReserveSamplingRecovery(Workspace::Impl &storage) {
   const std::size_t compression_vectors =
       CheckedProduct({storage.batch, plan.num_compressions(), storage.states},
                      "compression vector tape");
-  const std::size_t assignment_count =
-      CheckedProduct({storage.batch, plan.num_nodes()}, "posterior uniforms");
-  HostAllocate(storage.host_uniforms, assignment_count);
-  DeviceAllocate(storage.uniforms, assignment_count);
   DeviceAllocate(storage.rake_path_tape, rake_matrices);
   DeviceAllocate(storage.rake_leaf_tape, rake_vectors);
   DeviceAllocate(storage.compression_left_tape, compression_matrices);
   DeviceAllocate(storage.compression_middle_tape, compression_vectors);
   DeviceAllocate(storage.compression_right_tape, compression_matrices);
+}
+
+void ReserveSamplingRecovery(Workspace::Impl &storage) {
+  ReserveAssignments(storage);
+  ReserveConditionalTapes(storage);
+  const std::size_t assignment_count = CheckedProduct(
+      {storage.batch, storage.plan->num_nodes()}, "posterior uniforms");
+  HostAllocate(storage.host_uniforms, assignment_count);
+  DeviceAllocate(storage.uniforms, assignment_count);
   storage.sampling = true;
+}
+
+void ReserveMarginalRecovery(Workspace::Impl &storage) {
+  ReserveConditionalTapes(storage);
+  const btrc::Plan &plan = *storage.plan;
+  const std::size_t matrix =
+      CheckedProduct({storage.states, storage.states}, "state matrix");
+  const std::size_t node_values = CheckedProduct(
+      {storage.batch, plan.num_nodes(), storage.states}, "node marginals");
+  const std::size_t edge_values = CheckedProduct(
+      {storage.batch, plan.num_edges(), matrix}, "edge marginals");
+  const std::size_t branch_values =
+      CheckedProduct({storage.batch, plan.num_branches(), storage.states},
+                     "branch marginals");
+  const std::size_t compression_values =
+      CheckedProduct({storage.batch, plan.num_compressions(), matrix},
+                     "compression output tape");
+  HostAllocate(storage.host_node_marginals, node_values);
+  HostAllocate(storage.host_edge_marginals, edge_values);
+  DeviceAllocate(storage.node_marginals, node_values);
+  DeviceAllocate(storage.edge_marginals, edge_values);
+  DeviceAllocate(storage.branch_marginals, branch_values);
+  DeviceAllocate(storage.rake_message_tape, branch_values);
+  DeviceAllocate(storage.compression_output_tape, compression_values);
+  storage.marginals = true;
 }
 
 } // namespace
@@ -1561,6 +1964,21 @@ void Workspace::ReserveCategoricalSampling(
   ReserveCategorical(plan, states, batch, categories, observation_nodes,
                      device);
   ReserveSamplingRecovery(*impl_);
+}
+
+void Workspace::ReserveMarginals(const btrc::Plan &plan, std::size_t states,
+                                 std::size_t batch, int device) {
+  Reserve(plan, states, batch, device);
+  ReserveMarginalRecovery(*impl_);
+}
+
+void Workspace::ReserveCategoricalMarginals(
+    const btrc::Plan &plan, std::size_t states, std::size_t batch,
+    std::size_t categories, std::span<const btrc::Index> observation_nodes,
+    int device) {
+  ReserveCategorical(plan, states, batch, categories, observation_nodes,
+                     device);
+  ReserveMarginalRecovery(*impl_);
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
@@ -1965,21 +2383,21 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       break;
     case btrc::Primitive::kBranchCombination:
       if (states <= 8) {
-        MaximumCombineBranchesSerial<<<serial_blocks, kThreads, 0,
-                                       storage.stream>>>(
+        LogCombineBranchesSerial<<<serial_blocks, kThreads, 0,
+                                   storage.stream>>>(
             storage.combinations, storage.branches, params);
       } else {
-        MaximumCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
+        LogCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
             storage.combinations, storage.branches, params);
       }
       break;
     case btrc::Primitive::kBranchAbsorption:
       if (states <= 8) {
-        MaximumAbsorbBranchesSerial<<<serial_blocks, kThreads, 0,
-                                      storage.stream>>>(
+        LogAbsorbBranchesSerial<<<serial_blocks, kThreads, 0,
+                                  storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches, params);
       } else {
-        MaximumAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
+        LogAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches, params);
       }
       break;
@@ -2072,9 +2490,208 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
           {upload_ms, kernel_ms, download_ms, wall_ms}};
 }
 
-tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
-                            Workspace::Impl &storage, bool scaled,
-                            std::span<const float> uniforms = {}) {
+template <class StageInputs, class UploadInputs, class InitializeNodeData>
+tree_hmm::BatchedMarginalView
+RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
+                     std::size_t batch,
+                     std::span<const float> edge_potentials,
+                     Workspace::Impl &storage, StageInputs stage_inputs,
+                     UploadInputs upload_inputs,
+                     InitializeNodeData initialize_node_data) {
+  const auto wall_start = Clock::now();
+  if (!storage.marginals || storage.plan != &plan ||
+      storage.states != states || batch == 0 || batch > storage.batch) {
+    throw std::invalid_argument(
+        "prepared CUDA marginal inference requires ReserveMarginals for "
+        "this plan, state count, and batch capacity");
+  }
+  Check(cudaSetDevice(storage.device), "cudaSetDevice");
+  const std::size_t matrix = CheckedProduct({states, states}, "state matrix");
+  const std::size_t edge_values =
+      CheckedProduct({plan.num_edges(), matrix}, "edge inputs");
+  if (edge_potentials.size() != edge_values)
+    throw std::invalid_argument("CUDA edge input shape is wrong");
+  stage_inputs();
+  if (edge_potentials.data() != storage.host_edges) {
+    std::memcpy(storage.host_edges, edge_potentials.data(),
+                edge_potentials.size_bytes());
+  }
+
+  Check(cudaEventRecord(storage.upload_start, storage.stream),
+        "cudaEventRecord upload start");
+  upload_inputs();
+  Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
+                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                        storage.stream),
+        "cudaMemcpyAsync edge upload");
+  Check(cudaEventRecord(storage.upload_stop, storage.stream),
+        "cudaEventRecord upload stop");
+
+  constexpr std::size_t kThreads = 256;
+  Check(cudaEventRecord(storage.kernel_start, storage.stream),
+        "cudaEventRecord kernel start");
+  Params base_params = storage.params;
+  base_params.batch = CheckedU32(batch, "batch count");
+  base_params.scaled = 0;
+  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
+  initialize_node_data(base_params);
+  const std::size_t path_matrices =
+      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
+  if (path_matrices != 0) {
+    InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
+                      storage.stream>>>(storage.input_edges, storage.paths,
+                                        base_params);
+  }
+  const std::size_t node_values = CheckedProduct(
+      {batch, plan.num_nodes(), states}, "marginal node values");
+  TakeLogs<<<Blocks(node_values, kThreads), kThreads, 0, storage.stream>>>(
+      storage.nodes, node_values);
+  const std::size_t path_values = CheckedProduct(
+      {path_batches, plan.num_edges(), matrix}, "marginal path values");
+  if (path_values != 0) {
+    TakeLogs<<<Blocks(path_values, kThreads), kThreads, 0, storage.stream>>>(
+        storage.paths, path_values);
+  }
+  const std::size_t marginal_edge_values =
+      CheckedProduct({batch, plan.num_edges(), matrix}, "edge marginals");
+  const std::size_t branch_values =
+      CheckedProduct({batch, plan.num_branches(), states}, "branch marginals");
+  Check(cudaMemsetAsync(storage.node_marginals, 0,
+                        node_values * sizeof(float), storage.stream),
+        "cudaMemsetAsync node marginals");
+  Check(cudaMemsetAsync(storage.edge_marginals, 0,
+                        marginal_edge_values * sizeof(float), storage.stream),
+        "cudaMemsetAsync edge marginals");
+  Check(cudaMemsetAsync(storage.branch_marginals, 0,
+                        branch_values * sizeof(float), storage.stream),
+        "cudaMemsetAsync branch marginals");
+
+  for (const btrc::PrimitiveBatch &primitive_batch : plan.primitive_batches()) {
+    Params params = base_params;
+    params.operation_offset = primitive_batch.offset;
+    params.operation_count = primitive_batch.count;
+    const std::size_t operations = CheckedProduct(
+        {batch, primitive_batch.count}, "marginal primitive grid");
+    const std::uint32_t operation_blocks =
+        CheckedU32(operations, "marginal primitive grid");
+    switch (primitive_batch.primitive) {
+    case btrc::Primitive::kRake:
+      LogRake<<<operation_blocks, states, 0, storage.stream>>>(
+          storage.rakes, storage.nodes, storage.paths, storage.branches,
+          storage.rake_path_tape, storage.rake_leaf_tape,
+          storage.rake_message_tape, params);
+      break;
+    case btrc::Primitive::kBranchCombination:
+      LogCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
+          storage.combinations, storage.branches, params);
+      break;
+    case btrc::Primitive::kBranchAbsorption:
+      LogAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
+          storage.absorptions, storage.nodes, storage.branches, params);
+      break;
+    case btrc::Primitive::kCompression:
+      LogCompress<<<operation_blocks, matrix,
+                    (2 * matrix + states) * sizeof(float), storage.stream>>>(
+          storage.compressions, storage.nodes, storage.paths,
+          storage.compression_left_tape, storage.compression_middle_tape,
+          storage.compression_right_tape, storage.compression_output_tape,
+          params);
+      break;
+    }
+  }
+
+  FinishLogRootAndSeedMarginals<<<Blocks(batch, kThreads), kThreads, 0,
+                                  storage.stream>>>(
+      storage.nodes, storage.output, storage.node_marginals, base_params);
+  for (std::size_t index = plan.primitive_batches().size(); index-- > 0;) {
+    const btrc::PrimitiveBatch &primitive_batch =
+        plan.primitive_batches()[index];
+    Params params = base_params;
+    params.operation_offset = primitive_batch.offset;
+    params.operation_count = primitive_batch.count;
+    const std::size_t operations = CheckedProduct(
+        {batch, primitive_batch.count}, "marginal reverse grid");
+    const std::uint32_t operation_blocks =
+        CheckedU32(operations, "marginal reverse grid");
+    switch (primitive_batch.primitive) {
+    case btrc::Primitive::kRake:
+      ReverseLogRakes<<<operation_blocks, matrix, 0, storage.stream>>>(
+          storage.rakes, storage.rake_path_tape, storage.rake_leaf_tape,
+          storage.rake_message_tape, storage.branch_marginals,
+          storage.node_marginals, storage.edge_marginals, params);
+      break;
+    case btrc::Primitive::kBranchCombination:
+      ReverseLogCombinations<<<operation_blocks, states, 0, storage.stream>>>(
+          storage.combinations, storage.branch_marginals, params);
+      break;
+    case btrc::Primitive::kBranchAbsorption:
+      ReverseLogAbsorptions<<<operation_blocks, states, 0, storage.stream>>>(
+          storage.absorptions, storage.node_marginals,
+          storage.branch_marginals, params);
+      break;
+    case btrc::Primitive::kCompression:
+      ReverseLogCompressions<<<operation_blocks, matrix,
+                               matrix * sizeof(float), storage.stream>>>(
+          storage.compressions, storage.compression_left_tape,
+          storage.compression_middle_tape, storage.compression_right_tape,
+          storage.compression_output_tape, storage.node_marginals,
+          storage.edge_marginals, params);
+      break;
+    }
+  }
+  Check(cudaGetLastError(), "tree-HMM CUDA marginal kernel launch");
+  Check(cudaEventRecord(storage.kernel_stop, storage.stream),
+        "cudaEventRecord kernel stop");
+
+  Check(cudaEventRecord(storage.download_start, storage.stream),
+        "cudaEventRecord download start");
+  Check(cudaMemcpyAsync(storage.host_output, storage.output,
+                        batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        storage.stream),
+        "cudaMemcpyAsync marginal log-partition download");
+  Check(cudaMemcpyAsync(storage.host_node_marginals, storage.node_marginals,
+                        node_values * sizeof(float), cudaMemcpyDeviceToHost,
+                        storage.stream),
+        "cudaMemcpyAsync node-marginal download");
+  Check(cudaMemcpyAsync(storage.host_edge_marginals, storage.edge_marginals,
+                        marginal_edge_values * sizeof(float),
+                        cudaMemcpyDeviceToHost, storage.stream),
+        "cudaMemcpyAsync edge-marginal download");
+  Check(cudaEventRecord(storage.download_stop, storage.stream),
+        "cudaEventRecord download stop");
+  Check(cudaEventSynchronize(storage.download_stop),
+        "tree-HMM CUDA marginal execution");
+  for (std::size_t batch_index = 0; batch_index < batch; ++batch_index) {
+    if (!std::isfinite(storage.host_output[batch_index])) {
+      throw std::domain_error(
+          "the tree HMM has a nonpositive partition function");
+    }
+  }
+
+  float upload_ms = 0.0f;
+  float kernel_ms = 0.0f;
+  float download_ms = 0.0f;
+  Check(cudaEventElapsedTime(&upload_ms, storage.upload_start,
+                             storage.upload_stop),
+        "cudaEventElapsedTime marginal upload");
+  Check(cudaEventElapsedTime(&kernel_ms, storage.kernel_start,
+                             storage.kernel_stop),
+        "cudaEventElapsedTime marginal kernels");
+  Check(cudaEventElapsedTime(&download_ms, storage.download_start,
+                             storage.download_stop),
+        "cudaEventElapsedTime marginal download");
+  const double wall_ms =
+      std::chrono::duration<double, std::milli>(Clock::now() - wall_start)
+          .count();
+  return {{storage.host_output, batch},
+          {storage.host_node_marginals, node_values},
+          {storage.host_edge_marginals, marginal_edge_values},
+          {upload_ms, kernel_ms, download_ms, wall_ms}};
+}
+
+template <class Execute>
+auto WithDenseInputs(tree_hmm::BatchedModelView model,
+                     Workspace::Impl &storage, Execute execute) {
   if (storage.categorical)
     throw std::invalid_argument(
         "dense CUDA inference cannot use a categorical workspace");
@@ -2082,9 +2699,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
       {model.batch, model.plan.num_nodes(), model.states}, "node inputs");
   if (model.node_potentials.size() != node_values)
     throw std::invalid_argument("CUDA node input shape is wrong");
-  return RunPrepared(
-      model.plan, model.states, model.batch, model.edge_potentials, storage,
-      scaled, uniforms,
+  return execute(
       [&] {
         if (model.node_potentials.data() != storage.host_nodes) {
           std::memcpy(storage.host_nodes, model.node_potentials.data(),
@@ -2104,206 +2719,152 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                           (model.batch + kTransposeTile - 1) / kTransposeTile);
         InitializeNodes<<<blocks, threads, 0, storage.stream>>>(
             storage.input_nodes, storage.nodes, params);
+      });
+}
+
+template <class Execute>
+auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace::Impl &storage, Execute execute) {
+  if (!storage.categorical || model.categories != storage.categories ||
+      model.observation_nodes.size() != storage.observation_nodes.size() ||
+      !std::equal(model.observation_nodes.begin(),
+                  model.observation_nodes.end(),
+                  storage.observation_nodes.begin())) {
+    throw std::invalid_argument(
+        "categorical CUDA model does not match the reserved workspace");
+  }
+  const std::size_t observation_values =
+      CheckedProduct({model.batch, model.observation_nodes.size()},
+                     "categorical observations");
+  const std::size_t emission_values =
+      CheckedProduct({model.categories, model.states}, "categorical emissions");
+  if (model.observations.size() != observation_values ||
+      model.root_potential.size() != model.states ||
+      model.emission_potentials.size() != emission_values) {
+    throw std::invalid_argument("CUDA categorical input shapes are wrong");
+  }
+  return execute(
+      [&] {
+        if (model.observations.data() != storage.host_observations) {
+          std::memcpy(storage.host_observations, model.observations.data(),
+                      model.observations.size_bytes());
+        }
+        if (model.root_potential.data() != storage.host_root_potential) {
+          std::memcpy(storage.host_root_potential, model.root_potential.data(),
+                      model.root_potential.size_bytes());
+        }
+        if (model.emission_potentials.data() !=
+            storage.host_emission_potentials) {
+          std::memcpy(storage.host_emission_potentials,
+                      model.emission_potentials.data(),
+                      model.emission_potentials.size_bytes());
+        }
+      },
+      [&] {
+        Check(cudaMemcpyAsync(storage.input_observations,
+                              storage.host_observations,
+                              model.observations.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync categorical observation upload");
+        Check(cudaMemcpyAsync(storage.input_root_potential,
+                              storage.host_root_potential,
+                              model.root_potential.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync root-potential upload");
+        Check(cudaMemcpyAsync(storage.input_emission_potentials,
+                              storage.host_emission_potentials,
+                              model.emission_potentials.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync emission-potential upload");
+      },
+      [&](const Params &params) {
+        constexpr std::size_t kThreads = 256;
+        const std::size_t node_batches =
+            CheckedProduct({model.plan.num_nodes(), model.batch},
+                           "categorical node initialization");
+        InitializeCategoricalBase<<<Blocks(node_batches, kThreads), kThreads, 0,
+                                    storage.stream>>>(
+            storage.input_root_potential,
+            storage.categorical_observation_index_by_node, storage.nodes,
+            params);
+        if (!model.observation_nodes.empty()) {
+          const dim3 threads(kTransposeTile, kTransposeRows);
+          const dim3 blocks(
+              (model.observation_nodes.size() + kTransposeTile - 1) /
+                  kTransposeTile,
+              (model.batch + kTransposeTile - 1) / kTransposeTile);
+          ApplyCategoricalObservations<<<blocks, threads, 0, storage.stream>>>(
+              storage.input_observations, storage.categorical_observation_nodes,
+              storage.input_root_potential, storage.input_emission_potentials,
+              storage.nodes, params,
+              CheckedU32(model.observation_nodes.size(),
+                         "categorical observation count"),
+              CheckedU32(model.categories, "category count"));
+        }
+      });
+}
+
+tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
+                            Workspace::Impl &storage, bool scaled,
+                            std::span<const float> uniforms = {}) {
+  return WithDenseInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunPrepared(model.plan, model.states, model.batch,
+                           model.edge_potentials, storage, scaled, uniforms,
+                           stage, upload, initialize);
       });
 }
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
                             Workspace::Impl &storage, bool scaled,
                             std::span<const float> uniforms = {}) {
-  if (!storage.categorical || model.categories != storage.categories ||
-      model.observation_nodes.size() != storage.observation_nodes.size() ||
-      !std::equal(model.observation_nodes.begin(),
-                  model.observation_nodes.end(),
-                  storage.observation_nodes.begin())) {
-    throw std::invalid_argument(
-        "categorical CUDA model does not match the reserved workspace");
-  }
-  const std::size_t observation_values =
-      CheckedProduct({model.batch, model.observation_nodes.size()},
-                     "categorical observations");
-  const std::size_t emission_values =
-      CheckedProduct({model.categories, model.states}, "categorical emissions");
-  if (model.observations.size() != observation_values ||
-      model.root_potential.size() != model.states ||
-      model.emission_potentials.size() != emission_values) {
-    throw std::invalid_argument("CUDA categorical input shapes are wrong");
-  }
-  return RunPrepared(
-      model.plan, model.states, model.batch, model.edge_potentials, storage,
-      scaled, uniforms,
-      [&] {
-        if (model.observations.data() != storage.host_observations) {
-          std::memcpy(storage.host_observations, model.observations.data(),
-                      model.observations.size_bytes());
-        }
-        if (model.root_potential.data() != storage.host_root_potential) {
-          std::memcpy(storage.host_root_potential, model.root_potential.data(),
-                      model.root_potential.size_bytes());
-        }
-        if (model.emission_potentials.data() !=
-            storage.host_emission_potentials) {
-          std::memcpy(storage.host_emission_potentials,
-                      model.emission_potentials.data(),
-                      model.emission_potentials.size_bytes());
-        }
-      },
-      [&] {
-        Check(cudaMemcpyAsync(storage.input_observations,
-                              storage.host_observations,
-                              model.observations.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync categorical observation upload");
-        Check(cudaMemcpyAsync(storage.input_root_potential,
-                              storage.host_root_potential,
-                              model.root_potential.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync root-potential upload");
-        Check(cudaMemcpyAsync(storage.input_emission_potentials,
-                              storage.host_emission_potentials,
-                              model.emission_potentials.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync emission-potential upload");
-      },
-      [&](const Params &params) {
-        constexpr std::size_t kThreads = 256;
-        const std::size_t node_batches =
-            CheckedProduct({model.plan.num_nodes(), model.batch},
-                           "categorical node initialization");
-        InitializeCategoricalBase<<<Blocks(node_batches, kThreads), kThreads, 0,
-                                    storage.stream>>>(
-            storage.input_root_potential,
-            storage.categorical_observation_index_by_node, storage.nodes,
-            params);
-        if (!model.observation_nodes.empty()) {
-          const dim3 threads(kTransposeTile, kTransposeRows);
-          const dim3 blocks(
-              (model.observation_nodes.size() + kTransposeTile - 1) /
-                  kTransposeTile,
-              (model.batch + kTransposeTile - 1) / kTransposeTile);
-          ApplyCategoricalObservations<<<blocks, threads, 0, storage.stream>>>(
-              storage.input_observations, storage.categorical_observation_nodes,
-              storage.input_root_potential, storage.input_emission_potentials,
-              storage.nodes, params,
-              CheckedU32(model.observation_nodes.size(),
-                         "categorical observation count"),
-              CheckedU32(model.categories, "category count"));
-        }
+  return WithCategoricalInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunPrepared(model.plan, model.states, model.batch,
+                           model.edge_potentials, storage, scaled, uniforms,
+                           stage, upload, initialize);
       });
 }
 
 tree_hmm::BatchedMaximumAssignmentView
 RunMaximum(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
-  if (storage.categorical)
-    throw std::invalid_argument(
-        "dense CUDA inference cannot use a categorical workspace");
-  const std::size_t node_values = CheckedProduct(
-      {model.batch, model.plan.num_nodes(), model.states}, "node inputs");
-  if (model.node_potentials.size() != node_values)
-    throw std::invalid_argument("CUDA node input shape is wrong");
-  return RunMaximumPrepared(
-      model.plan, model.states, model.batch, model.edge_potentials, storage,
-      [&] {
-        if (model.node_potentials.data() != storage.host_nodes) {
-          std::memcpy(storage.host_nodes, model.node_potentials.data(),
-                      model.node_potentials.size_bytes());
-        }
-      },
-      [&] {
-        Check(cudaMemcpyAsync(storage.input_nodes, storage.host_nodes,
-                              model.node_potentials.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync node upload");
-      },
-      [&](const Params &params) {
-        const dim3 threads(kTransposeTile, kTransposeRows);
-        const dim3 blocks((model.plan.num_nodes() + kTransposeTile - 1) /
-                              kTransposeTile,
-                          (model.batch + kTransposeTile - 1) / kTransposeTile);
-        InitializeNodes<<<blocks, threads, 0, storage.stream>>>(
-            storage.input_nodes, storage.nodes, params);
+  return WithDenseInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunMaximumPrepared(model.plan, model.states, model.batch,
+                                  model.edge_potentials, storage, stage, upload,
+                                  initialize);
       });
 }
 
 tree_hmm::BatchedMaximumAssignmentView
 RunMaximum(tree_hmm::BatchedCategoricalModelView model,
            Workspace::Impl &storage) {
-  if (!storage.categorical || model.categories != storage.categories ||
-      model.observation_nodes.size() != storage.observation_nodes.size() ||
-      !std::equal(model.observation_nodes.begin(),
-                  model.observation_nodes.end(),
-                  storage.observation_nodes.begin())) {
-    throw std::invalid_argument(
-        "categorical CUDA model does not match the reserved workspace");
-  }
-  const std::size_t observation_values =
-      CheckedProduct({model.batch, model.observation_nodes.size()},
-                     "categorical observations");
-  const std::size_t emission_values =
-      CheckedProduct({model.categories, model.states}, "categorical emissions");
-  if (model.observations.size() != observation_values ||
-      model.root_potential.size() != model.states ||
-      model.emission_potentials.size() != emission_values) {
-    throw std::invalid_argument("CUDA categorical input shapes are wrong");
-  }
-  return RunMaximumPrepared(
-      model.plan, model.states, model.batch, model.edge_potentials, storage,
-      [&] {
-        if (model.observations.data() != storage.host_observations) {
-          std::memcpy(storage.host_observations, model.observations.data(),
-                      model.observations.size_bytes());
-        }
-        if (model.root_potential.data() != storage.host_root_potential) {
-          std::memcpy(storage.host_root_potential, model.root_potential.data(),
-                      model.root_potential.size_bytes());
-        }
-        if (model.emission_potentials.data() !=
-            storage.host_emission_potentials) {
-          std::memcpy(storage.host_emission_potentials,
-                      model.emission_potentials.data(),
-                      model.emission_potentials.size_bytes());
-        }
-      },
-      [&] {
-        Check(cudaMemcpyAsync(storage.input_observations,
-                              storage.host_observations,
-                              model.observations.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync categorical observation upload");
-        Check(cudaMemcpyAsync(storage.input_root_potential,
-                              storage.host_root_potential,
-                              model.root_potential.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync root-potential upload");
-        Check(cudaMemcpyAsync(storage.input_emission_potentials,
-                              storage.host_emission_potentials,
-                              model.emission_potentials.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "cudaMemcpyAsync emission-potential upload");
-      },
-      [&](const Params &params) {
-        constexpr std::size_t kThreads = 256;
-        const std::size_t node_batches =
-            CheckedProduct({model.plan.num_nodes(), model.batch},
-                           "categorical node initialization");
-        InitializeCategoricalBase<<<Blocks(node_batches, kThreads), kThreads, 0,
-                                    storage.stream>>>(
-            storage.input_root_potential,
-            storage.categorical_observation_index_by_node, storage.nodes,
-            params);
-        if (!model.observation_nodes.empty()) {
-          const dim3 threads(kTransposeTile, kTransposeRows);
-          const dim3 blocks(
-              (model.observation_nodes.size() + kTransposeTile - 1) /
-                  kTransposeTile,
-              (model.batch + kTransposeTile - 1) / kTransposeTile);
-          ApplyCategoricalObservations<<<blocks, threads, 0, storage.stream>>>(
-              storage.input_observations, storage.categorical_observation_nodes,
-              storage.input_root_potential, storage.input_emission_potentials,
-              storage.nodes, params,
-              CheckedU32(model.observation_nodes.size(),
-                         "categorical observation count"),
-              CheckedU32(model.categories, "category count"));
-        }
+  return WithCategoricalInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunMaximumPrepared(model.plan, model.states, model.batch,
+                                  model.edge_potentials, storage, stage, upload,
+                                  initialize);
+      });
+}
+
+tree_hmm::BatchedMarginalView
+RunMarginals(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
+  return WithDenseInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunMarginalsPrepared(model.plan, model.states, model.batch,
+                                    model.edge_potentials, storage, stage,
+                                    upload, initialize);
+      });
+}
+
+tree_hmm::BatchedMarginalView
+RunMarginals(tree_hmm::BatchedCategoricalModelView model,
+             Workspace::Impl &storage) {
+  return WithCategoricalInputs(
+      model, storage, [&](auto stage, auto upload, auto initialize) {
+        return RunMarginalsPrepared(model.plan, model.states, model.batch,
+                                    model.edge_potentials, storage, stage,
+                                    upload, initialize);
       });
 }
 
@@ -2363,6 +2924,17 @@ PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
   return {
       {workspace.impl_->host_assignments, model.batch * model.plan.num_nodes()},
       result.timings};
+}
+
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace) {
+  return RunMarginals(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedMarginalView PosteriorMarginalsPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace) {
+  return RunMarginals(model, *workspace.impl_);
 }
 
 } // namespace tree_hmm::cuda

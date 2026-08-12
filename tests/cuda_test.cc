@@ -48,6 +48,15 @@ int main() {
           std::span<const float> uniforms) {
         return tree_hmm::cuda::PosteriorSamplePrepared(model, uniforms,
                                                        workspace);
+      },
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategoricalMarginals(plan, states, batch, categories,
+                                              observation_nodes);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model) {
+        return tree_hmm::cuda::PosteriorMarginalsPrepared(model, workspace);
       });
   TestMaximumAccelerator(
       "CUDA", tree_hmm::cuda::Available(),
@@ -68,5 +77,14 @@ int main() {
       [&](tree_hmm::BatchedModelView model, std::span<const float> uniforms) {
         return tree_hmm::cuda::PosteriorSamplePrepared(model, uniforms,
                                                        workspace);
+      });
+  TestMarginalAccelerator(
+      "CUDA", tree_hmm::cuda::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
+        workspace.ReserveMarginals(plan, states, batch);
+      },
+      [&](std::size_t batch) { return workspace.Inputs(batch); },
+      [&](tree_hmm::BatchedModelView model) {
+        return tree_hmm::cuda::PosteriorMarginalsPrepared(model, workspace);
       });
 }

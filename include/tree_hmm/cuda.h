@@ -52,6 +52,12 @@ public:
       const btrc::Plan &plan, std::size_t states, std::size_t batch_capacity,
       std::size_t categories, std::span<const btrc::Index> observation_nodes,
       int device = 0);
+  void ReserveMarginals(const btrc::Plan &plan, std::size_t states,
+                        std::size_t batch_capacity, int device = 0);
+  void ReserveCategoricalMarginals(
+      const btrc::Plan &plan, std::size_t states, std::size_t batch_capacity,
+      std::size_t categories, std::span<const btrc::Index> observation_nodes,
+      int device = 0);
 
   // Returns pinned host storage owned by this workspace. Preparing factors
   // directly into it eliminates an otherwise redundant host-side copy.
@@ -84,6 +90,10 @@ private:
   friend tree_hmm::BatchedPosteriorSampleView
   PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
                           std::span<const float>, Workspace &);
+  friend tree_hmm::BatchedMarginalView
+  PosteriorMarginalsPrepared(tree_hmm::BatchedModelView, Workspace &);
+  friend tree_hmm::BatchedMarginalView PosteriorMarginalsPrepared(
+      tree_hmm::BatchedCategoricalModelView, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -111,6 +121,11 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
                         std::span<const float> uniforms, Workspace &workspace);
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
+                           Workspace &workspace);
+tree_hmm::BatchedMarginalView PosteriorMarginalsPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace);
 
 } // namespace tree_hmm::cuda
 

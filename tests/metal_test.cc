@@ -36,4 +36,13 @@ int main() {
         return tree_hmm::metal::PosteriorSamplePrepared(model, uniforms,
                                                         workspace);
       });
+  TestMarginalAccelerator(
+      "Metal", tree_hmm::metal::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
+        workspace.ReserveMarginals(plan, states, batch);
+      },
+      [&](std::size_t batch) { return workspace.Inputs(batch); },
+      [&](tree_hmm::BatchedModelView model) {
+        return tree_hmm::metal::PosteriorMarginalsPrepared(model, workspace);
+      });
 }

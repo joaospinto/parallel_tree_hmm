@@ -228,14 +228,16 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
 
 template <class Reserve, class Inputs, class SolveLog, class SolveMaximum,
           class SolveDense, class ReserveSampling, class Uniforms,
-          class SolveSampling>
+          class SolveSampling, class ReserveMarginals, class SolveMarginals>
 void TestCategoricalAccelerator(const char *name, bool available,
                                 Reserve reserve, Inputs inputs,
                                 SolveLog solve_log, SolveMaximum solve_maximum,
                                 SolveDense solve_dense,
                                 ReserveSampling reserve_sampling,
                                 Uniforms uniforms,
-                                SolveSampling solve_sampling) {
+                                SolveSampling solve_sampling,
+                                ReserveMarginals reserve_marginals,
+                                SolveMarginals solve_marginals) {
   if (!available)
     return;
   const btrc::Plan plan =
@@ -354,20 +356,23 @@ void TestCategoricalAccelerator(const char *name, bool available,
   }
 
   reserve_sampling(plan, kStates, kBatch, kCategories, observation_nodes);
-  staged = inputs(kBatch);
+  tree_hmm::MutableBatchedCategoricalModelView sampling_staged =
+      inputs(kBatch);
   std::copy(observations.begin(), observations.end(),
-            staged.observations.begin());
+            sampling_staged.observations.begin());
   std::copy(root_potential.begin(), root_potential.end(),
-            staged.root_potential.begin());
+            sampling_staged.root_potential.begin());
   std::copy(emissions.begin(), emissions.end(),
-            staged.emission_potentials.begin());
-  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+            sampling_staged.emission_potentials.begin());
+  std::copy(edges.begin(), edges.end(),
+            sampling_staged.edge_potentials.begin());
   std::span<float> staged_uniforms = uniforms(kBatch);
   for (std::size_t index = 0; index < staged_uniforms.size(); ++index)
     staged_uniforms[index] = 0.13f + 0.12f * static_cast<float>(index % 7);
   const tree_hmm::BatchedPosteriorSampleView samples =
-      solve_sampling(static_cast<tree_hmm::BatchedCategoricalModelView>(staged),
-                     staged_uniforms);
+      solve_sampling(
+          static_cast<tree_hmm::BatchedCategoricalModelView>(sampling_staged),
+          staged_uniforms);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
     std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
@@ -392,6 +397,59 @@ void TestCategoricalAccelerator(const char *name, bool available,
         throw std::runtime_error(
             std::string(name) +
             " categorical posterior sample disagrees with CPU");
+      }
+    }
+  }
+
+  reserve_marginals(plan, kStates, kBatch, kCategories, observation_nodes);
+  tree_hmm::MutableBatchedCategoricalModelView marginal_staged =
+      inputs(kBatch);
+  std::copy(observations.begin(), observations.end(),
+            marginal_staged.observations.begin());
+  std::copy(root_potential.begin(), root_potential.end(),
+            marginal_staged.root_potential.begin());
+  std::copy(emissions.begin(), emissions.end(),
+            marginal_staged.emission_potentials.begin());
+  std::copy(edges.begin(), edges.end(),
+            marginal_staged.edge_potentials.begin());
+  const tree_hmm::BatchedMarginalView marginals = solve_marginals(
+      static_cast<tree_hmm::BatchedCategoricalModelView>(marginal_staged));
+  const std::size_t nodes_per_batch = plan.num_nodes() * kStates;
+  const std::size_t edges_per_batch = plan.num_edges() * kStates * kStates;
+  if (marginals.log_partitions.size() != kBatch ||
+      marginals.nodes.size() != kBatch * nodes_per_batch ||
+      marginals.edges.size() != kBatch * edges_per_batch) {
+    throw std::runtime_error(std::string(name) +
+                             " categorical marginal shape is wrong");
+  }
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    const std::vector<double> nodes(
+        dense_nodes.begin() + batch * nodes_per_batch,
+        dense_nodes.begin() + (batch + 1) * nodes_per_batch);
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const tree_hmm::Marginals expected = tree_hmm::PosteriorMarginals(
+        {plan, kStates, nodes, host_edges});
+    if (std::abs(marginals.log_partitions[batch] -
+                 expected.log_partition) >
+        1e-4 * std::max(1.0, std::abs(expected.log_partition))) {
+      throw std::runtime_error(
+          std::string(name) +
+          " categorical marginal log partition disagrees with CPU");
+    }
+    for (std::size_t index = 0; index < nodes_per_batch; ++index) {
+      if (std::abs(marginals.nodes[batch * nodes_per_batch + index] -
+                   expected.nodes[index]) > 8e-5) {
+        throw std::runtime_error(
+            std::string(name) +
+            " categorical node marginal disagrees with CPU");
+      }
+    }
+    for (std::size_t index = 0; index < edges_per_batch; ++index) {
+      if (std::abs(marginals.edges[batch * edges_per_batch + index] -
+                   expected.edges[index]) > 8e-5) {
+        throw std::runtime_error(
+            std::string(name) +
+            " categorical edge marginal disagrees with CPU");
       }
     }
   }
@@ -534,6 +592,125 @@ void TestSamplingAccelerator(const char *name, bool available, Reserve reserve,
   if (!invalid_uniform_rejected) {
     throw std::runtime_error(std::string(name) +
                              " accepted an invalid posterior uniform");
+  }
+}
+
+template <class Reserve, class Inputs, class Solve>
+void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
+                             Inputs inputs, Solve solve) {
+  if (!available)
+    return;
+  const btrc::Plan plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kBatch = 5;
+  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      for (std::size_t state = 0; state < kStates; ++state) {
+        const std::size_t index =
+            (batch * plan.num_nodes() + node) * kStates + state;
+        nodes[index] = (batch + 2 * node + 3 * state) % 13 == 0
+                           ? 0.0f
+                           : 0.17f + 0.011f * static_cast<float>(
+                                         1 + batch + 2 * node + 5 * state);
+      }
+    }
+  }
+  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    for (std::size_t parent = 0; parent < kStates; ++parent) {
+      for (std::size_t child = 0; child < kStates; ++child) {
+        const std::size_t index =
+            (edge * kStates + parent) * kStates + child;
+        edges[index] = (edge + 3 * parent + 5 * child) % 17 == 0
+                           ? 0.0f
+                           : 0.09f + 0.008f * static_cast<float>(
+                                         1 + edge + parent + 2 * child);
+      }
+    }
+  }
+
+  reserve(plan, kStates, kBatch);
+  tree_hmm::MutableBatchedModelView staged = inputs(kBatch);
+  std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  const tree_hmm::BatchedMarginalView actual =
+      solve(static_cast<tree_hmm::BatchedModelView>(staged));
+  const std::size_t nodes_per_batch = plan.num_nodes() * kStates;
+  const std::size_t edges_per_batch =
+      plan.num_edges() * kStates * kStates;
+  if (actual.log_partitions.size() != kBatch ||
+      actual.nodes.size() != kBatch * nodes_per_batch ||
+      actual.edges.size() != kBatch * edges_per_batch) {
+    throw std::runtime_error(std::string(name) +
+                             " marginal output shape is wrong");
+  }
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    const std::vector<double> host_nodes(
+        nodes.begin() + batch * nodes_per_batch,
+        nodes.begin() + (batch + 1) * nodes_per_batch);
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const tree_hmm::Marginals expected = tree_hmm::PosteriorMarginals(
+        {plan, kStates, host_nodes, host_edges});
+    if (std::abs(actual.log_partitions[batch] - expected.log_partition) >
+        1e-4 * std::max(1.0, std::abs(expected.log_partition))) {
+      throw std::runtime_error(std::string(name) +
+                               " marginal log partition disagrees with CPU");
+    }
+    for (std::size_t index = 0; index < nodes_per_batch; ++index) {
+      if (std::abs(actual.nodes[batch * nodes_per_batch + index] -
+                   expected.nodes[index]) > 8e-5) {
+        throw std::runtime_error(std::string(name) +
+                                 " node marginal disagrees with CPU");
+      }
+    }
+    for (std::size_t index = 0; index < edges_per_batch; ++index) {
+      if (std::abs(actual.edges[batch * edges_per_batch + index] -
+                   expected.edges[index]) > 8e-5) {
+        throw std::runtime_error(std::string(name) +
+                                 " edge marginal disagrees with CPU");
+      }
+    }
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      float total = 0.0f;
+      for (std::size_t state = 0; state < kStates; ++state) {
+        total += actual.nodes[(batch * plan.num_nodes() + node) * kStates +
+                              state];
+      }
+      if (std::abs(total - 1.0f) > 1e-4f) {
+        throw std::runtime_error(std::string(name) +
+                                 " node marginal is not normalized");
+      }
+    }
+  }
+
+  const btrc::Plan root_plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1});
+  constexpr std::size_t kRootBatch = 3;
+  constexpr std::size_t kRootStates = 3;
+  const std::vector<float> root_nodes{
+      0.2f, 0.3f, 0.5f, 0.1f, 0.0f, 0.9f, 0.4f, 0.4f, 0.2f};
+  const std::vector<double> root_edges;
+  reserve(root_plan, kRootStates, kRootBatch);
+  tree_hmm::MutableBatchedModelView root_staged = inputs(kRootBatch);
+  std::copy(root_nodes.begin(), root_nodes.end(),
+            root_staged.node_potentials.begin());
+  const tree_hmm::BatchedMarginalView root_result =
+      solve(static_cast<tree_hmm::BatchedModelView>(root_staged));
+  for (std::size_t batch = 0; batch < kRootBatch; ++batch) {
+    const std::vector<double> host_nodes(
+        root_nodes.begin() + batch * kRootStates,
+        root_nodes.begin() + (batch + 1) * kRootStates);
+    const tree_hmm::Marginals expected = tree_hmm::PosteriorMarginals(
+        {root_plan, kRootStates, host_nodes, root_edges});
+    for (std::size_t state = 0; state < kRootStates; ++state) {
+      if (std::abs(root_result.nodes[batch * kRootStates + state] -
+                   expected.nodes[state]) > 5e-6) {
+        throw std::runtime_error(std::string(name) +
+                                 " root-only marginal disagrees with CPU");
+      }
+    }
   }
 }
 

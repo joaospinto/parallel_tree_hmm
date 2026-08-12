@@ -112,6 +112,17 @@ struct BatchedPosteriorSampleView {
   AcceleratorTimings timings;
 };
 
+// Posterior probabilities for every batch item. Log partitions have shape
+// [batch], nodes have shape [batch, node, state], and edges have shape
+// [batch, edge, parent state, child state]. All spans are owned by the backend
+// workspace.
+struct BatchedMarginalView {
+  std::span<const float> log_partitions;
+  std::span<const float> nodes;
+  std::span<const float> edges;
+  AcceleratorTimings timings;
+};
+
 } // namespace tree_hmm
 
 #endif // TREE_HMM_ACCELERATOR_H_

@@ -118,6 +118,17 @@ inline uint compression_vector_tape_index(constant Params &p, uint batch,
   return (tape * p.batch + batch) * p.states + state;
 }
 
+inline uint node_marginal_index(constant Params &p, uint batch, uint node,
+                                uint state) {
+  return (batch * p.nodes + node) * p.states + state;
+}
+
+inline uint edge_marginal_index(constant Params &p, uint batch, uint edge,
+                                uint parent_state, uint child_state) {
+  return ((batch * p.edges + edge) * p.states + parent_state) * p.states +
+         child_state;
+}
+
 inline uint sample_contiguous(device const float *weights, uint states,
                               float uniform) {
   float total = 0.0f;
@@ -206,6 +217,323 @@ kernel void take_logs(device float *values [[buffer(0)]],
                       uint index [[thread_position_in_grid]]) {
   if (index < count)
     values[index] = potential_log(values[index]);
+}
+
+kernel void log_rake(
+    device const Rake *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device const float *paths [[buffer(2)]],
+    device float *branches [[buffer(3)]],
+    device float *path_tape [[buffer(4)]],
+    device float *leaf_tape [[buffer(5)]],
+    device float *message_tape [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const Rake op = operations[p.operation_offset + gid.y];
+  const uint node_base = node_index(p, gid.z, op.leaf, 0);
+  const uint path_base = path_index(p, gid.z, op.edge, 0, 0);
+  leaf_tape[rake_leaf_tape_index(p, gid.z, op.branch, gid.x)] =
+      nodes[node_base + gid.x];
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    path_tape[rake_path_tape_index(
+        p, gid.z, op.branch, gid.x * p.states + child_state)] =
+        paths[path_base + gid.x * p.states + child_state];
+  }
+
+  float maximum = -INFINITY;
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    maximum = max(maximum,
+                  paths[path_base + gid.x * p.states + child_state] +
+                      nodes[node_base + child_state]);
+  }
+  float message = maximum;
+  if (isfinite(maximum)) {
+    float total = 0.0f;
+    for (uint child_state = 0; child_state < p.states; ++child_state) {
+      total += exp(paths[path_base + gid.x * p.states + child_state] +
+                   nodes[node_base + child_state] - maximum);
+    }
+    message += log(total);
+  }
+  branches[branch_index(p, gid.z, op.branch, gid.x)] = message;
+  message_tape[rake_leaf_tape_index(p, gid.z, op.branch, gid.x)] = message;
+}
+
+kernel void log_compress(
+    device const Compression *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device float *paths [[buffer(2)]],
+    device float *left_tape [[buffer(3)]],
+    device float *middle_tape [[buffer(4)]],
+    device float *right_tape [[buffer(5)]],
+    device float *output_tape [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    threadgroup float *scratch [[threadgroup(0)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+  if (group.x >= p.operation_count || group.y >= p.batch)
+    return;
+  const Compression op = operations[p.operation_offset + group.x];
+  const uint matrix_size = p.states * p.states;
+  threadgroup float *left = scratch;
+  threadgroup float *right = left + matrix_size;
+  threadgroup float *middle = right + matrix_size;
+  if (thread_index < matrix_size) {
+    const uint parent_state = thread_index / p.states;
+    const uint child_state = thread_index % p.states;
+    const uint tape_index =
+        compression_matrix_tape_index(p, group.y, op.tape, thread_index);
+    left[thread_index] =
+        paths[path_index(p, group.y, op.left_edge, parent_state, child_state)];
+    right[thread_index] = paths[path_index(
+        p, group.y, op.right_edge, parent_state, child_state)];
+    left_tape[tape_index] = left[thread_index];
+    right_tape[tape_index] = right[thread_index];
+  }
+  if (thread_index < p.states) {
+    middle[thread_index] =
+        nodes[node_index(p, group.y, op.middle, thread_index)];
+    middle_tape[compression_vector_tape_index(
+        p, group.y, op.tape, thread_index)] = middle[thread_index];
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index >= matrix_size)
+    return;
+
+  const uint parent_state = thread_index / p.states;
+  const uint child_state = thread_index % p.states;
+  float maximum = -INFINITY;
+  for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
+    maximum = max(maximum,
+                  left[parent_state * p.states + middle_state] +
+                      middle[middle_state] +
+                      right[middle_state * p.states + child_state]);
+  }
+  float output = maximum;
+  if (isfinite(maximum)) {
+    float total = 0.0f;
+    for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
+      total += exp(left[parent_state * p.states + middle_state] +
+                   middle[middle_state] +
+                   right[middle_state * p.states + child_state] - maximum);
+    }
+    output += log(total);
+  }
+  paths[path_index(p, group.y, op.left_edge, parent_state, child_state)] =
+      output;
+  output_tape[compression_matrix_tape_index(
+      p, group.y, op.tape, thread_index)] = output;
+}
+
+kernel void finish_log_root_and_seed_marginals(
+    device const float *nodes [[buffer(0)]],
+    device float *log_partitions [[buffer(1)]],
+    device float *node_marginals [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint batch_index [[thread_position_in_grid]]) {
+  if (batch_index >= p.batch)
+    return;
+  const uint root_base = node_index(p, batch_index, p.root, 0);
+  float maximum = -INFINITY;
+  for (uint state = 0; state < p.states; ++state)
+    maximum = max(maximum, nodes[root_base + state]);
+  float log_partition = maximum;
+  if (isfinite(maximum)) {
+    float total = 0.0f;
+    for (uint state = 0; state < p.states; ++state)
+      total += exp(nodes[root_base + state] - maximum);
+    log_partition += log(total);
+  }
+  log_partitions[batch_index] = log_partition;
+  for (uint state = 0; state < p.states; ++state) {
+    node_marginals[node_marginal_index(p, batch_index, p.root, state)] =
+        isfinite(log_partition)
+            ? exp(nodes[root_base + state] - log_partition)
+            : 0.0f;
+  }
+}
+
+kernel void reverse_log_compressions(
+    device const Compression *operations [[buffer(0)]],
+    device const float *left_tape [[buffer(1)]],
+    device const float *middle_tape [[buffer(2)]],
+    device const float *right_tape [[buffer(3)]],
+    device const float *output_tape [[buffer(4)]],
+    device float *node_marginals [[buffer(5)]],
+    device float *edge_marginals [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    threadgroup float *output_adjoints [[threadgroup(0)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+  if (group.x >= p.operation_count || group.y >= p.batch)
+    return;
+  const Compression op = operations[p.operation_offset + group.x];
+  const uint matrix_size = p.states * p.states;
+  if (thread_index < matrix_size) {
+    const uint parent_state = thread_index / p.states;
+    const uint child_state = thread_index % p.states;
+    const uint output_index = edge_marginal_index(
+        p, group.y, op.left_edge, parent_state, child_state);
+    output_adjoints[thread_index] = edge_marginals[output_index];
+    edge_marginals[output_index] = 0.0f;
+  }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index >= matrix_size)
+    return;
+
+  const uint first_state = thread_index / p.states;
+  const uint second_state = thread_index % p.states;
+  const uint tape_index =
+      compression_matrix_tape_index(p, group.y, op.tape, thread_index);
+  const float left = left_tape[tape_index];
+  float left_adjoint = 0.0f;
+  for (uint child_state = 0; child_state < p.states; ++child_state) {
+    const uint output_entry = first_state * p.states + child_state;
+    const float output = output_tape[compression_matrix_tape_index(
+        p, group.y, op.tape, output_entry)];
+    const float term =
+        left + middle_tape[compression_vector_tape_index(
+                   p, group.y, op.tape, second_state)] +
+        right_tape[compression_matrix_tape_index(
+            p, group.y, op.tape, second_state * p.states + child_state)];
+    if (output_adjoints[output_entry] != 0.0f && isfinite(term) &&
+        isfinite(output)) {
+      left_adjoint += output_adjoints[output_entry] * exp(term - output);
+    }
+  }
+  edge_marginals[edge_marginal_index(
+      p, group.y, op.left_edge, first_state, second_state)] = left_adjoint;
+
+  const float right = right_tape[tape_index];
+  float right_adjoint = 0.0f;
+  for (uint parent_state = 0; parent_state < p.states; ++parent_state) {
+    const uint output_entry = parent_state * p.states + second_state;
+    const float output = output_tape[compression_matrix_tape_index(
+        p, group.y, op.tape, output_entry)];
+    const float term =
+        left_tape[compression_matrix_tape_index(
+            p, group.y, op.tape, parent_state * p.states + first_state)] +
+        middle_tape[compression_vector_tape_index(
+            p, group.y, op.tape, first_state)] +
+        right;
+    if (output_adjoints[output_entry] != 0.0f && isfinite(term) &&
+        isfinite(output)) {
+      right_adjoint += output_adjoints[output_entry] * exp(term - output);
+    }
+  }
+  edge_marginals[edge_marginal_index(
+      p, group.y, op.right_edge, first_state, second_state)] += right_adjoint;
+
+  if (thread_index < p.states) {
+    const uint middle_state = thread_index;
+    const float middle = middle_tape[compression_vector_tape_index(
+        p, group.y, op.tape, middle_state)];
+    float middle_adjoint = 0.0f;
+    for (uint parent_state = 0; parent_state < p.states; ++parent_state) {
+      for (uint child_state = 0; child_state < p.states; ++child_state) {
+        const uint output_entry = parent_state * p.states + child_state;
+        const float output = output_tape[compression_matrix_tape_index(
+            p, group.y, op.tape, output_entry)];
+        const float term =
+            left_tape[compression_matrix_tape_index(
+                p, group.y, op.tape,
+                parent_state * p.states + middle_state)] +
+            middle +
+            right_tape[compression_matrix_tape_index(
+                p, group.y, op.tape,
+                middle_state * p.states + child_state)];
+        if (output_adjoints[output_entry] != 0.0f && isfinite(term) &&
+            isfinite(output)) {
+          middle_adjoint += output_adjoints[output_entry] * exp(term - output);
+        }
+      }
+    }
+    node_marginals[node_marginal_index(
+        p, group.y, op.middle, middle_state)] += middle_adjoint;
+  }
+}
+
+kernel void reverse_log_absorptions(
+    device const BranchAbsorption *operations [[buffer(0)]],
+    device const float *node_marginals [[buffer(1)]],
+    device float *branch_marginals [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const BranchAbsorption op = operations[p.operation_offset + gid.y];
+  branch_marginals[branch_index(p, gid.z, op.branch, gid.x)] +=
+      node_marginals[node_marginal_index(p, gid.z, op.parent, gid.x)];
+}
+
+kernel void reverse_log_combinations(
+    device const BranchCombination *operations [[buffer(0)]],
+    device float *branch_marginals [[buffer(1)]],
+    constant Params &p [[buffer(2)]],
+    uint3 gid [[thread_position_in_grid]]) {
+  if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
+    return;
+  const BranchCombination op = operations[p.operation_offset + gid.y];
+  branch_marginals[branch_index(p, gid.z, op.source, gid.x)] +=
+      branch_marginals[branch_index(p, gid.z, op.destination, gid.x)];
+}
+
+kernel void reverse_log_rakes(
+    device const Rake *operations [[buffer(0)]],
+    device const float *path_tape [[buffer(1)]],
+    device const float *leaf_tape [[buffer(2)]],
+    device const float *message_tape [[buffer(3)]],
+    device const float *branch_marginals [[buffer(4)]],
+    device float *node_marginals [[buffer(5)]],
+    device float *edge_marginals [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    uint thread_index [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+  const uint matrix_size = p.states * p.states;
+  if (group.x >= p.operation_count || group.y >= p.batch ||
+      thread_index >= matrix_size)
+    return;
+  const Rake op = operations[p.operation_offset + group.x];
+  const uint parent_state = thread_index / p.states;
+  const uint child_state = thread_index % p.states;
+  const float message = message_tape[rake_leaf_tape_index(
+      p, group.y, op.branch, parent_state)];
+  const float term =
+      path_tape[rake_path_tape_index(p, group.y, op.branch, thread_index)] +
+      leaf_tape[rake_leaf_tape_index(p, group.y, op.branch, child_state)];
+  float contribution = 0.0f;
+  if (isfinite(term) && isfinite(message)) {
+    contribution =
+        branch_marginals[branch_index(p, group.y, op.branch, parent_state)] *
+        exp(term - message);
+  }
+  edge_marginals[edge_marginal_index(
+      p, group.y, op.edge, parent_state, child_state)] += contribution;
+
+  if (thread_index < p.states) {
+    const uint leaf_state = thread_index;
+    float leaf_adjoint = 0.0f;
+    for (uint rake_parent_state = 0; rake_parent_state < p.states;
+         ++rake_parent_state) {
+      const float rake_message = message_tape[rake_leaf_tape_index(
+          p, group.y, op.branch, rake_parent_state)];
+      const float rake_term =
+          path_tape[rake_path_tape_index(
+              p, group.y, op.branch,
+              rake_parent_state * p.states + leaf_state)] +
+          leaf_tape[rake_leaf_tape_index(p, group.y, op.branch, leaf_state)];
+      if (isfinite(rake_term) && isfinite(rake_message)) {
+        leaf_adjoint +=
+            branch_marginals[branch_index(
+                p, group.y, op.branch, rake_parent_state)] *
+            exp(rake_term - rake_message);
+      }
+    }
+    node_marginals[node_marginal_index(
+        p, group.y, op.leaf, leaf_state)] += leaf_adjoint;
+  }
 }
 
 kernel void save_rake_tapes(
@@ -438,7 +766,7 @@ kernel void maximum_rake(
   choices[rake_choice_index(p, gid.z, op.branch, gid.x)] = choice;
 }
 
-kernel void maximum_combine_branches(
+kernel void log_combine_branches(
     device const BranchCombination *operations [[buffer(0)]],
     device float *branches [[buffer(1)]],
     constant Params &p [[buffer(2)]],
@@ -450,7 +778,7 @@ kernel void maximum_combine_branches(
       branches[branch_index(p, gid.z, op.source, gid.x)];
 }
 
-kernel void maximum_absorb_branches(
+kernel void log_absorb_branches(
     device const BranchAbsorption *operations [[buffer(0)]],
     device float *nodes [[buffer(1)]],
     device const float *branches [[buffer(2)]],
