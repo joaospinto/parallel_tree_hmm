@@ -293,10 +293,10 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
         MakeBuffer(runtime.device(),
                    CheckedProduct({batch, plan.num_nodes(), sizeof(float)},
                                   "Metal node scales"));
-    storage.path_scales =
-        MakeBuffer(runtime.device(),
-                   CheckedProduct({batch, plan.num_edges(), sizeof(float)},
-                                  "Metal path scales"));
+    storage.path_scales = MakeBuffer(
+        runtime.device(),
+        CheckedProduct({path_batches, plan.num_edges(), sizeof(float)},
+                       "Metal path scales"));
     storage.branch_scales =
         MakeBuffer(runtime.device(),
                    CheckedProduct({batch, plan.num_branches(), sizeof(float)},
@@ -409,10 +409,19 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     [encoder setBuffer:storage.input_nodes offset:0 atIndex:0];
     [encoder setBuffer:storage.nodes offset:0 atIndex:1];
     [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
-    DispatchOneDimensional(
-        encoder, runtime.initialize_nodes(),
-        CheckedProduct({model.batch, model.plan.num_nodes(), model.states},
-                       "Metal node initialization"));
+    constexpr NSUInteger kTransposeTile = 32;
+    constexpr NSUInteger kTransposeRows = 8;
+    [encoder setThreadgroupMemoryLength:kTransposeTile * (kTransposeTile + 1) *
+                                        sizeof(float)
+                                atIndex:0];
+    [encoder
+         dispatchThreadgroups:MTLSizeMake((model.plan.num_nodes() +
+                                           kTransposeTile - 1) /
+                                              kTransposeTile,
+                                          (model.batch + kTransposeTile - 1) /
+                                              kTransposeTile,
+                                          1)
+        threadsPerThreadgroup:MTLSizeMake(kTransposeTile, kTransposeRows, 1)];
 
     [encoder setComputePipelineState:runtime.initialize_paths()];
     [encoder setBuffer:storage.input_edges offset:0 atIndex:0];
@@ -421,7 +430,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     DispatchOneDimensional(
         encoder, runtime.initialize_paths(),
         CheckedProduct({base_params.paths_batched ? model.batch : 1,
-                        model.plan.num_edges(), model.states, model.states},
+                        model.plan.num_edges()},
                        "Metal path initialization"));
 
     for (const btrc::PrimitiveBatch &primitive_batch :

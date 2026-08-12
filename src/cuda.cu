@@ -120,39 +120,91 @@ void Upload(Value *destination, std::span<const Value> source,
 
 __device__ std::size_t NodeIndex(const Params &params, std::size_t batch,
                                  std::size_t node, std::size_t state) {
-  return (batch * params.nodes + node) * params.states + state;
+  return (node * params.batch + batch) * params.states + state;
 }
 
 __device__ std::size_t PathIndex(const Params &params, std::size_t batch,
                                  std::size_t edge, std::size_t parent_state,
                                  std::size_t child_state) {
   const std::size_t path_batch = params.paths_batched ? batch : 0;
-  return ((path_batch * params.edges + edge) * params.states + parent_state) *
+  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
+  return ((edge * path_batches + path_batch) * params.states + parent_state) *
              params.states +
          child_state;
 }
 
 __device__ std::size_t BranchIndex(const Params &params, std::size_t batch,
                                    std::size_t branch, std::size_t state) {
-  return (batch * params.branches + branch) * params.states + state;
+  return (branch * params.batch + batch) * params.states + state;
 }
+
+__device__ std::size_t NodeScaleIndex(const Params &params, std::size_t batch,
+                                      std::size_t node) {
+  return node * params.batch + batch;
+}
+
+__device__ std::size_t PathScaleIndex(const Params &params, std::size_t batch,
+                                      std::size_t edge) {
+  const std::size_t path_batch = params.paths_batched ? batch : 0;
+  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
+  return edge * path_batches + path_batch;
+}
+
+__device__ std::size_t BranchScaleIndex(const Params &params, std::size_t batch,
+                                        std::size_t branch) {
+  return branch * params.batch + batch;
+}
+
+// Transpose the public [batch, node, state] input into the internal
+// [node, batch, state] layout without constraining the state count.
+constexpr std::size_t kTransposeTile = 32;
+constexpr std::size_t kTransposeRows = 8;
 
 __global__ void InitializeNodes(const float *input, float *nodes,
-                                std::size_t total) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index < total)
-    nodes[index] = input[index];
+                                Params params) {
+  __shared__ float tile[kTransposeTile][kTransposeTile + 1];
+  const std::size_t node = blockIdx.x * kTransposeTile + threadIdx.x;
+  const std::size_t batch_base = blockIdx.y * kTransposeTile;
+  for (std::size_t state = 0; state < params.states; ++state) {
+    for (std::size_t row = threadIdx.y; row < kTransposeTile;
+         row += kTransposeRows) {
+      const std::size_t batch = batch_base + row;
+      if (node < params.nodes && batch < params.batch) {
+        const std::size_t input_index =
+            (batch * params.nodes + node) * params.states + state;
+        tile[row][threadIdx.x] = input[input_index];
+      }
+    }
+    __syncthreads();
+    const std::size_t batch = batch_base + threadIdx.x;
+    for (std::size_t row = threadIdx.y; row < kTransposeTile;
+         row += kTransposeRows) {
+      const std::size_t output_node = blockIdx.x * kTransposeTile + row;
+      if (output_node < params.nodes && batch < params.batch) {
+        nodes[NodeIndex(params, batch, output_node, state)] =
+            tile[threadIdx.x][row];
+      }
+    }
+    __syncthreads();
+  }
 }
 
-__global__ void InitializePaths(const float *input, float *paths, Params params,
-                                std::size_t total) {
+__global__ void InitializePaths(const float *input, float *paths,
+                                Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  if (index >= total)
+  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
+  const std::size_t count =
+      static_cast<std::size_t>(params.edges) * path_batches;
+  if (index >= count)
     return;
+  const std::size_t batch = index % path_batches;
+  const std::size_t edge = index / path_batches;
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  const std::size_t within_batch = index % (params.edges * matrix);
-  paths[index] = input[within_batch];
+  const std::size_t output = PathIndex(params, batch, edge, 0, 0);
+  const std::size_t source = edge * matrix;
+  for (std::size_t entry = 0; entry < matrix; ++entry)
+    paths[output + entry] = input[source + entry];
 }
 
 __global__ void Rake(const btrc::Rake *operations, const float *nodes,
@@ -161,8 +213,8 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
                      float *branch_scales, Params params) {
   __shared__ float normalizer;
   const std::size_t state = threadIdx.x;
-  const std::size_t operation_in_batch = blockIdx.x % params.operation_count;
-  const std::size_t batch = blockIdx.x / params.operation_count;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
@@ -182,9 +234,9 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
         detail::Maximum(branches + branch_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const float input_scale =
-        node_scales[batch * params.nodes + operation.leaf] +
-        path_scales[batch * params.edges + operation.edge];
-    branch_scales[batch * params.branches + operation.branch] =
+        node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
+        path_scales[PathScaleIndex(params, batch, operation.edge)];
+    branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
         detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
@@ -200,8 +252,8 @@ __global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
       static_cast<std::size_t>(params.batch) * params.operation_count;
   if (index >= count)
     return;
-  const std::size_t operation_in_batch = index % params.operation_count;
-  const std::size_t batch = index / params.operation_count;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
@@ -221,9 +273,10 @@ __global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     branches[branch_base + state] /= normalizer;
-  const float input_scale = node_scales[batch * params.nodes + operation.leaf] +
-                            path_scales[batch * params.edges + operation.edge];
-  branch_scales[batch * params.branches + operation.branch] =
+  const float input_scale =
+      node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
+      path_scales[PathScaleIndex(params, batch, operation.edge)];
+  branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
       detail::UpdatedLogScale(input_scale, maximum);
 }
 
@@ -232,8 +285,8 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
                                 Params params) {
   __shared__ float normalizer;
   const std::size_t state = threadIdx.x;
-  const std::size_t operation_in_batch = blockIdx.x % params.operation_count;
-  const std::size_t batch = blockIdx.x / params.operation_count;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const btrc::BranchCombination operation =
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
@@ -253,8 +306,9 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
         detail::Maximum(branches + destination_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t destination_scale =
-        batch * params.branches + operation.destination;
-    const std::size_t source_scale = batch * params.branches + operation.source;
+        BranchScaleIndex(params, batch, operation.destination);
+    const std::size_t source_scale =
+        BranchScaleIndex(params, batch, operation.source);
     const float input_scale =
         branch_scales[destination_scale] + branch_scales[source_scale];
     branch_scales[destination_scale] =
@@ -272,8 +326,8 @@ __global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
       static_cast<std::size_t>(params.batch) * params.operation_count;
   if (index >= count)
     return;
-  const std::size_t operation_in_batch = index % params.operation_count;
-  const std::size_t batch = index / params.operation_count;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchCombination operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t destination_base =
@@ -293,8 +347,9 @@ __global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
   for (std::size_t state = 0; state < params.states; ++state)
     branches[destination_base + state] /= normalizer;
   const std::size_t destination_scale =
-      batch * params.branches + operation.destination;
-  const std::size_t source_scale = batch * params.branches + operation.source;
+      BranchScaleIndex(params, batch, operation.destination);
+  const std::size_t source_scale =
+      BranchScaleIndex(params, batch, operation.source);
   const float input_scale =
       branch_scales[destination_scale] + branch_scales[source_scale];
   branch_scales[destination_scale] =
@@ -307,8 +362,8 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
                                Params params) {
   __shared__ float normalizer;
   const std::size_t state = threadIdx.x;
-  const std::size_t operation_in_batch = blockIdx.x % params.operation_count;
-  const std::size_t batch = blockIdx.x / params.operation_count;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const btrc::BranchAbsorption operation =
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
@@ -325,10 +380,11 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
   if (state == 0) {
     const float maximum = detail::Maximum(nodes + node_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
-    const std::size_t node_scale = batch * params.nodes + operation.parent;
+    const std::size_t node_scale =
+        NodeScaleIndex(params, batch, operation.parent);
     const float input_scale =
         node_scales[node_scale] +
-        branch_scales[batch * params.branches + operation.branch];
+        branch_scales[BranchScaleIndex(params, batch, operation.branch)];
     node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
@@ -345,8 +401,8 @@ __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
       static_cast<std::size_t>(params.batch) * params.operation_count;
   if (index >= count)
     return;
-  const std::size_t operation_in_batch = index % params.operation_count;
-  const std::size_t batch = index / params.operation_count;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchAbsorption operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
@@ -364,10 +420,11 @@ __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     nodes[node_base + state] /= normalizer;
-  const std::size_t node_scale = batch * params.nodes + operation.parent;
+  const std::size_t node_scale =
+      NodeScaleIndex(params, batch, operation.parent);
   const float input_scale =
       node_scales[node_scale] +
-      branch_scales[batch * params.branches + operation.branch];
+      branch_scales[BranchScaleIndex(params, batch, operation.branch)];
   node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
@@ -382,8 +439,8 @@ __global__ void Compress(const btrc::Compression *operations,
   float *left = storage;
   float *right = left + matrix;
   float *middle = right + matrix;
-  const std::size_t operation_in_batch = blockIdx.x % params.operation_count;
-  const std::size_t batch = blockIdx.x / params.operation_count;
+  const std::size_t batch = blockIdx.x % params.batch;
+  const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const btrc::Compression operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t entry = threadIdx.x;
@@ -418,11 +475,12 @@ __global__ void Compress(const btrc::Compression *operations,
     const float maximum =
         detail::Maximum(paths + output_base, static_cast<unsigned>(matrix));
     normalizer = maximum > 0.0f ? maximum : 1.0f;
-    const std::size_t left_scale = batch * params.edges + operation.left_edge;
+    const std::size_t left_scale =
+        PathScaleIndex(params, batch, operation.left_edge);
     const float input_scale =
         path_scales[left_scale] +
-        node_scales[batch * params.nodes + operation.middle] +
-        path_scales[batch * params.edges + operation.right_edge];
+        node_scales[NodeScaleIndex(params, batch, operation.middle)] +
+        path_scales[PathScaleIndex(params, batch, operation.right_edge)];
     path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
@@ -439,8 +497,8 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
       static_cast<std::size_t>(params.batch) * params.operation_count;
   if (index >= count)
     return;
-  const std::size_t operation_in_batch = index % params.operation_count;
-  const std::size_t batch = index / params.operation_count;
+  const std::size_t batch = index % params.batch;
+  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Compression operation =
       operations[params.operation_offset + operation_in_batch];
   constexpr std::size_t kStates = 4;
@@ -478,11 +536,12 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
     paths[PathIndex(params, batch, operation.left_edge, parent_state,
                     child_state)] /= normalizer;
   }
-  const std::size_t left_scale = batch * params.edges + operation.left_edge;
+  const std::size_t left_scale =
+      PathScaleIndex(params, batch, operation.left_edge);
   const float input_scale =
       path_scales[left_scale] +
-      node_scales[batch * params.nodes + operation.middle] +
-      path_scales[batch * params.edges + operation.right_edge];
+      node_scales[NodeScaleIndex(params, batch, operation.middle)] +
+      path_scales[PathScaleIndex(params, batch, operation.right_edge)];
   path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
@@ -497,7 +556,8 @@ __global__ void FinishRoot(const float *nodes, const float *node_scales,
   output[batch] =
       params.scaled
           ? (value > 0.0f
-                 ? node_scales[batch * params.nodes + params.root] + logf(value)
+                 ? node_scales[NodeScaleIndex(params, batch, params.root)] +
+                       logf(value)
                  : -INFINITY)
           : value;
 }
@@ -667,8 +727,9 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
   DeviceAllocate(storage.branches, branch_values);
   DeviceAllocate(storage.node_scales,
                  CheckedProduct({batch, plan.num_nodes()}, "node scales"));
-  DeviceAllocate(storage.path_scales,
-                 CheckedProduct({batch, plan.num_edges()}, "path scales"));
+  DeviceAllocate(
+      storage.path_scales,
+      CheckedProduct({path_batches, plan.num_edges()}, "path scales"));
   DeviceAllocate(storage.branch_scales,
                  CheckedProduct({batch, plan.num_branches()}, "branch scales"));
   DeviceAllocate(storage.output, batch);
@@ -748,13 +809,14 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   Params base_params = storage.params;
   base_params.batch = CheckedU32(model.batch, "batch count");
   base_params.scaled = scaled ? 1 : 0;
+  const std::size_t path_batches = base_params.paths_batched ? model.batch : 1;
   if (scaled) {
     Check(cudaMemsetAsync(storage.node_scales, 0,
                           model.batch * model.plan.num_nodes() * sizeof(float),
                           storage.stream),
           "cudaMemsetAsync node scales");
     Check(cudaMemsetAsync(storage.path_scales, 0,
-                          model.batch * model.plan.num_edges() * sizeof(float),
+                          path_batches * model.plan.num_edges() * sizeof(float),
                           storage.stream),
           "cudaMemsetAsync path scales");
     Check(
@@ -763,17 +825,18 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                         storage.stream),
         "cudaMemsetAsync branch scales");
   }
-  InitializeNodes<<<Blocks(node_values, kThreads), kThreads, 0,
-                    storage.stream>>>(storage.input_nodes, storage.nodes,
-                                      node_values);
+  const dim3 transpose_threads(kTransposeTile, kTransposeRows);
+  const dim3 transpose_blocks(
+      (model.plan.num_nodes() + kTransposeTile - 1) / kTransposeTile,
+      (model.batch + kTransposeTile - 1) / kTransposeTile);
+  InitializeNodes<<<transpose_blocks, transpose_threads, 0, storage.stream>>>(
+      storage.input_nodes, storage.nodes, base_params);
   const std::size_t path_values =
-      CheckedProduct({base_params.paths_batched ? model.batch : 1,
-                      model.plan.num_edges(), matrix},
-                     "path workspace");
+      CheckedProduct({path_batches, model.plan.num_edges()}, "path matrices");
   if (path_values != 0) {
     InitializePaths<<<Blocks(path_values, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
-                                        base_params, path_values);
+                                        base_params);
   }
 
   for (const btrc::PrimitiveBatch &batch : model.plan.primitive_batches()) {
