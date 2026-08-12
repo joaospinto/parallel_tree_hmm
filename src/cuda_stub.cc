@@ -20,12 +20,30 @@ void Workspace::Reserve(const btrc::Plan &, std::size_t, std::size_t, int) {
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
+void Workspace::ReserveCategorical(const btrc::Plan &, std::size_t, std::size_t,
+                                   std::size_t, std::span<const btrc::Index>,
+                                   int) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::MutableBatchedCategoricalModelView Workspace::CategoricalInputs() {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::MutableBatchedCategoricalModelView
+Workspace::CategoricalInputs(std::size_t) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
@@ -38,6 +56,19 @@ tree_hmm::PartitionView PartitionFunctionPrepared(tree_hmm::BatchedModelView,
 
 tree_hmm::PartitionView LogPartitionFunctionPrepared(tree_hmm::BatchedModelView,
                                                      Workspace &) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::PartitionView
+PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+tree_hmm::PartitionView
+LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView,
+                             Workspace &) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }

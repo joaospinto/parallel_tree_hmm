@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "src/cuda_device_algebra.h"
 
@@ -186,6 +187,63 @@ __global__ void InitializeNodes(const float *input, float *nodes,
       }
     }
     __syncthreads();
+  }
+}
+
+__global__ void
+InitializeCategoricalBase(const float *root_potential,
+                          const btrc::Index *observation_index_by_node,
+                          float *nodes, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.nodes) * params.batch;
+  if (index >= count)
+    return;
+  const std::size_t batch = index % params.batch;
+  const std::size_t node = index / params.batch;
+  if (observation_index_by_node[node] !=
+      std::numeric_limits<btrc::Index>::max())
+    return;
+  for (std::size_t state = 0; state < params.states; ++state) {
+    nodes[NodeIndex(params, batch, node, state)] =
+        node == params.root ? root_potential[state] : 1.0f;
+  }
+}
+
+__global__ void ApplyCategoricalObservations(
+    const std::uint8_t *observations, const btrc::Index *observation_nodes,
+    const float *root_potential, const float *emission_potentials, float *nodes,
+    Params params, std::uint32_t observation_count, std::uint32_t categories) {
+  __shared__ std::uint8_t tile[kTransposeTile][kTransposeTile + 1];
+  const std::size_t observation = blockIdx.x * kTransposeTile + threadIdx.x;
+  const std::size_t batch_base = blockIdx.y * kTransposeTile;
+  for (std::size_t row = threadIdx.y; row < kTransposeTile;
+       row += kTransposeRows) {
+    const std::size_t batch = batch_base + row;
+    if (observation < observation_count && batch < params.batch) {
+      tile[row][threadIdx.x] =
+          observations[batch * observation_count + observation];
+    }
+  }
+  __syncthreads();
+  const std::size_t batch = batch_base + threadIdx.x;
+  for (std::size_t row = threadIdx.y; row < kTransposeTile;
+       row += kTransposeRows) {
+    const std::size_t output_observation = blockIdx.x * kTransposeTile + row;
+    if (output_observation >= observation_count || batch >= params.batch)
+      continue;
+    const std::uint8_t category = tile[threadIdx.x][row];
+    const btrc::Index node = observation_nodes[output_observation];
+    for (std::size_t state = 0; state < params.states; ++state) {
+      const float emission =
+          category < categories
+              ? emission_potentials[static_cast<std::size_t>(category) *
+                                        params.states +
+                                    state]
+              : 0.0f;
+      nodes[NodeIndex(params, batch, node, state)] =
+          (node == params.root ? root_potential[state] : 1.0f) * emission;
+    }
   }
 }
 
@@ -589,8 +647,16 @@ struct Workspace::Impl {
   float *host_nodes = nullptr;
   float *host_edges = nullptr;
   float *host_output = nullptr;
+  std::uint8_t *host_observations = nullptr;
+  float *host_root_potential = nullptr;
+  float *host_emission_potentials = nullptr;
   float *input_nodes = nullptr;
   float *input_edges = nullptr;
+  std::uint8_t *input_observations = nullptr;
+  float *input_root_potential = nullptr;
+  float *input_emission_potentials = nullptr;
+  btrc::Index *categorical_observation_nodes = nullptr;
+  btrc::Index *categorical_observation_index_by_node = nullptr;
   float *nodes = nullptr;
   float *paths = nullptr;
   float *branches = nullptr;
@@ -598,6 +664,9 @@ struct Workspace::Impl {
   float *path_scales = nullptr;
   float *branch_scales = nullptr;
   float *output = nullptr;
+  std::vector<btrc::Index> observation_nodes;
+  std::size_t categories = 0;
+  bool categorical = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -610,6 +679,11 @@ struct Workspace::Impl {
     DeviceFree(compressions);
     DeviceFree(input_nodes);
     DeviceFree(input_edges);
+    DeviceFree(input_observations);
+    DeviceFree(input_root_potential);
+    DeviceFree(input_emission_potentials);
+    DeviceFree(categorical_observation_nodes);
+    DeviceFree(categorical_observation_index_by_node);
     DeviceFree(nodes);
     DeviceFree(paths);
     DeviceFree(branches);
@@ -620,6 +694,9 @@ struct Workspace::Impl {
     HostFree(host_nodes);
     HostFree(host_edges);
     HostFree(host_output);
+    HostFree(host_observations);
+    HostFree(host_root_potential);
+    HostFree(host_emission_potentials);
     Destroy(upload_start);
     Destroy(upload_stop);
     Destroy(kernel_start);
@@ -632,6 +709,9 @@ struct Workspace::Impl {
     batch = 0;
     device = 0;
     params = {};
+    observation_nodes.clear();
+    categories = 0;
+    categorical = false;
   }
 
   ~Impl() { Clear(); }
@@ -657,11 +737,12 @@ std::string DeviceDescription(int device) {
   return result.str();
 }
 
-void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
-                        std::size_t batch, int device) {
+namespace {
+
+void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
+                   std::size_t states, std::size_t batch, int device) {
   if (states == 0 || batch == 0)
     throw std::invalid_argument("CUDA state and batch counts must be nonzero");
-  Impl &storage = *impl_;
   storage.Clear();
   Check(cudaSetDevice(device), "cudaSetDevice");
   cudaDeviceProp properties{};
@@ -717,10 +798,8 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
       {path_batches, plan.num_edges(), matrix}, "path workspace");
   const std::size_t branch_values =
       CheckedProduct({batch, plan.num_branches(), states}, "branch workspace");
-  HostAllocate(storage.host_nodes, node_values);
   HostAllocate(storage.host_edges, edge_inputs);
   HostAllocate(storage.host_output, batch);
-  DeviceAllocate(storage.input_nodes, node_values);
   DeviceAllocate(storage.input_edges, edge_inputs);
   DeviceAllocate(storage.nodes, node_values);
   DeviceAllocate(storage.paths, path_values);
@@ -733,7 +812,71 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
   DeviceAllocate(storage.branch_scales,
                  CheckedProduct({batch, plan.num_branches()}, "branch scales"));
   DeviceAllocate(storage.output, batch);
+}
+
+} // namespace
+
+void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
+                        std::size_t batch, int device) {
+  Impl &storage = *impl_;
+  ReserveCommon(storage, plan, states, batch, device);
+  const std::size_t node_values =
+      CheckedProduct({batch, plan.num_nodes(), states}, "node inputs");
+  HostAllocate(storage.host_nodes, node_values);
+  DeviceAllocate(storage.input_nodes, node_values);
   Check(cudaStreamSynchronize(storage.stream), "topology upload");
+}
+
+void Workspace::ReserveCategorical(
+    const btrc::Plan &plan, std::size_t states, std::size_t batch,
+    std::size_t categories, std::span<const btrc::Index> observation_nodes,
+    int device) {
+  if (categories == 0 || categories > 256)
+    throw std::invalid_argument(
+        "CUDA categorical model must have between 1 and 256 categories");
+  btrc::Index previous = 0;
+  bool first = true;
+  for (const btrc::Index node : observation_nodes) {
+    if (node >= plan.num_nodes() || (!first && node <= previous)) {
+      throw std::invalid_argument(
+          "CUDA categorical observation nodes must be valid and strictly "
+          "increasing");
+    }
+    previous = node;
+    first = false;
+  }
+  Impl &storage = *impl_;
+  ReserveCommon(storage, plan, states, batch, device);
+  storage.categorical = true;
+  storage.categories = categories;
+  storage.observation_nodes.assign(observation_nodes.begin(),
+                                   observation_nodes.end());
+  const std::size_t observation_values = CheckedProduct(
+      {batch, observation_nodes.size()}, "categorical observations");
+  const std::size_t emission_values =
+      CheckedProduct({categories, states}, "categorical emissions");
+  HostAllocate(storage.host_observations, observation_values);
+  HostAllocate(storage.host_root_potential, states);
+  HostAllocate(storage.host_emission_potentials, emission_values);
+  DeviceAllocate(storage.input_observations, observation_values);
+  DeviceAllocate(storage.input_root_potential, states);
+  DeviceAllocate(storage.input_emission_potentials, emission_values);
+  DeviceAllocate(storage.categorical_observation_nodes,
+                 observation_nodes.size());
+  DeviceAllocate(storage.categorical_observation_index_by_node,
+                 plan.num_nodes());
+  Upload(storage.categorical_observation_nodes,
+         std::span<const btrc::Index>(storage.observation_nodes),
+         storage.stream);
+  std::vector<btrc::Index> observation_index_by_node(
+      plan.num_nodes(), std::numeric_limits<btrc::Index>::max());
+  for (std::size_t index = 0; index < observation_nodes.size(); ++index)
+    observation_index_by_node[observation_nodes[index]] =
+        static_cast<btrc::Index>(index);
+  Upload(storage.categorical_observation_index_by_node,
+         std::span<const btrc::Index>(observation_index_by_node),
+         storage.stream);
+  Check(cudaStreamSynchronize(storage.stream), "categorical topology upload");
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
@@ -744,6 +887,9 @@ tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
   Impl &storage = *impl_;
   if (storage.plan == nullptr)
     throw std::logic_error("CUDA Workspace::Reserve must precede Inputs");
+  if (storage.categorical)
+    throw std::logic_error(
+        "CUDA dense Inputs cannot be used after ReserveCategorical");
   if (batch == 0 || batch > storage.batch)
     throw std::invalid_argument(
         "CUDA input batch exceeds the reserved capacity");
@@ -759,46 +905,71 @@ tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
           {storage.host_edges, edge_values}};
 }
 
+tree_hmm::MutableBatchedCategoricalModelView Workspace::CategoricalInputs() {
+  return CategoricalInputs(impl_->batch);
+}
+
+tree_hmm::MutableBatchedCategoricalModelView
+Workspace::CategoricalInputs(std::size_t batch) {
+  Impl &storage = *impl_;
+  if (storage.plan == nullptr || !storage.categorical) {
+    throw std::logic_error(
+        "CUDA Workspace::ReserveCategorical must precede CategoricalInputs");
+  }
+  if (batch == 0 || batch > storage.batch)
+    throw std::invalid_argument(
+        "CUDA categorical input batch exceeds the reserved capacity");
+  const std::size_t observation_values = CheckedProduct(
+      {batch, storage.observation_nodes.size()}, "categorical observations");
+  const std::size_t emission_values = CheckedProduct(
+      {storage.categories, storage.states}, "categorical emissions");
+  const std::size_t edge_values = CheckedProduct(
+      {storage.plan->num_edges(), storage.states, storage.states},
+      "CUDA categorical input edges");
+  return {*storage.plan,
+          storage.states,
+          batch,
+          storage.categories,
+          storage.observation_nodes,
+          {storage.host_observations, observation_values},
+          {storage.host_root_potential, storage.states},
+          {storage.host_emission_potentials, emission_values},
+          {storage.host_edges, edge_values}};
+}
+
 namespace {
 
-tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
-                            Workspace::Impl &storage, bool scaled) {
+template <class StageInputs, class UploadInputs, class InitializeNodeData>
+tree_hmm::PartitionView
+RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
+            std::span<const float> edge_potentials, Workspace::Impl &storage,
+            bool scaled, StageInputs stage_inputs, UploadInputs upload_inputs,
+            InitializeNodeData initialize_node_data) {
   const auto wall_start = Clock::now();
-  if (storage.plan != &model.plan || storage.states != model.states ||
-      model.batch == 0 || model.batch > storage.batch) {
+  if (storage.plan != &plan || storage.states != states || batch == 0 ||
+      batch > storage.batch) {
     throw std::invalid_argument(
         "prepared CUDA inference requires Workspace::Reserve for this plan, "
         "state count, and batch capacity");
   }
   Check(cudaSetDevice(storage.device), "cudaSetDevice");
-  const std::size_t matrix =
-      CheckedProduct({model.states, model.states}, "state matrix");
-  const std::size_t node_values = CheckedProduct(
-      {model.batch, model.plan.num_nodes(), model.states}, "node inputs");
+  const std::size_t matrix = CheckedProduct({states, states}, "state matrix");
   const std::size_t edge_values =
-      CheckedProduct({model.plan.num_edges(), matrix}, "edge inputs");
-  if (model.node_potentials.size() != node_values ||
-      model.edge_potentials.size() != edge_values) {
-    throw std::invalid_argument("CUDA input shapes do not match the workspace");
-  }
-  if (model.node_potentials.data() != storage.host_nodes) {
-    std::memcpy(storage.host_nodes, model.node_potentials.data(),
-                model.node_potentials.size_bytes());
-  }
-  if (model.edge_potentials.data() != storage.host_edges) {
-    std::memcpy(storage.host_edges, model.edge_potentials.data(),
-                model.edge_potentials.size_bytes());
+      CheckedProduct({plan.num_edges(), matrix}, "edge inputs");
+  if (edge_potentials.size() != edge_values)
+    throw std::invalid_argument("CUDA edge input shape is wrong");
+  stage_inputs();
+  if (edge_potentials.data() != storage.host_edges) {
+    std::memcpy(storage.host_edges, edge_potentials.data(),
+                edge_potentials.size_bytes());
   }
 
   Check(cudaEventRecord(storage.upload_start, storage.stream),
         "cudaEventRecord upload start");
-  Check(cudaMemcpyAsync(storage.input_nodes, storage.host_nodes,
-                        model.node_potentials.size_bytes(),
-                        cudaMemcpyHostToDevice, storage.stream),
-        "cudaMemcpyAsync node upload");
+  upload_inputs();
   Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
-                        model.edge_potentials.size_bytes(),
-                        cudaMemcpyHostToDevice, storage.stream),
+                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                        storage.stream),
         "cudaMemcpyAsync edge upload");
   Check(cudaEventRecord(storage.upload_stop, storage.stream),
         "cudaEventRecord upload stop");
@@ -807,101 +978,93 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   Check(cudaEventRecord(storage.kernel_start, storage.stream),
         "cudaEventRecord kernel start");
   Params base_params = storage.params;
-  base_params.batch = CheckedU32(model.batch, "batch count");
+  base_params.batch = CheckedU32(batch, "batch count");
   base_params.scaled = scaled ? 1 : 0;
-  const std::size_t path_batches = base_params.paths_batched ? model.batch : 1;
+  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
   if (scaled) {
     Check(cudaMemsetAsync(storage.node_scales, 0,
-                          model.batch * model.plan.num_nodes() * sizeof(float),
+                          batch * plan.num_nodes() * sizeof(float),
                           storage.stream),
           "cudaMemsetAsync node scales");
     Check(cudaMemsetAsync(storage.path_scales, 0,
-                          path_batches * model.plan.num_edges() * sizeof(float),
+                          path_batches * plan.num_edges() * sizeof(float),
                           storage.stream),
           "cudaMemsetAsync path scales");
-    Check(
-        cudaMemsetAsync(storage.branch_scales, 0,
-                        model.batch * model.plan.num_branches() * sizeof(float),
-                        storage.stream),
-        "cudaMemsetAsync branch scales");
+    Check(cudaMemsetAsync(storage.branch_scales, 0,
+                          batch * plan.num_branches() * sizeof(float),
+                          storage.stream),
+          "cudaMemsetAsync branch scales");
   }
-  const dim3 transpose_threads(kTransposeTile, kTransposeRows);
-  const dim3 transpose_blocks(
-      (model.plan.num_nodes() + kTransposeTile - 1) / kTransposeTile,
-      (model.batch + kTransposeTile - 1) / kTransposeTile);
-  InitializeNodes<<<transpose_blocks, transpose_threads, 0, storage.stream>>>(
-      storage.input_nodes, storage.nodes, base_params);
+  initialize_node_data(base_params);
   const std::size_t path_values =
-      CheckedProduct({path_batches, model.plan.num_edges()}, "path matrices");
+      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
   if (path_values != 0) {
     InitializePaths<<<Blocks(path_values, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
                                         base_params);
   }
 
-  for (const btrc::PrimitiveBatch &batch : model.plan.primitive_batches()) {
+  for (const btrc::PrimitiveBatch &primitive_batch : plan.primitive_batches()) {
     Params params = base_params;
-    params.operation_offset = batch.offset;
-    params.operation_count = batch.count;
+    params.operation_offset = primitive_batch.offset;
+    params.operation_count = primitive_batch.count;
     const std::size_t operations =
-        CheckedProduct({model.batch, batch.count}, "primitive CUDA grid");
+        CheckedProduct({batch, primitive_batch.count}, "primitive CUDA grid");
     const std::uint32_t operation_blocks =
         CheckedU32(operations, "primitive CUDA grid");
     const std::uint32_t serial_blocks = Blocks(operations, kThreads);
-    switch (batch.primitive) {
+    switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
-      if (model.states <= 8) {
+      if (states <= 8) {
         RakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths, storage.branches,
             storage.node_scales, storage.path_scales, storage.branch_scales,
             params);
       } else {
-        Rake<<<operation_blocks, model.states, 0, storage.stream>>>(
+        Rake<<<operation_blocks, states, 0, storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths, storage.branches,
             storage.node_scales, storage.path_scales, storage.branch_scales,
             params);
       }
       break;
     case btrc::Primitive::kBranchCombination:
-      if (model.states <= 8) {
+      if (states <= 8) {
         CombineBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.combinations, storage.branches, storage.branch_scales,
             params);
       } else {
-        CombineBranches<<<operation_blocks, model.states, 0, storage.stream>>>(
+        CombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
             storage.combinations, storage.branches, storage.branch_scales,
             params);
       }
       break;
     case btrc::Primitive::kBranchAbsorption:
-      if (model.states <= 8) {
+      if (states <= 8) {
         AbsorbBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches,
             storage.node_scales, storage.branch_scales, params);
       } else {
-        AbsorbBranches<<<operation_blocks, model.states, 0, storage.stream>>>(
+        AbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches,
             storage.node_scales, storage.branch_scales, params);
       }
       break;
     case btrc::Primitive::kCompression:
-      if (model.states == 4) {
+      if (states == 4) {
         CompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
             storage.node_scales, storage.path_scales, params);
       } else {
         Compress<<<operation_blocks, matrix,
-                   (2 * matrix + model.states) * sizeof(float),
-                   storage.stream>>>(storage.compressions, storage.nodes,
-                                     storage.paths, storage.node_scales,
-                                     storage.path_scales, params);
+                   (2 * matrix + states) * sizeof(float), storage.stream>>>(
+            storage.compressions, storage.nodes, storage.paths,
+            storage.node_scales, storage.path_scales, params);
       }
       break;
     }
   }
-  FinishRoot<<<CheckedU32(model.batch, "root CUDA grid"), 1, 0,
-               storage.stream>>>(storage.nodes, storage.node_scales,
-                                 storage.output, base_params);
+  FinishRoot<<<CheckedU32(batch, "root CUDA grid"), 1, 0, storage.stream>>>(
+      storage.nodes, storage.node_scales, storage.output, base_params);
   Check(cudaGetLastError(), "tree-HMM CUDA kernel launch");
   Check(cudaEventRecord(storage.kernel_stop, storage.stream),
         "cudaEventRecord kernel stop");
@@ -909,7 +1072,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   Check(cudaEventRecord(storage.download_start, storage.stream),
         "cudaEventRecord download start");
   Check(cudaMemcpyAsync(storage.host_output, storage.output,
-                        model.batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        batch * sizeof(float), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync output download");
   Check(cudaEventRecord(storage.download_stop, storage.stream),
@@ -931,8 +1094,125 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   const double wall_ms =
       std::chrono::duration<double, std::milli>(Clock::now() - wall_start)
           .count();
-  return {{storage.host_output, model.batch},
+  return {{storage.host_output, batch},
           {upload_ms, kernel_ms, download_ms, wall_ms}};
+}
+
+tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
+                            Workspace::Impl &storage, bool scaled) {
+  if (storage.categorical)
+    throw std::invalid_argument(
+        "dense CUDA inference cannot use a categorical workspace");
+  const std::size_t node_values = CheckedProduct(
+      {model.batch, model.plan.num_nodes(), model.states}, "node inputs");
+  if (model.node_potentials.size() != node_values)
+    throw std::invalid_argument("CUDA node input shape is wrong");
+  return RunPrepared(
+      model.plan, model.states, model.batch, model.edge_potentials, storage,
+      scaled,
+      [&] {
+        if (model.node_potentials.data() != storage.host_nodes) {
+          std::memcpy(storage.host_nodes, model.node_potentials.data(),
+                      model.node_potentials.size_bytes());
+        }
+      },
+      [&] {
+        Check(cudaMemcpyAsync(storage.input_nodes, storage.host_nodes,
+                              model.node_potentials.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync node upload");
+      },
+      [&](const Params &params) {
+        const dim3 threads(kTransposeTile, kTransposeRows);
+        const dim3 blocks((model.plan.num_nodes() + kTransposeTile - 1) /
+                              kTransposeTile,
+                          (model.batch + kTransposeTile - 1) / kTransposeTile);
+        InitializeNodes<<<blocks, threads, 0, storage.stream>>>(
+            storage.input_nodes, storage.nodes, params);
+      });
+}
+
+tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
+                            Workspace::Impl &storage, bool scaled) {
+  if (!storage.categorical || model.categories != storage.categories ||
+      model.observation_nodes.size() != storage.observation_nodes.size() ||
+      !std::equal(model.observation_nodes.begin(),
+                  model.observation_nodes.end(),
+                  storage.observation_nodes.begin())) {
+    throw std::invalid_argument(
+        "categorical CUDA model does not match the reserved workspace");
+  }
+  const std::size_t observation_values =
+      CheckedProduct({model.batch, model.observation_nodes.size()},
+                     "categorical observations");
+  const std::size_t emission_values =
+      CheckedProduct({model.categories, model.states}, "categorical emissions");
+  if (model.observations.size() != observation_values ||
+      model.root_potential.size() != model.states ||
+      model.emission_potentials.size() != emission_values) {
+    throw std::invalid_argument("CUDA categorical input shapes are wrong");
+  }
+  return RunPrepared(
+      model.plan, model.states, model.batch, model.edge_potentials, storage,
+      scaled,
+      [&] {
+        if (model.observations.data() != storage.host_observations) {
+          std::memcpy(storage.host_observations, model.observations.data(),
+                      model.observations.size_bytes());
+        }
+        if (model.root_potential.data() != storage.host_root_potential) {
+          std::memcpy(storage.host_root_potential, model.root_potential.data(),
+                      model.root_potential.size_bytes());
+        }
+        if (model.emission_potentials.data() !=
+            storage.host_emission_potentials) {
+          std::memcpy(storage.host_emission_potentials,
+                      model.emission_potentials.data(),
+                      model.emission_potentials.size_bytes());
+        }
+      },
+      [&] {
+        Check(cudaMemcpyAsync(storage.input_observations,
+                              storage.host_observations,
+                              model.observations.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync categorical observation upload");
+        Check(cudaMemcpyAsync(storage.input_root_potential,
+                              storage.host_root_potential,
+                              model.root_potential.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync root-potential upload");
+        Check(cudaMemcpyAsync(storage.input_emission_potentials,
+                              storage.host_emission_potentials,
+                              model.emission_potentials.size_bytes(),
+                              cudaMemcpyHostToDevice, storage.stream),
+              "cudaMemcpyAsync emission-potential upload");
+      },
+      [&](const Params &params) {
+        constexpr std::size_t kThreads = 256;
+        const std::size_t node_batches =
+            CheckedProduct({model.plan.num_nodes(), model.batch},
+                           "categorical node initialization");
+        InitializeCategoricalBase<<<Blocks(node_batches, kThreads), kThreads, 0,
+                                    storage.stream>>>(
+            storage.input_root_potential,
+            storage.categorical_observation_index_by_node, storage.nodes,
+            params);
+        if (!model.observation_nodes.empty()) {
+          const dim3 threads(kTransposeTile, kTransposeRows);
+          const dim3 blocks(
+              (model.observation_nodes.size() + kTransposeTile - 1) /
+                  kTransposeTile,
+              (model.batch + kTransposeTile - 1) / kTransposeTile);
+          ApplyCategoricalObservations<<<blocks, threads, 0, storage.stream>>>(
+              storage.input_observations, storage.categorical_observation_nodes,
+              storage.input_root_potential, storage.input_emission_potentials,
+              storage.nodes, params,
+              CheckedU32(model.observation_nodes.size(),
+                         "categorical observation count"),
+              CheckedU32(model.categories, "category count"));
+        }
+      });
 }
 
 } // namespace
@@ -945,6 +1225,18 @@ PartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
+                             Workspace &workspace) {
+  return Run(model, *workspace.impl_, true);
+}
+
+tree_hmm::PartitionView
+PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
+                          Workspace &workspace) {
+  return Run(model, *workspace.impl_, false);
+}
+
+tree_hmm::PartitionView
+LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
                              Workspace &workspace) {
   return Run(model, *workspace.impl_, true);
 }

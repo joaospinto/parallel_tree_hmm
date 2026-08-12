@@ -226,4 +226,85 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   }
 }
 
+template <class Reserve, class Inputs, class SolveLog>
+void TestCategoricalAccelerator(const char *name, bool available,
+                                Reserve reserve, Inputs inputs,
+                                SolveLog solve_log) {
+  if (!available)
+    return;
+  const btrc::Plan plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kBatch = 7;
+  constexpr std::size_t kCategories = 6;
+  const std::vector<btrc::Index> observation_nodes{2, 3, 6, 7};
+  const std::vector<float> root_potential{0.1f, 0.2f, 0.3f, 0.4f};
+  const std::vector<float> emissions{
+      1.0f, 1.0f, 1.0f, 1.0f, // unobserved
+      1.0f, 0.0f, 0.0f, 0.0f, // state 0
+      0.0f, 1.0f, 0.0f, 0.0f, // state 1
+      0.0f, 0.0f, 1.0f, 0.0f, // state 2
+      0.0f, 0.0f, 0.0f, 1.0f, // state 3
+      1.0f, 0.0f, 1.0f, 0.0f, // states 0 or 2
+  };
+  std::vector<std::uint8_t> observations(kBatch * observation_nodes.size());
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    for (std::size_t observation = 0; observation < observation_nodes.size();
+         ++observation) {
+      observations[batch * observation_nodes.size() + observation] =
+          static_cast<std::uint8_t>((batch + 2 * observation) % kCategories);
+    }
+  }
+  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    for (std::size_t parent = 0; parent < kStates; ++parent) {
+      for (std::size_t child = 0; child < kStates; ++child) {
+        edges[(edge * kStates + parent) * kStates + child] =
+            parent == child ? 0.82f : 0.06f;
+      }
+    }
+  }
+
+  reserve(plan, kStates, kBatch, kCategories, observation_nodes);
+  tree_hmm::MutableBatchedCategoricalModelView staged = inputs(kBatch);
+  std::copy(observations.begin(), observations.end(),
+            staged.observations.begin());
+  std::copy(root_potential.begin(), root_potential.end(),
+            staged.root_potential.begin());
+  std::copy(emissions.begin(), emissions.end(),
+            staged.emission_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  const tree_hmm::PartitionView result =
+      solve_log(static_cast<tree_hmm::BatchedCategoricalModelView>(staged));
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
+    std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
+    for (std::size_t observation = 0; observation < observation_nodes.size();
+         ++observation) {
+      const std::uint8_t category =
+          observations[batch * observation_nodes.size() + observation];
+      for (std::size_t state = 0; state < kStates; ++state) {
+        nodes[observation_nodes[observation] * kStates + state] *=
+            emissions[category * kStates + state];
+      }
+    }
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const double expected =
+        tree_hmm::LogPartitionFunction({plan, kStates, nodes, host_edges});
+    const double actual = result.values[batch];
+    if (std::abs(actual - expected) >
+        5e-5 * std::max({1.0, std::abs(actual), std::abs(expected)})) {
+      throw std::runtime_error(std::string(name) +
+                               " categorical inference disagrees with CPU");
+    }
+  }
+
+  constexpr std::size_t kTailBatch = 3;
+  tree_hmm::MutableBatchedCategoricalModelView tail = inputs(kTailBatch);
+  if (tail.observations.size() != kTailBatch * observation_nodes.size()) {
+    throw std::runtime_error(std::string(name) +
+                             " categorical tail shape is wrong");
+  }
+}
+
 #endif // TREE_HMM_TESTS_ACCELERATOR_TEST_H_
