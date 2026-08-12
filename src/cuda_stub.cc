@@ -25,6 +25,11 @@ tree_hmm::MutableBatchedModelView Workspace::Inputs() {
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
+tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
 tree_hmm::PartitionView PartitionFunctionPrepared(tree_hmm::BatchedModelView,
                                                   Workspace &) {
   throw std::runtime_error(

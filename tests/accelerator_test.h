@@ -64,7 +64,7 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   if (result.timings.kernel_ms < 0.0)
     throw std::runtime_error(std::string(name) + " kernel timing is invalid");
 
-  tree_hmm::MutableBatchedModelView staged = inputs();
+  tree_hmm::MutableBatchedModelView staged = inputs(kBatch);
   std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
   std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
   const tree_hmm::PartitionView staged_result =
@@ -82,6 +82,33 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
         2e-5 * std::max(1.0, std::abs(expected))) {
       throw std::runtime_error(std::string(name) +
                                " staged input disagrees with CPU inference");
+    }
+  }
+
+  constexpr std::size_t kTailBatch = 3;
+  tree_hmm::MutableBatchedModelView tail = inputs(kTailBatch);
+  std::copy(nodes.begin(),
+            nodes.begin() + kTailBatch * plan.num_nodes() * kStates,
+            tail.node_potentials.begin());
+  std::copy(edges.begin(), edges.end(), tail.edge_potentials.begin());
+  const tree_hmm::PartitionView tail_result =
+      solve_log(static_cast<tree_hmm::BatchedModelView>(tail));
+  if (tail_result.values.size() != kTailBatch)
+    throw std::runtime_error(std::string(name) +
+                             " capacity-backed output shape is wrong");
+  for (std::size_t batch = 0; batch < kTailBatch; ++batch) {
+    const std::size_t node_values = plan.num_nodes() * kStates;
+    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
+                                         nodes.begin() +
+                                             (batch + 1) * node_values);
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const double expected =
+        tree_hmm::LogPartitionFunction({plan, kStates, host_nodes, host_edges});
+    if (std::abs(tail_result.values[batch] - expected) >
+        5e-5 * std::max(1.0, std::abs(expected))) {
+      throw std::runtime_error(std::string(name) +
+                               " capacity-backed inference disagrees with "
+                               "CPU");
     }
   }
 

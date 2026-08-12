@@ -676,18 +676,24 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
+  return Inputs(impl_->batch);
+}
+
+tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
   Impl &storage = *impl_;
   if (storage.plan == nullptr)
     throw std::logic_error("CUDA Workspace::Reserve must precede Inputs");
-  const std::size_t node_values =
-      CheckedProduct({storage.batch, storage.plan->num_nodes(), storage.states},
-                     "CUDA input nodes");
+  if (batch == 0 || batch > storage.batch)
+    throw std::invalid_argument(
+        "CUDA input batch exceeds the reserved capacity");
+  const std::size_t node_values = CheckedProduct(
+      {batch, storage.plan->num_nodes(), storage.states}, "CUDA input nodes");
   const std::size_t edge_values = CheckedProduct(
       {storage.plan->num_edges(), storage.states, storage.states},
       "CUDA input edges");
   return {*storage.plan,
           storage.states,
-          storage.batch,
+          batch,
           {storage.host_nodes, node_values},
           {storage.host_edges, edge_values}};
 }
@@ -698,10 +704,10 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                             Workspace::Impl &storage, bool scaled) {
   const auto wall_start = Clock::now();
   if (storage.plan != &model.plan || storage.states != model.states ||
-      storage.batch != model.batch) {
+      model.batch == 0 || model.batch > storage.batch) {
     throw std::invalid_argument(
         "prepared CUDA inference requires Workspace::Reserve for this plan, "
-        "state count, and batch");
+        "state count, and batch capacity");
   }
   Check(cudaSetDevice(storage.device), "cudaSetDevice");
   const std::size_t matrix =
@@ -740,6 +746,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   Check(cudaEventRecord(storage.kernel_start, storage.stream),
         "cudaEventRecord kernel start");
   Params base_params = storage.params;
+  base_params.batch = CheckedU32(model.batch, "batch count");
   base_params.scaled = scaled ? 1 : 0;
   if (scaled) {
     Check(cudaMemsetAsync(storage.node_scales, 0,

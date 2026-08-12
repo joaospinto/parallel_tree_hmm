@@ -23,14 +23,16 @@ public:
   Workspace(const Workspace &) = delete;
   Workspace &operator=(const Workspace &) = delete;
 
-  // Allocates device and pinned-host storage and uploads the topology plan.
-  // Repeated prepared calls do not allocate memory or rebuild the plan.
-  void Reserve(const btrc::Plan &plan, std::size_t states, std::size_t batch,
-               int device = 0);
+  // Allocates device and pinned-host storage for up to batch_capacity items
+  // and uploads the topology plan. Repeated prepared calls do not allocate
+  // memory or rebuild the plan.
+  void Reserve(const btrc::Plan &plan, std::size_t states,
+               std::size_t batch_capacity, int device = 0);
 
   // Returns pinned host storage owned by this workspace. Preparing factors
   // directly into it eliminates an otherwise redundant host-side copy.
   tree_hmm::MutableBatchedModelView Inputs();
+  tree_hmm::MutableBatchedModelView Inputs(std::size_t batch);
 
 private:
   friend tree_hmm::PartitionView

@@ -9,7 +9,7 @@ int main() {
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
         workspace.Reserve(plan, states, batch);
       },
-      [&] { return workspace.Inputs(); },
+      [&](std::size_t batch) { return workspace.Inputs(batch); },
       [&](tree_hmm::BatchedModelView model) {
         return tree_hmm::metal::PartitionFunctionPrepared(model, workspace);
       },

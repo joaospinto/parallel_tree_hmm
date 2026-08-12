@@ -22,13 +22,16 @@ public:
   Workspace(const Workspace &) = delete;
   Workspace &operator=(const Workspace &) = delete;
 
-  // Allocates buffers, copies the topology plan, and compiles no
-  // topology-specific kernels. Repeated prepared calls allocate nothing.
-  void Reserve(const btrc::Plan &plan, std::size_t states, std::size_t batch);
+  // Allocates buffers for up to batch_capacity items, copies the topology
+  // plan, and compiles no topology-specific kernels. Repeated prepared calls
+  // allocate nothing.
+  void Reserve(const btrc::Plan &plan, std::size_t states,
+               std::size_t batch_capacity);
 
   // Returns shared host/device storage owned by this workspace. Preparing
   // factors directly into it eliminates an otherwise redundant copy.
   tree_hmm::MutableBatchedModelView Inputs();
+  tree_hmm::MutableBatchedModelView Inputs(std::size_t batch);
 
 private:
   friend tree_hmm::PartitionView

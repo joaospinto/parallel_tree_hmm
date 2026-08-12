@@ -308,19 +308,26 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
+  return Inputs(impl_->batch);
+}
+
+tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
   @autoreleasepool {
     Impl &storage = *impl_;
     if (storage.plan == nullptr)
       throw std::logic_error("Metal Workspace::Reserve must precede Inputs");
-    const std::size_t node_values = CheckedProduct(
-        {storage.batch, storage.plan->num_nodes(), storage.states},
-        "Metal input nodes");
+    if (batch == 0 || batch > storage.batch)
+      throw std::invalid_argument(
+          "Metal input batch exceeds the reserved capacity");
+    const std::size_t node_values =
+        CheckedProduct({batch, storage.plan->num_nodes(), storage.states},
+                       "Metal input nodes");
     const std::size_t edge_values = CheckedProduct(
         {storage.plan->num_edges(), storage.states, storage.states},
         "Metal input edges");
     return {*storage.plan,
             storage.states,
-            storage.batch,
+            batch,
             {static_cast<float *>(storage.input_nodes.contents), node_values},
             {static_cast<float *>(storage.input_edges.contents), edge_values}};
   }
@@ -333,10 +340,10 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (storage.plan != &model.plan || storage.states != model.states ||
-        storage.batch != model.batch) {
+        model.batch == 0 || model.batch > storage.batch) {
       throw std::invalid_argument(
           "prepared Metal inference requires Workspace::Reserve for this "
-          "plan, state count, and batch");
+          "plan, state count, and batch capacity");
     }
     const std::size_t expected_nodes =
         CheckedProduct({model.batch, model.plan.num_nodes(), model.states},
@@ -367,18 +374,31 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
       throw std::runtime_error("failed to create a Metal command buffer");
 
     Params base_params = storage.params;
+    base_params.batch = CheckedU32(model.batch, "batch count");
     base_params.scaled = scaled ? 1 : 0;
     if (scaled) {
       id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
       [encoder fillBuffer:storage.node_scales
-                    range:NSMakeRange(0, storage.node_scales.length)
+                    range:NSMakeRange(0, CheckedProduct({model.batch,
+                                                         model.plan.num_nodes(),
+                                                         sizeof(float)},
+                                                        "Metal node scales"))
                     value:0];
-      [encoder fillBuffer:storage.path_scales
-                    range:NSMakeRange(0, storage.path_scales.length)
-                    value:0];
-      [encoder fillBuffer:storage.branch_scales
-                    range:NSMakeRange(0, storage.branch_scales.length)
-                    value:0];
+      [encoder
+          fillBuffer:storage.path_scales
+               range:NSMakeRange(
+                         0, CheckedProduct(
+                                {base_params.paths_batched ? model.batch : 1,
+                                 model.plan.num_edges(), sizeof(float)},
+                                "Metal path scales"))
+               value:0];
+      [encoder
+          fillBuffer:storage.branch_scales
+               range:NSMakeRange(0, CheckedProduct({model.batch,
+                                                    model.plan.num_branches(),
+                                                    sizeof(float)},
+                                                   "Metal branch scales"))
+               value:0];
       [encoder endEncoding];
     }
 
