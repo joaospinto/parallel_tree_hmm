@@ -99,6 +99,8 @@ int main() {
       BruteForce(plan, kStates, nodes, edges);
   const tree_hmm::Marginals actual = tree_hmm::PosteriorMarginals(model);
   Check(Near(tree_hmm::PartitionFunction(model), expected.partition));
+  Check(Near(tree_hmm::LogPartitionFunction(model),
+             std::log(expected.partition)));
   Check(Near(actual.partition, expected.partition));
   for (std::size_t index = 0; index < actual.nodes.size(); ++index)
     Check(Near(actual.nodes[index], expected.nodes[index]));
@@ -116,7 +118,21 @@ int main() {
     const tree_hmm::MarginalView repeated =
         tree_hmm::PosteriorMarginalsPrepared(model, workspace);
     Check(Near(repeated.partition, expected.partition));
+    Check(Near(tree_hmm::LogPartitionFunctionPrepared(model, workspace),
+               std::log(expected.partition)));
   }
   g_count_allocations = false;
   Check(g_allocations == 0);
+
+  constexpr std::size_t kLongNodes = 4096;
+  std::vector<std::int64_t> long_parents(kLongNodes);
+  long_parents[0] = -1;
+  for (std::size_t node = 1; node < kLongNodes; ++node)
+    long_parents[node] = static_cast<std::int64_t>(node - 1);
+  const btrc::Plan long_plan = btrc::MakePlan(long_parents);
+  const std::vector<double> long_nodes(kLongNodes, 0.5);
+  const std::vector<double> long_edges(kLongNodes - 1, 1.0);
+  const double log_partition = tree_hmm::LogPartitionFunction(
+      {long_plan, 1, long_nodes, long_edges});
+  Check(Near(log_partition, kLongNodes * std::log(0.5), 1e-10));
 }

@@ -21,6 +21,9 @@ struct Workspace::Impl {
   std::vector<double> nodes;
   std::vector<double> paths;
   std::vector<double> branches;
+  std::vector<double> node_log_scales;
+  std::vector<double> path_log_scales;
+  std::vector<double> branch_log_scales;
   std::vector<double> node_adjoints;
   std::vector<double> path_adjoints;
   std::vector<double> branch_adjoints;
@@ -353,6 +356,150 @@ private:
   Workspace::Impl &storage_;
 };
 
+class ScaledSumProductDispatcher {
+public:
+  ScaledSumProductDispatcher(const btrc::Plan &plan, std::size_t states,
+                             Workspace::Impl &storage)
+      : plan_(plan), states_(states), matrix_size_(states * states),
+        storage_(storage) {}
+
+  void Rake(std::span<const btrc::Rake> operations) {
+    for (const auto &operation : operations) {
+      const double *path = Path(operation.edge);
+      const double *leaf = Node(operation.leaf);
+      double *message = Branch(operation.branch);
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        double value = 0.0;
+        for (std::size_t child_state = 0; child_state < states_;
+             ++child_state) {
+          value += path[parent_state * states_ + child_state] *
+                   leaf[child_state];
+        }
+        message[parent_state] = value;
+      }
+      BranchScale(operation.branch) =
+          Normalize(message, states_, PathScale(operation.edge) +
+                                          NodeScale(operation.leaf));
+    }
+  }
+
+  void CombineBranches(std::span<const btrc::BranchCombination> operations) {
+    for (const auto &operation : operations) {
+      double *destination = Branch(operation.destination);
+      const double *source = Branch(operation.source);
+      for (std::size_t state = 0; state < states_; ++state)
+        destination[state] *= source[state];
+      BranchScale(operation.destination) = Normalize(
+          destination, states_, BranchScale(operation.destination) +
+                                    BranchScale(operation.source));
+    }
+  }
+
+  void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
+    for (const auto &operation : operations) {
+      double *node = Node(operation.parent);
+      const double *branch = Branch(operation.branch);
+      for (std::size_t state = 0; state < states_; ++state)
+        node[state] *= branch[state];
+      NodeScale(operation.parent) = Normalize(
+          node, states_, NodeScale(operation.parent) +
+                             BranchScale(operation.branch));
+    }
+  }
+
+  void Compress(std::span<const btrc::Compression> operations) {
+    for (const auto &operation : operations) {
+      double *left = Path(operation.left_edge);
+      const double *middle = Node(operation.middle);
+      const double *right = Path(operation.right_edge);
+      std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        for (std::size_t child_state = 0; child_state < states_;
+             ++child_state) {
+          double value = 0.0;
+          for (std::size_t middle_state = 0; middle_state < states_;
+               ++middle_state) {
+            value += storage_.reverse_scratch[parent_state * states_ +
+                                              middle_state] *
+                     middle[middle_state] *
+                     right[middle_state * states_ + child_state];
+          }
+          left[parent_state * states_ + child_state] = value;
+        }
+      }
+      PathScale(operation.left_edge) = Normalize(
+          left, matrix_size_, PathScale(operation.left_edge) +
+                                  NodeScale(operation.middle) +
+                                  PathScale(operation.right_edge));
+    }
+  }
+
+  double FinishRoot() const {
+    const double *root = Node(plan_.root());
+    const double sum = std::accumulate(root, root + states_, 0.0);
+    if (!(sum > 0.0))
+      return -std::numeric_limits<double>::infinity();
+    return NodeScale(plan_.root()) + std::log(sum);
+  }
+
+private:
+  static double Normalize(double *values, std::size_t size,
+                          double input_scale) {
+    const double maximum = *std::max_element(values, values + size);
+    if (!(maximum > 0.0)) {
+      return -std::numeric_limits<double>::infinity();
+    }
+    const double inverse = 1.0 / maximum;
+    for (std::size_t index = 0; index < size; ++index)
+      values[index] *= inverse;
+    return input_scale + std::log(maximum);
+  }
+
+  double *Node(btrc::Index node) {
+    return storage_.nodes.data() + node * states_;
+  }
+  const double *Node(btrc::Index node) const {
+    return storage_.nodes.data() + node * states_;
+  }
+  double *Path(btrc::Index edge) {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  const double *Path(btrc::Index edge) const {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  double *Branch(btrc::Index branch) {
+    return storage_.branches.data() + branch * states_;
+  }
+  const double *Branch(btrc::Index branch) const {
+    return storage_.branches.data() + branch * states_;
+  }
+  double &NodeScale(btrc::Index node) {
+    return storage_.node_log_scales[node];
+  }
+  double NodeScale(btrc::Index node) const {
+    return storage_.node_log_scales[node];
+  }
+  double &PathScale(btrc::Index edge) {
+    return storage_.path_log_scales[edge];
+  }
+  double PathScale(btrc::Index edge) const {
+    return storage_.path_log_scales[edge];
+  }
+  double &BranchScale(btrc::Index branch) {
+    return storage_.branch_log_scales[branch];
+  }
+  double BranchScale(btrc::Index branch) const {
+    return storage_.branch_log_scales[branch];
+  }
+
+  const btrc::Plan &plan_;
+  std::size_t states_;
+  std::size_t matrix_size_;
+  Workspace::Impl &storage_;
+};
+
 } // namespace
 
 Workspace::Workspace() : impl_(std::make_unique<Impl>()) {}
@@ -388,6 +535,9 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
   storage.nodes.resize(node_values);
   storage.paths.resize(path_values);
   storage.branches.resize(branch_values);
+  storage.node_log_scales.resize(plan.num_nodes());
+  storage.path_log_scales.resize(plan.num_edges());
+  storage.branch_log_scales.resize(plan.num_branches());
   storage.node_adjoints.resize(node_values);
   storage.path_adjoints.resize(path_values);
   storage.branch_adjoints.resize(branch_values);
@@ -409,6 +559,19 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
 double PartitionFunctionPrepared(ModelView model, Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
   SumProductDispatcher dispatcher(model.plan, model.states, storage);
+  btrc::Contract(model.plan, dispatcher);
+  return dispatcher.FinishRoot();
+}
+
+double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace) {
+  Workspace::Impl &storage = Prepare(model, *workspace.impl_);
+  std::fill(storage.node_log_scales.begin(), storage.node_log_scales.end(),
+            0.0);
+  std::fill(storage.path_log_scales.begin(), storage.path_log_scales.end(),
+            0.0);
+  std::fill(storage.branch_log_scales.begin(), storage.branch_log_scales.end(),
+            0.0);
+  ScaledSumProductDispatcher dispatcher(model.plan, model.states, storage);
   btrc::Contract(model.plan, dispatcher);
   return dispatcher.FinishRoot();
 }
@@ -436,6 +599,12 @@ double PartitionFunction(ModelView model) {
   Workspace workspace;
   workspace.Reserve(model.plan, model.states);
   return PartitionFunctionPrepared(model, workspace);
+}
+
+double LogPartitionFunction(ModelView model) {
+  Workspace workspace;
+  workspace.Reserve(model.plan, model.states);
+  return LogPartitionFunctionPrepared(model, workspace);
 }
 
 Marginals PosteriorMarginals(ModelView model) {

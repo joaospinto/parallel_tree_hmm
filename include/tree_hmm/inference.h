@@ -48,15 +48,18 @@ public:
 
 private:
   friend double PartitionFunctionPrepared(ModelView, Workspace &);
+  friend double LogPartitionFunctionPrepared(ModelView, Workspace &);
   friend MarginalView PosteriorMarginalsPrepared(ModelView, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
 double PartitionFunctionPrepared(ModelView model, Workspace &workspace);
+double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace);
 MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace);
 Marginals Materialize(MarginalView view);
 
 double PartitionFunction(ModelView model);
+double LogPartitionFunction(ModelView model);
 
 // Returns normalized p(x_i) and p(x_parent, x_child). The initial CPU
 // reference differentiates the contraction analytically; no division by
