@@ -80,6 +80,34 @@ template <class Value> void HostAllocate(Value *&pointer, std::size_t count) {
         "cudaMallocHost");
 }
 
+template <class Value> void DeviceFree(Value *&pointer) noexcept {
+  if (pointer != nullptr) {
+    static_cast<void>(cudaFree(pointer));
+    pointer = nullptr;
+  }
+}
+
+template <class Value> void HostFree(Value *&pointer) noexcept {
+  if (pointer != nullptr) {
+    static_cast<void>(cudaFreeHost(pointer));
+    pointer = nullptr;
+  }
+}
+
+void Destroy(cudaEvent_t &event) noexcept {
+  if (event != nullptr) {
+    static_cast<void>(cudaEventDestroy(event));
+    event = nullptr;
+  }
+}
+
+void Destroy(cudaStream_t &stream) noexcept {
+  if (stream != nullptr) {
+    static_cast<void>(cudaStreamDestroy(stream));
+    stream = nullptr;
+  }
+}
+
 template <class Value>
 void Upload(Value *destination, std::span<const Value> source,
             cudaStream_t stream) {
@@ -357,57 +385,34 @@ struct Workspace::Impl {
       static_cast<void>(cudaSetDevice(device));
       static_cast<void>(cudaStreamSynchronize(stream));
     }
-    static_cast<void>(cudaFree(rakes));
-    static_cast<void>(cudaFree(combinations));
-    static_cast<void>(cudaFree(absorptions));
-    static_cast<void>(cudaFree(compressions));
-    static_cast<void>(cudaFree(input_nodes));
-    static_cast<void>(cudaFree(input_edges));
-    static_cast<void>(cudaFree(nodes));
-    static_cast<void>(cudaFree(paths));
-    static_cast<void>(cudaFree(branches));
-    static_cast<void>(cudaFree(node_scales));
-    static_cast<void>(cudaFree(path_scales));
-    static_cast<void>(cudaFree(branch_scales));
-    static_cast<void>(cudaFree(output));
-    static_cast<void>(cudaFreeHost(host_nodes));
-    static_cast<void>(cudaFreeHost(host_edges));
-    static_cast<void>(cudaFreeHost(host_output));
-    static_cast<void>(cudaEventDestroy(upload_start));
-    static_cast<void>(cudaEventDestroy(upload_stop));
-    static_cast<void>(cudaEventDestroy(kernel_start));
-    static_cast<void>(cudaEventDestroy(kernel_stop));
-    static_cast<void>(cudaEventDestroy(download_start));
-    static_cast<void>(cudaEventDestroy(download_stop));
-    static_cast<void>(cudaStreamDestroy(stream));
+    DeviceFree(rakes);
+    DeviceFree(combinations);
+    DeviceFree(absorptions);
+    DeviceFree(compressions);
+    DeviceFree(input_nodes);
+    DeviceFree(input_edges);
+    DeviceFree(nodes);
+    DeviceFree(paths);
+    DeviceFree(branches);
+    DeviceFree(node_scales);
+    DeviceFree(path_scales);
+    DeviceFree(branch_scales);
+    DeviceFree(output);
+    HostFree(host_nodes);
+    HostFree(host_edges);
+    HostFree(host_output);
+    Destroy(upload_start);
+    Destroy(upload_stop);
+    Destroy(kernel_start);
+    Destroy(kernel_stop);
+    Destroy(download_start);
+    Destroy(download_stop);
+    Destroy(stream);
     plan = nullptr;
     states = 0;
     batch = 0;
     device = 0;
     params = {};
-    stream = nullptr;
-    upload_start = nullptr;
-    upload_stop = nullptr;
-    kernel_start = nullptr;
-    kernel_stop = nullptr;
-    download_start = nullptr;
-    download_stop = nullptr;
-    rakes = nullptr;
-    combinations = nullptr;
-    absorptions = nullptr;
-    compressions = nullptr;
-    host_nodes = nullptr;
-    host_edges = nullptr;
-    host_output = nullptr;
-    input_nodes = nullptr;
-    input_edges = nullptr;
-    nodes = nullptr;
-    paths = nullptr;
-    branches = nullptr;
-    node_scales = nullptr;
-    path_scales = nullptr;
-    branch_scales = nullptr;
-    output = nullptr;
   }
 
   ~Impl() { Clear(); }
@@ -620,7 +625,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
   FinishRoot<<<CheckedU32(model.batch, "root CUDA grid"), 1, 0,
                storage.stream>>>(storage.nodes, storage.node_scales,
                                  storage.output, base_params);
-  Check(cudaPeekAtLastError(), "tree-HMM CUDA kernel launch");
+  Check(cudaGetLastError(), "tree-HMM CUDA kernel launch");
   Check(cudaEventRecord(storage.kernel_stop, storage.stream),
         "cudaEventRecord kernel stop");
 
