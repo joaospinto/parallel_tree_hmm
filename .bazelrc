@@ -11,6 +11,13 @@ build:macos --cxxopt=-Wextra
 build:macos --cxxopt=-Wpedantic
 build:macos --cxxopt=-Werror
 build:macos --cxxopt=-O3
+build:macos --macos_minimum_os=11.0
+
+# Native CUDA targets are opt-in and excluded from ordinary CPU/Metal builds.
+build --@rules_cuda//cuda:enable=false
+build:cuda --@rules_cuda//cuda:enable=true
+build:cuda --@rules_cuda//cuda:compiler=nvcc
+common --flag_alias=cuda_archs=@rules_cuda//cuda:archs
 
 build -c opt
 common --enable_platform_specific_config

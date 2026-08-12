@@ -1,10 +1,23 @@
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
+load(
+    "@rules_cuda//cuda:defs.bzl",
+    "cuda_library",
+    "requires_cuda",
+)
+
+config_setting(
+    name = "macos",
+    constraint_values = ["@platforms//os:osx"],
+)
 
 cc_library(
     name = "tree_hmm",
     srcs = ["src/inference.cc"],
-    hdrs = ["include/tree_hmm/inference.h"],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/inference.h",
+    ],
     includes = ["include"],
     visibility = ["//visibility:public"],
     deps = ["@bidirectional_tree_rake_compress//:btrc"],
@@ -14,4 +27,116 @@ cc_test(
     name = "inference_test",
     srcs = ["tests/inference_test.cc"],
     deps = [":tree_hmm"],
+)
+
+cc_library(
+    name = "tree_hmm_cuda_stub",
+    srcs = ["src/cuda_stub.cc"],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/cuda.h",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = ["@bidirectional_tree_rake_compress//:btrc"],
+)
+
+cc_test(
+    name = "cuda_stub_test",
+    srcs = ["tests/cuda_stub_test.cc"],
+    deps = [":tree_hmm_cuda_stub"],
+)
+
+cc_test(
+    name = "cuda_kernel_emulation_test",
+    srcs = [
+        "src/cuda_device_algebra.h",
+        "tests/cuda_kernel_emulation_test.cc",
+    ],
+    deps = [
+        ":tree_hmm",
+        "@bidirectional_tree_rake_compress//:btrc",
+    ],
+)
+
+cuda_library(
+    name = "tree_hmm_cuda",
+    srcs = ["src/cuda.cu"],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/cuda.h",
+        "src/cuda_device_algebra.h",
+    ],
+    alwayslink = True,
+    copts = [
+        "--std=c++20",
+        "-lineinfo",
+        "-Wno-deprecated-gpu-targets",
+    ],
+    host_copts = ["-std=c++20"],
+    includes = ["include"],
+    target_compatible_with = requires_cuda(),
+    visibility = ["//visibility:public"],
+    deps = ["@bidirectional_tree_rake_compress//:btrc"],
+)
+
+cc_test(
+    name = "cuda_test",
+    srcs = [
+        "tests/accelerator_test.h",
+        "tests/cuda_test.cc",
+    ],
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = requires_cuda(),
+    deps = [
+        ":tree_hmm",
+        ":tree_hmm_cuda",
+    ],
+)
+
+cc_library(
+    name = "tree_hmm_metal",
+    srcs = ["src/metal.cc"],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/metal.h",
+        "src/metal_kernels.h",
+    ],
+    copts = [
+        "-fobjc-arc",
+        "-std=c++20",
+        "-x",
+        "objective-c++",
+        "-Wno-gnu-zero-variadic-macro-arguments",
+    ],
+    includes = ["include"],
+    linkopts = [
+        "-framework Foundation",
+        "-framework Metal",
+    ],
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+    deps = ["@bidirectional_tree_rake_compress//:btrc"],
+)
+
+cc_test(
+    name = "metal_test",
+    srcs = [
+        "tests/accelerator_test.h",
+        "tests/metal_test.cc",
+    ],
+    target_compatible_with = select({
+        ":macos": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":tree_hmm",
+        ":tree_hmm_metal",
+    ],
 )
