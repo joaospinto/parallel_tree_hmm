@@ -34,6 +34,18 @@ struct MarginalView {
   std::span<const double> edges;
 };
 
+struct MaximumAssignment {
+  double weight = 0.0;
+  double log_weight = 0.0;
+  std::vector<std::size_t> states;
+};
+
+struct MaximumAssignmentView {
+  double weight = 0.0;
+  double log_weight = 0.0;
+  std::span<const std::size_t> states;
+};
+
 class Workspace {
 public:
   struct Impl;
@@ -52,6 +64,10 @@ private:
   friend double PartitionFunctionPrepared(ModelView, Workspace &);
   friend double LogPartitionFunctionPrepared(ModelView, Workspace &);
   friend MarginalView PosteriorMarginalsPrepared(ModelView, Workspace &);
+  friend MaximumAssignmentView MaximumAPosterioriPrepared(ModelView,
+                                                          Workspace &);
+  friend std::span<const std::size_t>
+  PosteriorSamplePrepared(ModelView, std::span<const double>, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
@@ -59,6 +75,16 @@ double PartitionFunctionPrepared(ModelView model, Workspace &workspace);
 double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace);
 MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace);
 Marginals Materialize(MarginalView view);
+MaximumAssignmentView MaximumAPosterioriPrepared(ModelView model,
+                                                 Workspace &workspace);
+MaximumAssignment Materialize(MaximumAssignmentView view);
+
+// uniforms contains one independent U[0,1) variate per original node. Keeping
+// random-number generation outside the inference algebra makes sampling
+// reproducible and permits allocation-free CPU or accelerator execution.
+std::span<const std::size_t>
+PosteriorSamplePrepared(ModelView model, std::span<const double> uniforms,
+                        Workspace &workspace);
 
 double PartitionFunction(ModelView model);
 double LogPartitionFunction(ModelView model);
@@ -67,6 +93,9 @@ double LogPartitionFunction(ModelView model);
 // and analytic reverse contraction avoid underflow and division by
 // intermediate messages, including messages containing zeros.
 Marginals PosteriorMarginals(ModelView model);
+MaximumAssignment MaximumAPosteriori(ModelView model);
+std::vector<std::size_t> PosteriorSample(ModelView model,
+                                         std::span<const double> uniforms);
 
 } // namespace tree_hmm
 

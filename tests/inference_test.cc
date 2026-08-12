@@ -1,6 +1,7 @@
 #include "tree_hmm/inference.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -88,6 +89,52 @@ tree_hmm::Marginals BruteForce(const btrc::Plan &plan, std::size_t states,
   return result;
 }
 
+double AssignmentWeight(const btrc::Plan &plan, std::size_t states,
+                        const std::vector<double> &node_potentials,
+                        const std::vector<double> &edge_potentials,
+                        std::span<const std::size_t> assignment) {
+  Check(assignment.size() == plan.num_nodes());
+  double result = 1.0;
+  for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+    Check(assignment[node] < states);
+    result *= node_potentials[node * states + assignment[node]];
+  }
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    const std::size_t parent_state = assignment[plan.edge_parents()[edge]];
+    const std::size_t child_state = assignment[plan.edge_children()[edge]];
+    result *=
+        edge_potentials[(edge * states + parent_state) * states + child_state];
+  }
+  return result;
+}
+
+tree_hmm::MaximumAssignment
+BruteForceMaximum(const btrc::Plan &plan, std::size_t states,
+                  const std::vector<double> &node_potentials,
+                  const std::vector<double> &edge_potentials) {
+  tree_hmm::MaximumAssignment result;
+  result.states.assign(plan.num_nodes(), 0);
+  std::vector<std::size_t> assignment(plan.num_nodes(), 0);
+  std::size_t assignments = 1;
+  for (std::size_t node = 0; node < plan.num_nodes(); ++node)
+    assignments *= states;
+  for (std::size_t code = 0; code < assignments; ++code) {
+    std::size_t remainder = code;
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
+      assignment[node] = remainder % states;
+      remainder /= states;
+    }
+    const double weight = AssignmentWeight(plan, states, node_potentials,
+                                           edge_potentials, assignment);
+    if (weight > result.weight) {
+      result.weight = weight;
+      result.states = assignment;
+    }
+  }
+  result.log_weight = std::log(result.weight);
+  return result;
+}
+
 void CheckMarginals(const tree_hmm::Marginals &actual,
                     const tree_hmm::Marginals &expected) {
   Check(Near(actual.partition, expected.partition));
@@ -118,6 +165,16 @@ int main() {
   Check(Near(tree_hmm::LogPartitionFunction(model),
              std::log(expected.partition)));
   CheckMarginals(actual, expected);
+  Check(plan.num_compressions() != 0);
+
+  const tree_hmm::MaximumAssignment expected_maximum =
+      BruteForceMaximum(plan, kStates, nodes, edges);
+  const tree_hmm::MaximumAssignment maximum =
+      tree_hmm::MaximumAPosteriori(model);
+  Check(Near(maximum.weight, expected_maximum.weight));
+  Check(Near(maximum.log_weight, expected_maximum.log_weight));
+  Check(Near(AssignmentWeight(plan, kStates, nodes, edges, maximum.states),
+             expected_maximum.weight));
 
   const std::vector<double> zero_nodes{
       0.55, 0.45, 1.0, 0.0, 0.0, 1.0, 0.7, 0.3, 0.0, 1.0,
@@ -131,6 +188,24 @@ int main() {
   CheckMarginals(
       tree_hmm::PosteriorMarginals({plan, kStates, zero_nodes, zero_edges}),
       zero_expected);
+  const tree_hmm::MaximumAssignment zero_maximum =
+      tree_hmm::MaximumAPosteriori({plan, kStates, zero_nodes, zero_edges});
+  Check(Near(zero_maximum.weight,
+             BruteForceMaximum(plan, kStates, zero_nodes, zero_edges).weight));
+
+  const std::vector<double> midpoint_uniforms(plan.num_nodes(), 0.5);
+  const std::vector<std::size_t> zero_sample = tree_hmm::PosteriorSample(
+      {plan, kStates, zero_nodes, zero_edges}, midpoint_uniforms);
+  Check(AssignmentWeight(plan, kStates, zero_nodes, zero_edges, zero_sample) >
+        0.0);
+
+  const std::vector<double> tie_nodes(plan.num_nodes() * kStates, 1.0);
+  const std::vector<double> tie_edges(plan.num_edges() * kStates * kStates,
+                                      1.0);
+  const tree_hmm::MaximumAssignment tie_maximum =
+      tree_hmm::MaximumAPosteriori({plan, kStates, tie_nodes, tie_edges});
+  Check(std::all_of(tie_maximum.states.begin(), tie_maximum.states.end(),
+                    [](std::size_t state) { return state == 0; }));
 
   tree_hmm::Workspace workspace;
   workspace.Reserve(plan, kStates);
@@ -138,6 +213,13 @@ int main() {
       tree_hmm::PosteriorMarginalsPrepared(model, workspace);
   Check(Near(prepared.partition, expected.partition));
   Check(Near(prepared.log_partition, std::log(expected.partition)));
+  const tree_hmm::MaximumAssignmentView prepared_maximum =
+      tree_hmm::MaximumAPosterioriPrepared(model, workspace);
+  Check(Near(prepared_maximum.weight, expected_maximum.weight));
+  std::vector<double> uniforms(plan.num_nodes(), 0.5);
+  const std::span<const std::size_t> prepared_sample =
+      tree_hmm::PosteriorSamplePrepared(model, uniforms, workspace);
+  Check(AssignmentWeight(plan, kStates, nodes, edges, prepared_sample) > 0.0);
   g_allocations = 0;
   g_count_allocations = true;
   for (int repeat = 0; repeat < 10; ++repeat) {
@@ -146,9 +228,51 @@ int main() {
     Check(Near(repeated.partition, expected.partition));
     Check(Near(tree_hmm::LogPartitionFunctionPrepared(model, workspace),
                std::log(expected.partition)));
+    Check(Near(tree_hmm::MaximumAPosterioriPrepared(model, workspace).weight,
+               expected_maximum.weight));
+    Check(
+        tree_hmm::PosteriorSamplePrepared(model, uniforms, workspace).size() ==
+        plan.num_nodes());
   }
   g_count_allocations = false;
   Check(g_allocations == 0);
+
+  constexpr std::size_t kSamples = 30000;
+  std::vector<double> sampled_nodes(expected.nodes.size(), 0.0);
+  std::vector<double> sampled_edges(expected.edges.size(), 0.0);
+  std::uint64_t random_state = 0xd1b54a32d192ed03ULL;
+  const auto next_uniform = [&] {
+    random_state =
+        random_state * 6364136223846793005ULL + 1442695040888963407ULL;
+    return static_cast<double>(random_state >> 11) * 0x1.0p-53;
+  };
+  for (std::size_t draw = 0; draw < kSamples; ++draw) {
+    for (double &uniform : uniforms)
+      uniform = next_uniform();
+    const std::span<const std::size_t> sample =
+        tree_hmm::PosteriorSamplePrepared(model, uniforms, workspace);
+    for (std::size_t node = 0; node < plan.num_nodes(); ++node)
+      ++sampled_nodes[node * kStates + sample[node]];
+    for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+      const std::size_t parent_state = sample[plan.edge_parents()[edge]];
+      const std::size_t child_state = sample[plan.edge_children()[edge]];
+      ++sampled_edges[(edge * kStates + parent_state) * kStates + child_state];
+    }
+  }
+  for (std::size_t index = 0; index < sampled_nodes.size(); ++index)
+    Check(Near(sampled_nodes[index] / kSamples, expected.nodes[index], 0.012));
+  for (std::size_t index = 0; index < sampled_edges.size(); ++index)
+    Check(Near(sampled_edges[index] / kSamples, expected.edges[index], 0.012));
+
+  bool invalid_uniform_rejected = false;
+  uniforms[0] = 1.0;
+  try {
+    static_cast<void>(
+        tree_hmm::PosteriorSamplePrepared(model, uniforms, workspace));
+  } catch (const std::invalid_argument &) {
+    invalid_uniform_rejected = true;
+  }
+  Check(invalid_uniform_rejected);
 
   constexpr std::size_t kLongNodes = 4096;
   std::vector<std::int64_t> long_parents(kLongNodes);
@@ -169,6 +293,10 @@ int main() {
                     [](double value) { return Near(value, 1.0); }));
   Check(std::all_of(long_marginals.edges.begin(), long_marginals.edges.end(),
                     [](double value) { return Near(value, 1.0); }));
+  const tree_hmm::MaximumAssignment long_maximum =
+      tree_hmm::MaximumAPosteriori({long_plan, 1, long_nodes, long_edges});
+  Check(long_maximum.weight == 0.0);
+  Check(Near(long_maximum.log_weight, log_partition, 1e-10));
 
   const std::vector<double> long_binary_nodes(kLongNodes * 2, 0.5);
   std::vector<double> long_binary_edges((kLongNodes - 1) * 4);

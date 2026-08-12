@@ -35,8 +35,12 @@ struct Workspace::Impl {
 
   std::vector<double> marginal_nodes;
   std::vector<double> marginal_edges;
+  std::vector<std::size_t> rake_choices;
+  std::vector<std::size_t> compression_choices;
+  std::vector<std::size_t> assignments;
   double partition = 0.0;
   double log_partition = 0.0;
+  double maximum_log_weight = 0.0;
 };
 
 namespace {
@@ -91,6 +95,7 @@ Workspace::Impl &Prepare(ModelView model, Workspace::Impl &storage) {
             0.0);
   storage.partition = 0.0;
   storage.log_partition = 0.0;
+  storage.maximum_log_weight = 0.0;
   return storage;
 }
 
@@ -109,6 +114,42 @@ template <class Term> double LogSumExp(std::size_t size, Term term) {
   for (std::size_t index = 0; index < size; ++index)
     sum += std::exp(term(index) - maximum);
   return maximum + std::log(sum);
+}
+
+template <class Term>
+std::size_t Argmax(std::size_t size, Term term, double *maximum = nullptr) {
+  std::size_t result = 0;
+  double value = term(0);
+  for (std::size_t index = 1; index < size; ++index) {
+    const double candidate = term(index);
+    if (candidate > value) {
+      result = index;
+      value = candidate;
+    }
+  }
+  if (maximum != nullptr)
+    *maximum = value;
+  return result;
+}
+
+template <class Term>
+std::size_t SampleLogWeights(std::size_t size, Term term, double normalizer,
+                             double uniform) {
+  double cumulative = 0.0;
+  std::size_t last_supported = size;
+  for (std::size_t index = 0; index < size; ++index) {
+    const double log_weight = term(index);
+    if (!std::isfinite(log_weight))
+      continue;
+    last_supported = index;
+    cumulative += std::exp(log_weight - normalizer);
+    if (uniform < cumulative)
+      return index;
+  }
+  if (last_supported == size)
+    throw std::domain_error(
+        "cannot sample from an empty conditional distribution");
+  return last_supported;
 }
 
 class SumProductDispatcher {
@@ -316,6 +357,75 @@ public:
       root_adjoint[state] = std::exp(root[state] - storage_.log_partition);
   }
 
+  void SeedRootSample(std::span<const double> uniforms) {
+    if (uniforms.size() != plan_.num_nodes()) {
+      throw std::invalid_argument(
+          "posterior sampling requires one uniform variate per node");
+    }
+    for (double uniform : uniforms) {
+      if (!std::isfinite(uniform) || uniform < 0.0 || uniform >= 1.0) {
+        throw std::invalid_argument(
+            "posterior-sampling variates must lie in [0, 1)");
+      }
+    }
+    uniforms_ = uniforms;
+    const double *root = Node(plan_.root());
+    storage_.assignments[plan_.root()] = SampleLogWeights(
+        states_, [&](std::size_t state) { return root[state]; },
+        storage_.log_partition, uniforms[plan_.root()]);
+  }
+
+  void ExpandRakes(std::span<const btrc::Rake> operations) {
+    for (const btrc::Rake &operation : operations) {
+      const std::size_t parent_state = storage_.assignments[operation.parent];
+      const double *path =
+          storage_.rake_paths.data() + operation.branch * matrix_size_;
+      const double *leaf =
+          storage_.rake_leaves.data() + operation.branch * states_;
+      const double normalizer =
+          LogSumExp(states_, [&](std::size_t child_state) {
+            return path[parent_state * states_ + child_state] +
+                   leaf[child_state];
+          });
+      storage_.assignments[operation.leaf] = SampleLogWeights(
+          states_,
+          [&](std::size_t child_state) {
+            return path[parent_state * states_ + child_state] +
+                   leaf[child_state];
+          },
+          normalizer, uniforms_[operation.leaf]);
+    }
+  }
+
+  void ExpandCompressions(std::span<const btrc::Compression> operations) {
+    for (const btrc::Compression &operation : operations) {
+      const std::size_t parent_state = storage_.assignments[operation.parent];
+      const std::size_t child_state = storage_.assignments[operation.child];
+      const double *left =
+          storage_.compression_left.data() + operation.tape * matrix_size_;
+      const double *middle =
+          storage_.compression_middle.data() + operation.tape * states_;
+      const double *right =
+          storage_.compression_right.data() + operation.tape * matrix_size_;
+      const double normalizer =
+          LogSumExp(states_, [&](std::size_t middle_state) {
+            return left[parent_state * states_ + middle_state] +
+                   middle[middle_state] +
+                   right[middle_state * states_ + child_state];
+          });
+      storage_.assignments[operation.middle] = SampleLogWeights(
+          states_,
+          [&](std::size_t middle_state) {
+            return left[parent_state * states_ + middle_state] +
+                   middle[middle_state] +
+                   right[middle_state * states_ + child_state];
+          },
+          normalizer, uniforms_[operation.middle]);
+    }
+  }
+
+  std::span<const std::size_t> Sample() const { return storage_.assignments; }
+
   void ReverseCompressions(std::span<const btrc::Compression> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
@@ -459,6 +569,142 @@ private:
   }
   const double *BranchAdjoint(btrc::Index branch) const {
     return storage_.branch_adjoints.data() + branch * states_;
+  }
+
+  const btrc::Plan &plan_;
+  std::size_t states_;
+  std::size_t matrix_size_;
+  Workspace::Impl &storage_;
+  std::span<const double> uniforms_;
+};
+
+class MaxProductDispatcher {
+public:
+  MaxProductDispatcher(const btrc::Plan &plan, std::size_t states,
+                       Workspace::Impl &storage)
+      : plan_(plan), states_(states), matrix_size_(states * states),
+        storage_(storage) {
+    std::transform(storage_.nodes.begin(), storage_.nodes.end(),
+                   storage_.nodes.begin(), PotentialLog);
+    std::transform(storage_.paths.begin(), storage_.paths.end(),
+                   storage_.paths.begin(), PotentialLog);
+    std::fill(storage_.branches.begin(), storage_.branches.end(),
+              -std::numeric_limits<double>::infinity());
+  }
+
+  void Rake(std::span<const btrc::Rake> operations) {
+    for (const btrc::Rake &operation : operations) {
+      const double *path = Path(operation.edge);
+      const double *leaf = Node(operation.leaf);
+      double *message = Branch(operation.branch);
+      std::size_t *choices =
+          storage_.rake_choices.data() + operation.branch * states_;
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        choices[parent_state] = Argmax(
+            states_,
+            [&](std::size_t child_state) {
+              return path[parent_state * states_ + child_state] +
+                     leaf[child_state];
+            },
+            &message[parent_state]);
+      }
+    }
+  }
+
+  void CombineBranches(std::span<const btrc::BranchCombination> operations) {
+    for (const btrc::BranchCombination &operation : operations) {
+      double *destination = Branch(operation.destination);
+      const double *source = Branch(operation.source);
+      for (std::size_t state = 0; state < states_; ++state)
+        destination[state] += source[state];
+    }
+  }
+
+  void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
+    for (const btrc::BranchAbsorption &operation : operations) {
+      double *node = Node(operation.parent);
+      const double *branch = Branch(operation.branch);
+      for (std::size_t state = 0; state < states_; ++state)
+        node[state] += branch[state];
+    }
+  }
+
+  void Compress(std::span<const btrc::Compression> operations) {
+    for (const btrc::Compression &operation : operations) {
+      double *left = Path(operation.left_edge);
+      const double *middle = Node(operation.middle);
+      const double *right = Path(operation.right_edge);
+      std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
+      std::size_t *choices =
+          storage_.compression_choices.data() + operation.tape * matrix_size_;
+      for (std::size_t parent_state = 0; parent_state < states_;
+           ++parent_state) {
+        for (std::size_t child_state = 0; child_state < states_;
+             ++child_state) {
+          const std::size_t output = parent_state * states_ + child_state;
+          choices[output] = Argmax(
+              states_,
+              [&](std::size_t middle_state) {
+                return storage_.reverse_scratch[parent_state * states_ +
+                                                middle_state] +
+                       middle[middle_state] +
+                       right[middle_state * states_ + child_state];
+              },
+              &left[output]);
+        }
+      }
+    }
+  }
+
+  void FinishRoot() {
+    const double *root = Node(plan_.root());
+    storage_.assignments[plan_.root()] = Argmax(
+        states_, [&](std::size_t state) { return root[state]; },
+        &storage_.maximum_log_weight);
+    if (!std::isfinite(storage_.maximum_log_weight)) {
+      throw std::domain_error("the tree HMM has no positive-weight assignment");
+    }
+  }
+
+  void ExpandRakes(std::span<const btrc::Rake> operations) {
+    for (const btrc::Rake &operation : operations) {
+      const std::size_t parent_state = storage_.assignments[operation.parent];
+      storage_.assignments[operation.leaf] =
+          storage_.rake_choices[operation.branch * states_ + parent_state];
+    }
+  }
+
+  void ExpandCompressions(std::span<const btrc::Compression> operations) {
+    for (const btrc::Compression &operation : operations) {
+      const std::size_t parent_state = storage_.assignments[operation.parent];
+      const std::size_t child_state = storage_.assignments[operation.child];
+      storage_.assignments[operation.middle] =
+          storage_.compression_choices[operation.tape * matrix_size_ +
+                                       parent_state * states_ + child_state];
+    }
+  }
+
+  MaximumAssignmentView Result() const {
+    return {std::exp(storage_.maximum_log_weight), storage_.maximum_log_weight,
+            storage_.assignments};
+  }
+
+private:
+  double *Node(btrc::Index node) {
+    return storage_.nodes.data() + node * states_;
+  }
+  const double *Node(btrc::Index node) const {
+    return storage_.nodes.data() + node * states_;
+  }
+  double *Path(btrc::Index edge) {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  const double *Path(btrc::Index edge) const {
+    return storage_.paths.data() + edge * matrix_size_;
+  }
+  double *Branch(btrc::Index branch) {
+    return storage_.branches.data() + branch * states_;
   }
 
   const btrc::Plan &plan_;
@@ -652,6 +898,9 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
   storage.reverse_scratch.resize(matrix_size);
   storage.marginal_nodes.resize(node_values);
   storage.marginal_edges.resize(path_values);
+  storage.rake_choices.resize(branch_values);
+  storage.compression_choices.resize(compression_matrices);
+  storage.assignments.resize(plan.num_nodes());
 }
 
 double PartitionFunctionPrepared(ModelView model, Workspace &workspace) {
@@ -684,12 +933,43 @@ MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace) {
   return dispatcher.BuildMarginals();
 }
 
+MaximumAssignmentView MaximumAPosterioriPrepared(ModelView model,
+                                                 Workspace &workspace) {
+  Workspace::Impl &storage = Prepare(model, *workspace.impl_);
+  MaxProductDispatcher dispatcher(model.plan, model.states, storage);
+  btrc::Contract(model.plan, dispatcher);
+  dispatcher.FinishRoot();
+  btrc::Expand(model.plan, dispatcher);
+  return dispatcher.Result();
+}
+
+std::span<const std::size_t>
+PosteriorSamplePrepared(ModelView model, std::span<const double> uniforms,
+                        Workspace &workspace) {
+  Workspace::Impl &storage = Prepare(model, *workspace.impl_);
+  LogSumProductDispatcher dispatcher(model.plan, model.states, storage);
+  btrc::Contract(model.plan, dispatcher);
+  dispatcher.FinishRoot();
+  dispatcher.SeedRootSample(uniforms);
+  btrc::Expand(model.plan, dispatcher);
+  return dispatcher.Sample();
+}
+
 Marginals Materialize(MarginalView view) {
   return {
       .partition = view.partition,
       .log_partition = view.log_partition,
       .nodes = std::vector<double>(view.nodes.begin(), view.nodes.end()),
       .edges = std::vector<double>(view.edges.begin(), view.edges.end()),
+  };
+}
+
+MaximumAssignment Materialize(MaximumAssignmentView view) {
+  return {
+      .weight = view.weight,
+      .log_weight = view.log_weight,
+      .states =
+          std::vector<std::size_t>(view.states.begin(), view.states.end()),
   };
 }
 
@@ -709,6 +989,21 @@ Marginals PosteriorMarginals(ModelView model) {
   Workspace workspace;
   workspace.Reserve(model.plan, model.states);
   return Materialize(PosteriorMarginalsPrepared(model, workspace));
+}
+
+MaximumAssignment MaximumAPosteriori(ModelView model) {
+  Workspace workspace;
+  workspace.Reserve(model.plan, model.states);
+  return Materialize(MaximumAPosterioriPrepared(model, workspace));
+}
+
+std::vector<std::size_t> PosteriorSample(ModelView model,
+                                         std::span<const double> uniforms) {
+  Workspace workspace;
+  workspace.Reserve(model.plan, model.states);
+  const std::span<const std::size_t> sample =
+      PosteriorSamplePrepared(model, uniforms, workspace);
+  return {sample.begin(), sample.end()};
 }
 
 } // namespace tree_hmm
