@@ -40,8 +40,8 @@ int main() {
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
           std::size_t categories,
           std::span<const btrc::Index> observation_nodes) {
-        workspace.ReserveCategoricalSumProduct(plan, states, batch, categories,
-                                               observation_nodes);
+        workspace.ReserveCategoricalSampling(plan, states, batch, categories,
+                                             observation_nodes);
       },
       [&](std::size_t batch) { return workspace.Uniforms(batch); },
       [&](tree_hmm::BatchedCategoricalModelView model,
@@ -61,7 +61,7 @@ int main() {
   TestSamplingAccelerator(
       "CUDA", tree_hmm::cuda::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
-        workspace.ReserveSumProduct(plan, states, batch);
+        workspace.ReserveSampling(plan, states, batch);
       },
       [&](std::size_t batch) { return workspace.Inputs(batch); },
       [&](std::size_t batch) { return workspace.Uniforms(batch); },

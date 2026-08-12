@@ -1256,7 +1256,7 @@ struct Workspace::Impl {
   std::size_t categories = 0;
   bool categorical = false;
   bool maximum = false;
-  bool sum_product = false;
+  bool sampling = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -1314,7 +1314,7 @@ struct Workspace::Impl {
     categories = 0;
     categorical = false;
     maximum = false;
-    sum_product = false;
+    sampling = false;
   }
 
   ~Impl() { Clear(); }
@@ -1441,7 +1441,7 @@ void ReserveMaximumRecovery(Workspace::Impl &storage) {
   storage.maximum = true;
 }
 
-void ReserveSumProductRecovery(Workspace::Impl &storage) {
+void ReserveSamplingRecovery(Workspace::Impl &storage) {
   ReserveAssignments(storage);
   const btrc::Plan &plan = *storage.plan;
   const std::size_t matrix =
@@ -1465,7 +1465,7 @@ void ReserveSumProductRecovery(Workspace::Impl &storage) {
   DeviceAllocate(storage.compression_left_tape, compression_matrices);
   DeviceAllocate(storage.compression_middle_tape, compression_vectors);
   DeviceAllocate(storage.compression_right_tape, compression_matrices);
-  storage.sum_product = true;
+  storage.sampling = true;
 }
 
 } // namespace
@@ -1548,19 +1548,19 @@ void Workspace::ReserveCategoricalMaximum(
   ReserveMaximumRecovery(*impl_);
 }
 
-void Workspace::ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+void Workspace::ReserveSampling(const btrc::Plan &plan, std::size_t states,
                                   std::size_t batch, int device) {
   Reserve(plan, states, batch, device);
-  ReserveSumProductRecovery(*impl_);
+  ReserveSamplingRecovery(*impl_);
 }
 
-void Workspace::ReserveCategoricalSumProduct(
+void Workspace::ReserveCategoricalSampling(
     const btrc::Plan &plan, std::size_t states, std::size_t batch,
     std::size_t categories, std::span<const btrc::Index> observation_nodes,
     int device) {
   ReserveCategorical(plan, states, batch, categories, observation_nodes,
                      device);
-  ReserveSumProductRecovery(*impl_);
+  ReserveSamplingRecovery(*impl_);
 }
 
 tree_hmm::MutableBatchedModelView Workspace::Inputs() {
@@ -1625,9 +1625,9 @@ std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
 
 std::span<float> Workspace::Uniforms(std::size_t batch) {
   Impl &storage = *impl_;
-  if (!storage.sum_product) {
+  if (!storage.sampling) {
     throw std::logic_error(
-        "CUDA Workspace::ReserveSumProduct must precede Uniforms");
+        "CUDA Workspace::ReserveSampling must precede Uniforms");
   }
   if (batch == 0 || batch > storage.batch)
     throw std::invalid_argument(
@@ -1663,9 +1663,9 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   const std::size_t assignment_count =
       CheckedProduct({batch, plan.num_nodes()}, "posterior assignments");
   if (sampling &&
-      (!storage.sum_product || uniforms.size() != assignment_count)) {
+      (!storage.sampling || uniforms.size() != assignment_count)) {
     throw std::invalid_argument(
-        "prepared CUDA posterior sampling requires ReserveSumProduct and one "
+        "prepared CUDA posterior sampling requires ReserveSampling and one "
         "uniform variate per batch item and node");
   }
   for (const float uniform : uniforms) {

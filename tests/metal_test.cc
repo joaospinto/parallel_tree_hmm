@@ -28,7 +28,7 @@ int main() {
   TestSamplingAccelerator(
       "Metal", tree_hmm::metal::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {
-        workspace.ReserveSumProduct(plan, states, batch);
+        workspace.ReserveSampling(plan, states, batch);
       },
       [&](std::size_t batch) { return workspace.Inputs(batch); },
       [&](std::size_t batch) { return workspace.Uniforms(batch); },

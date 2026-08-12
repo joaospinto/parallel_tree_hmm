@@ -275,7 +275,7 @@ struct Workspace::Impl {
   id<MTLBuffer> compression_middle_tape;
   id<MTLBuffer> compression_right_tape;
   bool maximum = false;
-  bool sum_product = false;
+  bool sampling = false;
 };
 
 bool Available() {
@@ -339,7 +339,7 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
     storage.compression_middle_tape = nil;
     storage.compression_right_tape = nil;
     storage.maximum = false;
-    storage.sum_product = false;
+    storage.sampling = false;
 
     storage.rakes = MakeDataBuffer(runtime.device(), plan.rakes());
     storage.combinations =
@@ -412,7 +412,7 @@ void Workspace::ReserveMaximum(const btrc::Plan &plan, std::size_t states,
   }
 }
 
-void Workspace::ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
+void Workspace::ReserveSampling(const btrc::Plan &plan, std::size_t states,
                                   std::size_t batch) {
   Reserve(plan, states, batch);
   @autoreleasepool {
@@ -447,7 +447,7 @@ void Workspace::ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
         runtime.device(), CheckedProduct({batch, plan.num_compressions(),
                                           matrix_size, sizeof(float)},
                                          "Metal compression-right tape"));
-    storage.sum_product = true;
+    storage.sampling = true;
   }
 }
 
@@ -482,9 +482,9 @@ std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
 std::span<float> Workspace::Uniforms(std::size_t batch) {
   @autoreleasepool {
     Impl &storage = *impl_;
-    if (!storage.sum_product) {
+    if (!storage.sampling) {
       throw std::logic_error(
-          "Metal Workspace::ReserveSumProduct must precede Uniforms");
+          "Metal Workspace::ReserveSampling must precede Uniforms");
     }
     if (batch == 0 || batch > storage.batch)
       throw std::invalid_argument(
@@ -523,9 +523,9 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     const std::size_t assignment_count = CheckedProduct(
         {model.batch, model.plan.num_nodes()}, "Metal posterior assignments");
     if (sampling &&
-        (!storage.sum_product || uniforms.size() != assignment_count)) {
+        (!storage.sampling || uniforms.size() != assignment_count)) {
       throw std::invalid_argument(
-          "prepared Metal posterior sampling requires ReserveSumProduct and "
+          "prepared Metal posterior sampling requires ReserveSampling and "
           "one uniform variate per batch item and node");
     }
     for (const float uniform : uniforms) {

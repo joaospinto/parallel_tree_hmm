@@ -46,9 +46,9 @@ public:
                                  std::size_t categories,
                                  std::span<const btrc::Index> observation_nodes,
                                  int device = 0);
-  void ReserveSumProduct(const btrc::Plan &plan, std::size_t states,
-                         std::size_t batch_capacity, int device = 0);
-  void ReserveCategoricalSumProduct(
+  void ReserveSampling(const btrc::Plan &plan, std::size_t states,
+                       std::size_t batch_capacity, int device = 0);
+  void ReserveCategoricalSampling(
       const btrc::Plan &plan, std::size_t states, std::size_t batch_capacity,
       std::size_t categories, std::span<const btrc::Index> observation_nodes,
       int device = 0);
