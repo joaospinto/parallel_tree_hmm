@@ -12,6 +12,8 @@ The first vertical slice provides:
 - a sum-product contraction for the partition function;
 - stable log-domain reverse contraction for every node and edge posterior
   marginal, including models with zero factors;
+- log-domain max-product contraction followed by MAP-state reconstruction;
+- exact posterior sampling from caller-supplied uniform variates;
 - stable scaled log-partition evaluation for long trees;
 - batched Metal and CUDA likelihood backends sharing one accelerator API;
 - brute-force, device-emulation, and accelerator cross-validation.
@@ -23,11 +25,27 @@ scale propagation attached to every intermediate node, edge, and branch
 factor. Prepared CPU and accelerator APIs allocate all problem storage in
 `Workspace::Reserve`; repeated numerical calls reuse it.
 
+MAP assignments and posterior samples use the same topology plan as
+sum-product inference. Contraction records the local conditional data required
+for reconstruction, and `btrc::Expand` restores all eliminated states in
+reverse dependency order. The prepared calls return workspace-backed views and
+allocate no memory. Posterior sampling accepts one `U[0,1)` variate per node so
+random-number generation remains external, reproducible, and independent of
+execution order.
+
+CUDA and Metal pack independent operations into full threadgroups for small
+state spaces, with a generic-state fallback. Each accelerator workspace also
+exposes a mutable model view through `Inputs()`. Applications can prepare
+factors directly in the workspace's pinned CUDA storage or shared Metal
+storage, then pass the resulting ordinary `BatchedModelView` to the same
+inference call. This avoids a full-batch staging copy without introducing a
+separate numerical path.
+
 The CUDA device algebra is exercised on every host build by an emulation test.
 Real CUDA compilation, launch semantics, and performance still require an
 NVIDIA system. The Metal kernels are compiled and tested directly on macOS.
-Max-product recovery, posterior sampling, accelerator marginals, and language
-bindings are later milestones.
+Accelerator marginals, accelerator reconstruction, and language bindings are
+later milestones.
 
 ## Build
 

@@ -1,10 +1,10 @@
 #ifndef TREE_HMM_METAL_H_
 #define TREE_HMM_METAL_H_
 
+#include "tree_hmm/accelerator.h"
 #include <cstddef>
 #include <memory>
 #include <string>
-#include "tree_hmm/accelerator.h"
 
 namespace tree_hmm::metal {
 
@@ -25,6 +25,10 @@ public:
   // Allocates buffers, copies the topology plan, and compiles no
   // topology-specific kernels. Repeated prepared calls allocate nothing.
   void Reserve(const btrc::Plan &plan, std::size_t states, std::size_t batch);
+
+  // Returns shared host/device storage owned by this workspace. Preparing
+  // factors directly into it eliminates an otherwise redundant copy.
+  tree_hmm::MutableBatchedModelView Inputs();
 
 private:
   friend tree_hmm::PartitionView

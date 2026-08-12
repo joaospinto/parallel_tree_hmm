@@ -113,6 +113,53 @@ kernel void rake(
   branches[branch_base + gid.x] = value / normalizer;
 }
 
+// Batched small-state inference has enough independent operations that one
+// thread can evaluate and normalize a complete message. This fills SIMD
+// groups instead of launching one mostly empty threadgroup per operation.
+kernel void rake_serial(
+    device const Rake *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device const float *paths [[buffer(2)]],
+    device float *branches [[buffer(3)]],
+    device const float *node_scales [[buffer(4)]],
+    device const float *path_scales [[buffer(5)]],
+    device float *branch_scales [[buffer(6)]],
+    constant Params &p [[buffer(7)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint operation_index = index % p.operation_count;
+  const uint batch_index = index / p.operation_count;
+  const Rake op = operations[p.operation_offset + operation_index];
+  const uint matrix_size = p.states * p.states;
+  const uint node_base = (batch_index * p.nodes + op.leaf) * p.states;
+  const uint path_batch = p.paths_batched ? batch_index : 0;
+  const uint path_base = (path_batch * p.edges + op.edge) * matrix_size;
+  const uint branch_base =
+      (batch_index * p.branches + op.branch) * p.states;
+  float maximum = 0.0f;
+  for (uint parent_state = 0; parent_state < p.states; ++parent_state) {
+    float value = 0.0f;
+    for (uint child_state = 0; child_state < p.states; ++child_state) {
+      value += paths[path_base + parent_state * p.states + child_state] *
+               nodes[node_base + child_state];
+    }
+    branches[branch_base + parent_state] = value;
+    maximum = max(maximum, value);
+  }
+  if (!p.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (uint state = 0; state < p.states; ++state)
+    branches[branch_base + state] /= normalizer;
+  const float input_scale =
+      node_scales[batch_index * p.nodes + op.leaf] +
+      path_scales[batch_index * p.edges + op.edge];
+  branch_scales[batch_index * p.branches + op.branch] =
+      maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
+}
+
 kernel void combine_branches(
     device const BranchCombination *operations [[buffer(0)]],
     device float *branches [[buffer(1)]],
@@ -148,6 +195,44 @@ kernel void combine_branches(
   branches[destination_base + gid.x] = value / normalizer;
 }
 
+kernel void combine_branches_serial(
+    device const BranchCombination *operations [[buffer(0)]],
+    device float *branches [[buffer(1)]],
+    device float *branch_scales [[buffer(2)]],
+    constant Params &p [[buffer(3)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint operation_index = index % p.operation_count;
+  const uint batch_index = index / p.operation_count;
+  const BranchCombination op =
+      operations[p.operation_offset + operation_index];
+  const uint destination_base =
+      (batch_index * p.branches + op.destination) * p.states;
+  const uint source_base =
+      (batch_index * p.branches + op.source) * p.states;
+  float maximum = 0.0f;
+  for (uint state = 0; state < p.states; ++state) {
+    const float value =
+        branches[destination_base + state] * branches[source_base + state];
+    branches[destination_base + state] = value;
+    maximum = max(maximum, value);
+  }
+  if (!p.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (uint state = 0; state < p.states; ++state)
+    branches[destination_base + state] /= normalizer;
+  const uint destination_scale =
+      batch_index * p.branches + op.destination;
+  const uint source_scale = batch_index * p.branches + op.source;
+  const float input_scale =
+      branch_scales[destination_scale] + branch_scales[source_scale];
+  branch_scales[destination_scale] =
+      maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
+}
+
 kernel void absorb_branches(
     device const BranchAbsorption *operations [[buffer(0)]],
     device float *nodes [[buffer(1)]],
@@ -181,6 +266,44 @@ kernel void absorb_branches(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   nodes[node_base + gid.x] = value / normalizer;
+}
+
+kernel void absorb_branches_serial(
+    device const BranchAbsorption *operations [[buffer(0)]],
+    device float *nodes [[buffer(1)]],
+    device const float *branches [[buffer(2)]],
+    device float *node_scales [[buffer(3)]],
+    device const float *branch_scales [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint operation_index = index % p.operation_count;
+  const uint batch_index = index / p.operation_count;
+  const BranchAbsorption op =
+      operations[p.operation_offset + operation_index];
+  const uint node_base = (batch_index * p.nodes + op.parent) * p.states;
+  const uint branch_base =
+      (batch_index * p.branches + op.branch) * p.states;
+  float maximum = 0.0f;
+  for (uint state = 0; state < p.states; ++state) {
+    const float value =
+        nodes[node_base + state] * branches[branch_base + state];
+    nodes[node_base + state] = value;
+    maximum = max(maximum, value);
+  }
+  if (!p.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (uint state = 0; state < p.states; ++state)
+    nodes[node_base + state] /= normalizer;
+  const uint node_scale = batch_index * p.nodes + op.parent;
+  const float input_scale =
+      node_scales[node_scale] +
+      branch_scales[batch_index * p.branches + op.branch];
+  node_scales[node_scale] =
+      maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
 }
 
 kernel void compress(
@@ -239,6 +362,65 @@ kernel void compress(
   }
   threadgroup_barrier(mem_flags::mem_threadgroup);
   paths[left_base + thread_index] = value / *normalizer;
+}
+
+kernel void compress_serial4(
+    device const Compression *operations [[buffer(0)]],
+    device const float *nodes [[buffer(1)]],
+    device float *paths [[buffer(2)]],
+    device const float *node_scales [[buffer(3)]],
+    device float *path_scales [[buffer(4)]],
+    constant Params &p [[buffer(5)]],
+    uint index [[thread_position_in_grid]]) {
+  const uint count = p.operation_count * p.batch;
+  if (index >= count)
+    return;
+  const uint operation_index = index % p.operation_count;
+  const uint batch_index = index / p.operation_count;
+  const Compression op =
+      operations[p.operation_offset + operation_index];
+  constexpr uint states = 4;
+  constexpr uint matrix_size = states * states;
+  const uint left_base =
+      (batch_index * p.edges + op.left_edge) * matrix_size;
+  const uint right_base =
+      (batch_index * p.edges + op.right_edge) * matrix_size;
+  const uint middle_base = (batch_index * p.nodes + op.middle) * states;
+  float left[matrix_size];
+  float right[matrix_size];
+  float middle[states];
+  for (uint entry = 0; entry < matrix_size; ++entry) {
+    left[entry] = paths[left_base + entry];
+    right[entry] = paths[right_base + entry];
+  }
+  for (uint state = 0; state < states; ++state)
+    middle[state] = nodes[middle_base + state];
+
+  float maximum = 0.0f;
+  for (uint parent_state = 0; parent_state < states; ++parent_state) {
+    for (uint child_state = 0; child_state < states; ++child_state) {
+      float value = 0.0f;
+      for (uint middle_state = 0; middle_state < states; ++middle_state) {
+        value += left[parent_state * states + middle_state] *
+                 middle[middle_state] *
+                 right[middle_state * states + child_state];
+      }
+      paths[left_base + parent_state * states + child_state] = value;
+      maximum = max(maximum, value);
+    }
+  }
+  if (!p.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (uint entry = 0; entry < matrix_size; ++entry)
+    paths[left_base + entry] /= normalizer;
+  const uint left_scale = batch_index * p.edges + op.left_edge;
+  const float input_scale =
+      path_scales[left_scale] +
+      node_scales[batch_index * p.nodes + op.middle] +
+      path_scales[batch_index * p.edges + op.right_edge];
+  path_scales[left_scale] =
+      maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
 }
 
 kernel void finish_root(

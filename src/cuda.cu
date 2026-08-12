@@ -64,20 +64,20 @@ std::size_t CheckedProduct(std::initializer_list<std::size_t> values,
 }
 
 template <class Value> void DeviceAllocate(Value *&pointer, std::size_t count) {
-  Check(cudaMalloc(reinterpret_cast<void **>(&pointer),
-                   std::max<std::size_t>(
-                       CheckedProduct({count, sizeof(Value)}, "CUDA buffer"),
-                       1)),
-        "cudaMalloc");
+  Check(
+      cudaMalloc(reinterpret_cast<void **>(&pointer),
+                 std::max<std::size_t>(
+                     CheckedProduct({count, sizeof(Value)}, "CUDA buffer"), 1)),
+      "cudaMalloc");
 }
 
 template <class Value> void HostAllocate(Value *&pointer, std::size_t count) {
-  Check(cudaMallocHost(reinterpret_cast<void **>(&pointer),
-                       std::max<std::size_t>(
-                           CheckedProduct({count, sizeof(Value)},
-                                          "pinned host buffer"),
-                           1)),
-        "cudaMallocHost");
+  Check(
+      cudaMallocHost(
+          reinterpret_cast<void **>(&pointer),
+          std::max<std::size_t>(
+              CheckedProduct({count, sizeof(Value)}, "pinned host buffer"), 1)),
+      "cudaMallocHost");
 }
 
 template <class Value> void DeviceFree(Value *&pointer) noexcept {
@@ -167,10 +167,10 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
     return;
-  const float value = detail::RakeValue(
-      paths + PathIndex(params, batch, operation.edge, 0, 0),
-      nodes + NodeIndex(params, batch, operation.leaf, 0), params.states,
-      state);
+  const float value =
+      detail::RakeValue(paths + PathIndex(params, batch, operation.edge, 0, 0),
+                        nodes + NodeIndex(params, batch, operation.leaf, 0),
+                        params.states, state);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
   branches[branch_base + state] = value;
@@ -189,6 +189,42 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
   }
   __syncthreads();
   branches[branch_base + state] = value / normalizer;
+}
+
+__global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
+                           const float *paths, float *branches,
+                           const float *node_scales, const float *path_scales,
+                           float *branch_scales, Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t operation_in_batch = index % params.operation_count;
+  const std::size_t batch = index / params.operation_count;
+  const btrc::Rake operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t branch_base =
+      BranchIndex(params, batch, operation.branch, 0);
+  float maximum = 0.0f;
+  for (std::size_t parent_state = 0; parent_state < params.states;
+       ++parent_state) {
+    const float value = detail::RakeValue(paths + path_base, nodes + node_base,
+                                          params.states, parent_state);
+    branches[branch_base + parent_state] = value;
+    maximum = fmaxf(maximum, value);
+  }
+  if (!params.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (std::size_t state = 0; state < params.states; ++state)
+    branches[branch_base + state] /= normalizer;
+  const float input_scale = node_scales[batch * params.nodes + operation.leaf] +
+                            path_scales[batch * params.edges + operation.edge];
+  branch_scales[batch * params.branches + operation.branch] =
+      detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void CombineBranches(const btrc::BranchCombination *operations,
@@ -218,8 +254,7 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t destination_scale =
         batch * params.branches + operation.destination;
-    const std::size_t source_scale =
-        batch * params.branches + operation.source;
+    const std::size_t source_scale = batch * params.branches + operation.source;
     const float input_scale =
         branch_scales[destination_scale] + branch_scales[source_scale];
     branch_scales[destination_scale] =
@@ -229,10 +264,47 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
   branches[destination_base + state] = value / normalizer;
 }
 
+__global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
+                                      float *branches, float *branch_scales,
+                                      Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t operation_in_batch = index % params.operation_count;
+  const std::size_t batch = index / params.operation_count;
+  const btrc::BranchCombination operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t destination_base =
+      BranchIndex(params, batch, operation.destination, 0);
+  const std::size_t source_base =
+      BranchIndex(params, batch, operation.source, 0);
+  float maximum = 0.0f;
+  for (std::size_t state = 0; state < params.states; ++state) {
+    const float value = detail::Product(branches[destination_base + state],
+                                        branches[source_base + state]);
+    branches[destination_base + state] = value;
+    maximum = fmaxf(maximum, value);
+  }
+  if (!params.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (std::size_t state = 0; state < params.states; ++state)
+    branches[destination_base + state] /= normalizer;
+  const std::size_t destination_scale =
+      batch * params.branches + operation.destination;
+  const std::size_t source_scale = batch * params.branches + operation.source;
+  const float input_scale =
+      branch_scales[destination_scale] + branch_scales[source_scale];
+  branch_scales[destination_scale] =
+      detail::UpdatedLogScale(input_scale, maximum);
+}
+
 __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
                                float *nodes, const float *branches,
-                               float *node_scales,
-                               const float *branch_scales, Params params) {
+                               float *node_scales, const float *branch_scales,
+                               Params params) {
   __shared__ float normalizer;
   const std::size_t state = threadIdx.x;
   const std::size_t operation_in_batch = blockIdx.x % params.operation_count;
@@ -241,8 +313,7 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
     return;
-  const std::size_t node_base =
-      NodeIndex(params, batch, operation.parent, 0);
+  const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
   const float value =
@@ -258,11 +329,46 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
     const float input_scale =
         node_scales[node_scale] +
         branch_scales[batch * params.branches + operation.branch];
-    node_scales[node_scale] =
-        detail::UpdatedLogScale(input_scale, maximum);
+    node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
   nodes[node_base + state] = value / normalizer;
+}
+
+__global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
+                                     float *nodes, const float *branches,
+                                     float *node_scales,
+                                     const float *branch_scales,
+                                     Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t operation_in_batch = index % params.operation_count;
+  const std::size_t batch = index / params.operation_count;
+  const btrc::BranchAbsorption operation =
+      operations[params.operation_offset + operation_in_batch];
+  const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
+  const std::size_t branch_base =
+      BranchIndex(params, batch, operation.branch, 0);
+  float maximum = 0.0f;
+  for (std::size_t state = 0; state < params.states; ++state) {
+    const float value = detail::Product(nodes[node_base + state],
+                                        branches[branch_base + state]);
+    nodes[node_base + state] = value;
+    maximum = fmaxf(maximum, value);
+  }
+  if (!params.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (std::size_t state = 0; state < params.states; ++state)
+    nodes[node_base + state] /= normalizer;
+  const std::size_t node_scale = batch * params.nodes + operation.parent;
+  const float input_scale =
+      node_scales[node_scale] +
+      branch_scales[batch * params.branches + operation.branch];
+  node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void Compress(const btrc::Compression *operations,
@@ -292,8 +398,7 @@ __global__ void Compress(const btrc::Compression *operations,
                                    parent_state, child_state)];
   }
   if (entry < params.states) {
-    middle[entry] =
-        nodes[NodeIndex(params, batch, operation.middle, entry)];
+    middle[entry] = nodes[NodeIndex(params, batch, operation.middle, entry)];
   }
   __syncthreads();
   if (entry >= matrix)
@@ -313,18 +418,72 @@ __global__ void Compress(const btrc::Compression *operations,
     const float maximum =
         detail::Maximum(paths + output_base, static_cast<unsigned>(matrix));
     normalizer = maximum > 0.0f ? maximum : 1.0f;
-    const std::size_t left_scale =
-        batch * params.edges + operation.left_edge;
+    const std::size_t left_scale = batch * params.edges + operation.left_edge;
     const float input_scale =
         path_scales[left_scale] +
         node_scales[batch * params.nodes + operation.middle] +
         path_scales[batch * params.edges + operation.right_edge];
-    path_scales[left_scale] =
-        detail::UpdatedLogScale(input_scale, maximum);
+    path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
   paths[PathIndex(params, batch, operation.left_edge, parent_state,
                   child_state)] = value / normalizer;
+}
+
+__global__ void CompressSerial4(const btrc::Compression *operations,
+                                const float *nodes, float *paths,
+                                const float *node_scales, float *path_scales,
+                                Params params) {
+  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
+  const std::size_t count =
+      static_cast<std::size_t>(params.batch) * params.operation_count;
+  if (index >= count)
+    return;
+  const std::size_t operation_in_batch = index % params.operation_count;
+  const std::size_t batch = index / params.operation_count;
+  const btrc::Compression operation =
+      operations[params.operation_offset + operation_in_batch];
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kMatrix = kStates * kStates;
+  float left[kMatrix];
+  float right[kMatrix];
+  float middle[kStates];
+  for (std::size_t entry = 0; entry < kMatrix; ++entry) {
+    const std::size_t parent_state = entry / kStates;
+    const std::size_t child_state = entry % kStates;
+    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
+                                  parent_state, child_state)];
+    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
+                                   parent_state, child_state)];
+  }
+  for (std::size_t state = 0; state < kStates; ++state)
+    middle[state] = nodes[NodeIndex(params, batch, operation.middle, state)];
+
+  float maximum = 0.0f;
+  for (std::size_t parent_state = 0; parent_state < kStates; ++parent_state) {
+    for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
+      const float value = detail::CompressionValue(left, middle, right, kStates,
+                                                   parent_state, child_state);
+      paths[PathIndex(params, batch, operation.left_edge, parent_state,
+                      child_state)] = value;
+      maximum = fmaxf(maximum, value);
+    }
+  }
+  if (!params.scaled)
+    return;
+  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (std::size_t entry = 0; entry < kMatrix; ++entry) {
+    const std::size_t parent_state = entry / kStates;
+    const std::size_t child_state = entry % kStates;
+    paths[PathIndex(params, batch, operation.left_edge, parent_state,
+                    child_state)] /= normalizer;
+  }
+  const std::size_t left_scale = batch * params.edges + operation.left_edge;
+  const float input_scale =
+      path_scales[left_scale] +
+      node_scales[batch * params.nodes + operation.middle] +
+      path_scales[batch * params.edges + operation.right_edge];
+  path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void FinishRoot(const float *nodes, const float *node_scales,
@@ -510,11 +669,27 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
                  CheckedProduct({batch, plan.num_nodes()}, "node scales"));
   DeviceAllocate(storage.path_scales,
                  CheckedProduct({batch, plan.num_edges()}, "path scales"));
-  DeviceAllocate(
-      storage.branch_scales,
-      CheckedProduct({batch, plan.num_branches()}, "branch scales"));
+  DeviceAllocate(storage.branch_scales,
+                 CheckedProduct({batch, plan.num_branches()}, "branch scales"));
   DeviceAllocate(storage.output, batch);
   Check(cudaStreamSynchronize(storage.stream), "topology upload");
+}
+
+tree_hmm::MutableBatchedModelView Workspace::Inputs() {
+  Impl &storage = *impl_;
+  if (storage.plan == nullptr)
+    throw std::logic_error("CUDA Workspace::Reserve must precede Inputs");
+  const std::size_t node_values =
+      CheckedProduct({storage.batch, storage.plan->num_nodes(), storage.states},
+                     "CUDA input nodes");
+  const std::size_t edge_values = CheckedProduct(
+      {storage.plan->num_edges(), storage.states, storage.states},
+      "CUDA input edges");
+  return {*storage.plan,
+          storage.states,
+          storage.batch,
+          {storage.host_nodes, node_values},
+          {storage.host_edges, edge_values}};
 }
 
 namespace {
@@ -539,10 +714,14 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
       model.edge_potentials.size() != edge_values) {
     throw std::invalid_argument("CUDA input shapes do not match the workspace");
   }
-  std::memcpy(storage.host_nodes, model.node_potentials.data(),
-              model.node_potentials.size_bytes());
-  std::memcpy(storage.host_edges, model.edge_potentials.data(),
-              model.edge_potentials.size_bytes());
+  if (model.node_potentials.data() != storage.host_nodes) {
+    std::memcpy(storage.host_nodes, model.node_potentials.data(),
+                model.node_potentials.size_bytes());
+  }
+  if (model.edge_potentials.data() != storage.host_edges) {
+    std::memcpy(storage.host_edges, model.edge_potentials.data(),
+                model.edge_potentials.size_bytes());
+  }
 
   Check(cudaEventRecord(storage.upload_start, storage.stream),
         "cudaEventRecord upload start");
@@ -571,19 +750,19 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                           model.batch * model.plan.num_edges() * sizeof(float),
                           storage.stream),
           "cudaMemsetAsync path scales");
-    Check(cudaMemsetAsync(
-              storage.branch_scales, 0,
-              model.batch * model.plan.num_branches() * sizeof(float),
-              storage.stream),
-          "cudaMemsetAsync branch scales");
+    Check(
+        cudaMemsetAsync(storage.branch_scales, 0,
+                        model.batch * model.plan.num_branches() * sizeof(float),
+                        storage.stream),
+        "cudaMemsetAsync branch scales");
   }
   InitializeNodes<<<Blocks(node_values, kThreads), kThreads, 0,
                     storage.stream>>>(storage.input_nodes, storage.nodes,
                                       node_values);
-  const std::size_t path_values = CheckedProduct(
-      {base_params.paths_batched ? model.batch : 1, model.plan.num_edges(),
-       matrix},
-      "path workspace");
+  const std::size_t path_values =
+      CheckedProduct({base_params.paths_batched ? model.batch : 1,
+                      model.plan.num_edges(), matrix},
+                     "path workspace");
   if (path_values != 0) {
     InitializePaths<<<Blocks(path_values, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
@@ -594,31 +773,59 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
     Params params = base_params;
     params.operation_offset = batch.offset;
     params.operation_count = batch.count;
-    const std::uint32_t blocks = CheckedU32(
-        CheckedProduct({model.batch, batch.count}, "primitive CUDA grid"),
-        "primitive CUDA grid");
+    const std::size_t operations =
+        CheckedProduct({model.batch, batch.count}, "primitive CUDA grid");
+    const std::uint32_t operation_blocks =
+        CheckedU32(operations, "primitive CUDA grid");
+    const std::uint32_t serial_blocks = Blocks(operations, kThreads);
     switch (batch.primitive) {
     case btrc::Primitive::kRake:
-      Rake<<<blocks, model.states, 0, storage.stream>>>(
-          storage.rakes, storage.nodes, storage.paths, storage.branches,
-          storage.node_scales, storage.path_scales, storage.branch_scales,
-          params);
+      if (model.states <= 8) {
+        RakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.rakes, storage.nodes, storage.paths, storage.branches,
+            storage.node_scales, storage.path_scales, storage.branch_scales,
+            params);
+      } else {
+        Rake<<<operation_blocks, model.states, 0, storage.stream>>>(
+            storage.rakes, storage.nodes, storage.paths, storage.branches,
+            storage.node_scales, storage.path_scales, storage.branch_scales,
+            params);
+      }
       break;
     case btrc::Primitive::kBranchCombination:
-      CombineBranches<<<blocks, model.states, 0, storage.stream>>>(
-          storage.combinations, storage.branches, storage.branch_scales,
-          params);
+      if (model.states <= 8) {
+        CombineBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.combinations, storage.branches, storage.branch_scales,
+            params);
+      } else {
+        CombineBranches<<<operation_blocks, model.states, 0, storage.stream>>>(
+            storage.combinations, storage.branches, storage.branch_scales,
+            params);
+      }
       break;
     case btrc::Primitive::kBranchAbsorption:
-      AbsorbBranches<<<blocks, model.states, 0, storage.stream>>>(
-          storage.absorptions, storage.nodes, storage.branches,
-          storage.node_scales, storage.branch_scales, params);
+      if (model.states <= 8) {
+        AbsorbBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.absorptions, storage.nodes, storage.branches,
+            storage.node_scales, storage.branch_scales, params);
+      } else {
+        AbsorbBranches<<<operation_blocks, model.states, 0, storage.stream>>>(
+            storage.absorptions, storage.nodes, storage.branches,
+            storage.node_scales, storage.branch_scales, params);
+      }
       break;
     case btrc::Primitive::kCompression:
-      Compress<<<blocks, matrix, (2 * matrix + model.states) * sizeof(float),
-                 storage.stream>>>(storage.compressions, storage.nodes,
-                                   storage.paths, storage.node_scales,
-                                   storage.path_scales, params);
+      if (model.states == 4) {
+        CompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
+            storage.compressions, storage.nodes, storage.paths,
+            storage.node_scales, storage.path_scales, params);
+      } else {
+        Compress<<<operation_blocks, matrix,
+                   (2 * matrix + model.states) * sizeof(float),
+                   storage.stream>>>(storage.compressions, storage.nodes,
+                                     storage.paths, storage.node_scales,
+                                     storage.path_scales, params);
+      }
       break;
     }
   }
@@ -637,8 +844,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
         "cudaMemcpyAsync output download");
   Check(cudaEventRecord(storage.download_stop, storage.stream),
         "cudaEventRecord download stop");
-  Check(cudaEventSynchronize(storage.download_stop),
-        "tree-HMM CUDA execution");
+  Check(cudaEventSynchronize(storage.download_stop), "tree-HMM CUDA execution");
 
   float upload_ms = 0.0f;
   float kernel_ms = 0.0f;

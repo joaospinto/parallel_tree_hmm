@@ -11,9 +11,9 @@
 #include <string>
 #include <vector>
 
-template <class Reserve, class Solve, class SolveLog>
+template <class Reserve, class Inputs, class Solve, class SolveLog>
 void TestAccelerator(const char *name, bool available, Reserve reserve,
-                     Solve solve, SolveLog solve_log) {
+                     Inputs inputs, Solve solve, SolveLog solve_log) {
   if (!available)
     return;
   const btrc::Plan plan =
@@ -51,8 +51,8 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
                    host_nodes.begin(),
                    [](float value) { return static_cast<double>(value); });
     std::vector<double> host_edges(edges.begin(), edges.end());
-    const double expected = tree_hmm::PartitionFunction(
-        {plan, kStates, host_nodes, host_edges});
+    const double expected =
+        tree_hmm::PartitionFunction({plan, kStates, host_nodes, host_edges});
     const double actual = result.values[batch];
     const double tolerance =
         2e-5 * std::max({1.0, std::abs(actual), std::abs(expected)});
@@ -64,6 +64,27 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   if (result.timings.kernel_ms < 0.0)
     throw std::runtime_error(std::string(name) + " kernel timing is invalid");
 
+  tree_hmm::MutableBatchedModelView staged = inputs();
+  std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
+  std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
+  const tree_hmm::PartitionView staged_result =
+      solve(static_cast<tree_hmm::BatchedModelView>(staged));
+  for (std::size_t batch = 0; batch < kBatch; ++batch) {
+    std::vector<double> host_nodes(plan.num_nodes() * kStates);
+    std::transform(nodes.begin() + batch * host_nodes.size(),
+                   nodes.begin() + (batch + 1) * host_nodes.size(),
+                   host_nodes.begin(),
+                   [](float value) { return static_cast<double>(value); });
+    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const double expected =
+        tree_hmm::PartitionFunction({plan, kStates, host_nodes, host_edges});
+    if (std::abs(staged_result.values[batch] - expected) >
+        2e-5 * std::max(1.0, std::abs(expected))) {
+      throw std::runtime_error(std::string(name) +
+                               " staged input disagrees with CPU inference");
+    }
+  }
+
   const tree_hmm::PartitionView log_result = solve_log(
       tree_hmm::BatchedModelView{plan, kStates, kBatch, nodes, edges});
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
@@ -73,8 +94,8 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
                    host_nodes.begin(),
                    [](float value) { return static_cast<double>(value); });
     std::vector<double> host_edges(edges.begin(), edges.end());
-    const double expected = tree_hmm::LogPartitionFunction(
-        {plan, kStates, host_nodes, host_edges});
+    const double expected =
+        tree_hmm::LogPartitionFunction({plan, kStates, host_nodes, host_edges});
     const double actual = log_result.values[batch];
     const double tolerance =
         5e-5 * std::max({1.0, std::abs(actual), std::abs(expected)});
@@ -87,8 +108,8 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   // A unary chain forces path composition and therefore site-specific path
   // storage. Its edge factors vary by edge so accidental path broadcasting is
   // observable.
-  const btrc::Plan chain_plan = btrc::MakePlan(
-      std::vector<std::int64_t>{-1, 0, 1, 2, 3, 4, 5});
+  const btrc::Plan chain_plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 2, 3, 4, 5});
   constexpr std::size_t kChainBatch = 5;
   std::vector<float> chain_nodes(kChainBatch * chain_plan.num_nodes() *
                                  kStates);
@@ -99,15 +120,15 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
         chain_edges[(edge * kStates + parent) * kStates + child] =
-            0.02f + 0.01f * static_cast<float>(
-                              1 + edge + 2 * parent + 3 * child);
+            0.02f +
+            0.01f * static_cast<float>(1 + edge + 2 * parent + 3 * child);
       }
     }
   }
   reserve(chain_plan, kStates, kChainBatch);
-  const tree_hmm::PartitionView chain_result = solve_log(
-      tree_hmm::BatchedModelView{chain_plan, kStates, kChainBatch, chain_nodes,
-                                 chain_edges});
+  const tree_hmm::PartitionView chain_result =
+      solve_log(tree_hmm::BatchedModelView{chain_plan, kStates, kChainBatch,
+                                           chain_nodes, chain_edges});
   for (std::size_t batch = 0; batch < kChainBatch; ++batch) {
     const std::size_t node_values = chain_plan.num_nodes() * kStates;
     const std::vector<double> host_nodes(
@@ -140,6 +161,41 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   if (std::abs(long_result.values[0] - long_expected) > 2e-3) {
     throw std::runtime_error(std::string(name) +
                              " scaled inference underflowed on a long tree");
+  }
+
+  // Exercise the generic-state fallback, including path composition. The
+  // optimized small-state kernels above must not become the only tested path.
+  constexpr std::size_t kGenericStates = 9;
+  constexpr std::size_t kGenericBatch = 2;
+  const btrc::Plan generic_plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 2, 3});
+  std::vector<float> generic_nodes(kGenericBatch * generic_plan.num_nodes() *
+                                   kGenericStates);
+  for (std::size_t index = 0; index < generic_nodes.size(); ++index)
+    generic_nodes[index] = 0.1f + 0.003f * static_cast<float>(index % 23);
+  std::vector<float> generic_edges(generic_plan.num_edges() * kGenericStates *
+                                   kGenericStates);
+  for (std::size_t index = 0; index < generic_edges.size(); ++index)
+    generic_edges[index] = 0.02f + 0.001f * static_cast<float>(index % 31);
+  reserve(generic_plan, kGenericStates, kGenericBatch);
+  const tree_hmm::PartitionView generic_result =
+      solve_log({generic_plan, kGenericStates, kGenericBatch, generic_nodes,
+                 generic_edges});
+  for (std::size_t batch = 0; batch < kGenericBatch; ++batch) {
+    const std::size_t node_values = generic_plan.num_nodes() * kGenericStates;
+    const std::vector<double> host_nodes(
+        generic_nodes.begin() + batch * node_values,
+        generic_nodes.begin() + (batch + 1) * node_values);
+    const std::vector<double> host_edges(generic_edges.begin(),
+                                         generic_edges.end());
+    const double expected = tree_hmm::LogPartitionFunction(
+        {generic_plan, kGenericStates, host_nodes, host_edges});
+    const double actual = generic_result.values[batch];
+    if (std::abs(actual - expected) >
+        1e-4 * std::max({1.0, std::abs(actual), std::abs(expected)})) {
+      throw std::runtime_error(std::string(name) +
+                               " generic-state inference disagrees with CPU");
+    }
   }
 }
 

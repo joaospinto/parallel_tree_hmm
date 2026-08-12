@@ -28,6 +28,10 @@ public:
   void Reserve(const btrc::Plan &plan, std::size_t states, std::size_t batch,
                int device = 0);
 
+  // Returns pinned host storage owned by this workspace. Preparing factors
+  // directly into it eliminates an otherwise redundant host-side copy.
+  tree_hmm::MutableBatchedModelView Inputs();
+
 private:
   friend tree_hmm::PartitionView
   PartitionFunctionPrepared(tree_hmm::BatchedModelView, Workspace &);
