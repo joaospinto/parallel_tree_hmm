@@ -33,8 +33,6 @@ struct Workspace::Impl {
   std::vector<double> compression_right;
   std::vector<double> reverse_scratch;
 
-  std::vector<double> marginal_nodes;
-  std::vector<double> marginal_edges;
   std::vector<std::size_t> rake_choices;
   std::vector<std::size_t> compression_choices;
   std::vector<std::size_t> assignments;
@@ -88,11 +86,6 @@ Workspace::Impl &Prepare(ModelView model, Workspace::Impl &storage) {
             storage.nodes.begin());
   std::copy(model.edge_potentials.begin(), model.edge_potentials.end(),
             storage.paths.begin());
-  std::fill(storage.branches.begin(), storage.branches.end(), 0.0);
-  std::fill(storage.node_adjoints.begin(), storage.node_adjoints.end(), 0.0);
-  std::fill(storage.path_adjoints.begin(), storage.path_adjoints.end(), 0.0);
-  std::fill(storage.branch_adjoints.begin(), storage.branch_adjoints.end(),
-            0.0);
   storage.partition = 0.0;
   storage.log_partition = 0.0;
   storage.maximum_log_weight = 0.0;
@@ -200,15 +193,7 @@ public:
       double *left = Path(operation.left_edge);
       const double *middle = Node(operation.middle);
       const double *right = Path(operation.right_edge);
-      double *saved_left =
-          storage_.compression_left.data() + operation.tape * matrix_size_;
-      double *saved_middle =
-          storage_.compression_middle.data() + operation.tape * states_;
-      double *saved_right =
-          storage_.compression_right.data() + operation.tape * matrix_size_;
-      std::copy(left, left + matrix_size_, saved_left);
-      std::copy(middle, middle + states_, saved_middle);
-      std::copy(right, right + matrix_size_, saved_right);
+      std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         for (std::size_t child_state = 0; child_state < states_;
@@ -216,9 +201,10 @@ public:
           double value = 0.0;
           for (std::size_t middle_state = 0; middle_state < states_;
                ++middle_state) {
-            value += saved_left[parent_state * states_ + middle_state] *
-                     saved_middle[middle_state] *
-                     saved_right[middle_state * states_ + child_state];
+            value += storage_.reverse_scratch[parent_state * states_ +
+                                              middle_state] *
+                     middle[middle_state] *
+                     right[middle_state * states_ + child_state];
           }
           left[parent_state * states_ + child_state] = value;
         }
@@ -267,8 +253,6 @@ public:
                    storage_.nodes.begin(), PotentialLog);
     std::transform(storage_.paths.begin(), storage_.paths.end(),
                    storage_.paths.begin(), PotentialLog);
-    std::fill(storage_.branches.begin(), storage_.branches.end(),
-              -std::numeric_limits<double>::infinity());
   }
 
   void Rake(std::span<const btrc::Rake> operations) {
@@ -382,17 +366,18 @@ public:
           storage_.rake_paths.data() + operation.branch * matrix_size_;
       const double *leaf =
           storage_.rake_leaves.data() + operation.branch * states_;
+      double *conditional = storage_.reverse_scratch.data();
+      for (std::size_t child_state = 0; child_state < states_; ++child_state) {
+        conditional[child_state] =
+            path[parent_state * states_ + child_state] + leaf[child_state];
+      }
       const double normalizer =
           LogSumExp(states_, [&](std::size_t child_state) {
-            return path[parent_state * states_ + child_state] +
-                   leaf[child_state];
+            return conditional[child_state];
           });
       storage_.assignments[operation.leaf] = SampleLogWeights(
           states_,
-          [&](std::size_t child_state) {
-            return path[parent_state * states_ + child_state] +
-                   leaf[child_state];
-          },
+          [&](std::size_t child_state) { return conditional[child_state]; },
           normalizer, uniforms_[operation.leaf]);
     }
   }
@@ -407,19 +392,21 @@ public:
           storage_.compression_middle.data() + operation.tape * states_;
       const double *right =
           storage_.compression_right.data() + operation.tape * matrix_size_;
+      double *conditional = storage_.reverse_scratch.data();
+      for (std::size_t middle_state = 0; middle_state < states_;
+           ++middle_state) {
+        conditional[middle_state] =
+            left[parent_state * states_ + middle_state] +
+            middle[middle_state] +
+            right[middle_state * states_ + child_state];
+      }
       const double normalizer =
           LogSumExp(states_, [&](std::size_t middle_state) {
-            return left[parent_state * states_ + middle_state] +
-                   middle[middle_state] +
-                   right[middle_state * states_ + child_state];
+            return conditional[middle_state];
           });
       storage_.assignments[operation.middle] = SampleLogWeights(
           states_,
-          [&](std::size_t middle_state) {
-            return left[parent_state * states_ + middle_state] +
-                   middle[middle_state] +
-                   right[middle_state * states_ + child_state];
-          },
+          [&](std::size_t middle_state) { return conditional[middle_state]; },
           normalizer, uniforms_[operation.middle]);
     }
   }
@@ -531,12 +518,8 @@ public:
   }
 
   MarginalView BuildMarginals() {
-    std::copy(storage_.node_adjoints.begin(), storage_.node_adjoints.end(),
-              storage_.marginal_nodes.begin());
-    std::copy(storage_.path_adjoints.begin(), storage_.path_adjoints.end(),
-              storage_.marginal_edges.begin());
-    return {storage_.partition, storage_.log_partition, storage_.marginal_nodes,
-            storage_.marginal_edges};
+    return {storage_.partition, storage_.log_partition, storage_.node_adjoints,
+            storage_.path_adjoints};
   }
 
 private:
@@ -588,8 +571,6 @@ public:
                    storage_.nodes.begin(), PotentialLog);
     std::transform(storage_.paths.begin(), storage_.paths.end(),
                    storage_.paths.begin(), PotentialLog);
-    std::fill(storage_.branches.begin(), storage_.branches.end(),
-              -std::numeric_limits<double>::infinity());
   }
 
   void Rake(std::span<const btrc::Rake> operations) {
@@ -896,8 +877,6 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
   storage.compression_middle.resize(compression_vectors);
   storage.compression_right.resize(compression_matrices);
   storage.reverse_scratch.resize(matrix_size);
-  storage.marginal_nodes.resize(node_values);
-  storage.marginal_edges.resize(path_values);
   storage.rake_choices.resize(branch_values);
   storage.compression_choices.resize(compression_matrices);
   storage.assignments.resize(plan.num_nodes());
@@ -925,6 +904,10 @@ double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace) {
 
 MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
+  std::fill(storage.node_adjoints.begin(), storage.node_adjoints.end(), 0.0);
+  std::fill(storage.path_adjoints.begin(), storage.path_adjoints.end(), 0.0);
+  std::fill(storage.branch_adjoints.begin(), storage.branch_adjoints.end(),
+            0.0);
   LogSumProductDispatcher dispatcher(model.plan, model.states, storage);
   btrc::Contract(model.plan, dispatcher);
   dispatcher.FinishRoot();
