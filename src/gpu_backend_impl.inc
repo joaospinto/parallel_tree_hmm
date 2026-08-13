@@ -270,6 +270,25 @@ __device__ bool Finite(Scalar value) {
   return value > -INFINITY && value < INFINITY;
 }
 
+struct SmallStateWorkItem {
+  std::uint32_t operation;
+  std::uint32_t batch;
+};
+
+// Small-state kernels assign one complete algebra operation to each thread for
+// every Scalar type. Keeping operations and batch items on separate grid axes
+// avoids recovering both coordinates with integer division in every primitive.
+__device__ SmallStateWorkItem SmallStateWork() {
+  return {static_cast<std::uint32_t>(blockIdx.x * blockDim.y + threadIdx.y),
+          static_cast<std::uint32_t>(
+              (blockIdx.z * gridDim.y + blockIdx.y) * blockDim.x +
+              threadIdx.x)};
+}
+
+// This execution threshold depends only on state count; the same kernels and
+// policy are compiled for every Scalar type and both CUDA-compatible runtimes.
+constexpr std::size_t kSmallStateLimit = 8;
+
 // Transpose the public [batch, node, state] input into the internal
 // [node, batch, state] layout without constraining the state count.
 constexpr std::size_t kTransposeTile = 32;
@@ -934,18 +953,15 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
                                   const btrc::Index *mutable_path_slots,
                                   Scalar *branches, std::uint32_t *choices,
                                   Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Rake operation =
-      operations[params.operation_offset + operation_in_batch];
-  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+      operations[params.operation_offset + work.operation];
+  const std::size_t node_base =
+      NodeIndex(params, work.batch, operation.leaf, 0);
   const std::size_t path_base =
-      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
+      PathIndex(params, mutable_path_slots, work.batch, operation.edge, 0, 0);
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
     Scalar best =
@@ -961,9 +977,10 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
         choice = child_state;
       }
     }
-    branches[BranchIndex(params, batch, operation.branch, parent_state)] = best;
-    choices[RakeChoiceIndex(params, batch, operation.branch, parent_state)] =
-        choice;
+    branches[BranchIndex(params, work.batch, operation.branch, parent_state)] =
+        best;
+    choices[RakeChoiceIndex(params, work.batch, operation.branch,
+                            parent_state)] = choice;
   }
 }
 
@@ -1003,18 +1020,14 @@ __global__ void MaximumRake(const btrc::Rake *operations, const Scalar *nodes,
 __global__ void
 LogCombineBranchesSerial(const btrc::BranchCombination *operations,
                          Scalar *branches, Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchCombination operation =
-      operations[params.operation_offset + operation_in_batch];
+      operations[params.operation_offset + work.operation];
   for (std::size_t state = 0; state < params.states; ++state) {
-    branches[BranchIndex(params, batch, operation.destination, state)] +=
-        branches[BranchIndex(params, batch, operation.source, state)];
+    branches[BranchIndex(params, work.batch, operation.destination, state)] +=
+        branches[BranchIndex(params, work.batch, operation.source, state)];
   }
 }
 
@@ -1034,18 +1047,14 @@ __global__ void LogCombineBranches(const btrc::BranchCombination *operations,
 __global__ void
 LogAbsorbBranchesSerial(const btrc::BranchAbsorption *operations, Scalar *nodes,
                         const Scalar *branches, Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchAbsorption operation =
-      operations[params.operation_offset + operation_in_batch];
+      operations[params.operation_offset + work.operation];
   for (std::size_t state = 0; state < params.states; ++state) {
-    nodes[NodeIndex(params, batch, operation.parent, state)] +=
-        branches[BranchIndex(params, batch, operation.branch, state)];
+    nodes[NodeIndex(params, work.batch, operation.parent, state)] +=
+        branches[BranchIndex(params, work.batch, operation.branch, state)];
   }
 }
 
@@ -1067,25 +1076,24 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
                                        const Scalar *nodes, Scalar *paths,
                                        const btrc::Index *mutable_path_slots,
                                        std::uint32_t *choices, Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Compression operation =
-      operations[params.operation_offset + operation_in_batch];
+      operations[params.operation_offset + work.operation];
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kMatrix = kStates * kStates;
   Scalar left[kMatrix];
   Scalar right[kMatrix];
   Scalar middle[kStates];
   const std::size_t left_base =
-      PathIndex(params, mutable_path_slots, batch, operation.left_edge, 0, 0);
+      PathIndex(params, mutable_path_slots, work.batch, operation.left_edge, 0,
+                0);
   const std::size_t right_base =
-      PathIndex(params, mutable_path_slots, batch, operation.right_edge, 0, 0);
-  const std::size_t middle_base = NodeIndex(params, batch, operation.middle, 0);
+      PathIndex(params, mutable_path_slots, work.batch, operation.right_edge, 0,
+                0);
+  const std::size_t middle_base =
+      NodeIndex(params, work.batch, operation.middle, 0);
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     left[entry] = paths[left_base + entry];
     right[entry] = paths[right_base + entry];
@@ -1108,7 +1116,7 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
         }
       }
       paths[left_base + parent_state * kStates + child_state] = best;
-      choices[CompressionChoiceIndex(params, batch, operation.tape,
+      choices[CompressionChoiceIndex(params, work.batch, operation.tape,
                                      parent_state, child_state)] = choice;
     }
   }
@@ -1270,38 +1278,37 @@ __global__ void RakeSerial(const btrc::Rake *operations, const Scalar *nodes,
                            const btrc::Index *mutable_path_slots,
                            const Scalar *node_scales, const Scalar *path_scales,
                            Scalar *branch_scales, Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Rake operation =
-      operations[params.operation_offset + operation_in_batch];
-  const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
+      operations[params.operation_offset + work.operation];
+  const std::size_t node_base =
+      NodeIndex(params, work.batch, operation.leaf, 0);
   const std::size_t path_base =
-      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
+      PathIndex(params, mutable_path_slots, work.batch, operation.edge, 0, 0);
   const std::size_t branch_base =
-      BranchIndex(params, batch, operation.branch, 0);
+      BranchIndex(params, work.batch, operation.branch, 0);
+  Scalar values[kSmallStateLimit];
   Scalar maximum = 0.0f;
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
     const Scalar value = accelerator_detail::RakeValue(paths + path_base, nodes + node_base,
                                            params.states, parent_state);
-    branches[branch_base + parent_state] = value;
+    values[parent_state] = value;
     maximum = fmax(maximum, value);
   }
-  if (!params.scaled)
-    return;
   const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
-    branches[branch_base + state] /= normalizer;
+    branches[branch_base + state] =
+        params.scaled ? values[state] / normalizer : values[state];
+  if (!params.scaled)
+    return;
   const Scalar input_scale =
-      node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
-      path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+      node_scales[NodeScaleIndex(params, work.batch, operation.leaf)] +
+      path_scales[PathScaleIndex(params, mutable_path_slots, work.batch,
                                  operation.edge)];
-  branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
+  branch_scales[BranchScaleIndex(params, work.batch, operation.branch)] =
       accelerator_detail::UpdatedLogScale(input_scale, maximum);
 }
 
@@ -1346,35 +1353,33 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
 __global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
                                       Scalar *branches, Scalar *branch_scales,
                                       Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchCombination operation =
-      operations[params.operation_offset + operation_in_batch];
+      operations[params.operation_offset + work.operation];
   const std::size_t destination_base =
-      BranchIndex(params, batch, operation.destination, 0);
+      BranchIndex(params, work.batch, operation.destination, 0);
   const std::size_t source_base =
-      BranchIndex(params, batch, operation.source, 0);
+      BranchIndex(params, work.batch, operation.source, 0);
+  Scalar values[kSmallStateLimit];
   Scalar maximum = 0.0f;
   for (std::size_t state = 0; state < params.states; ++state) {
     const Scalar value = accelerator_detail::Product(branches[destination_base + state],
                                          branches[source_base + state]);
-    branches[destination_base + state] = value;
+    values[state] = value;
     maximum = fmax(maximum, value);
   }
-  if (!params.scaled)
-    return;
   const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
-    branches[destination_base + state] /= normalizer;
+    branches[destination_base + state] =
+        params.scaled ? values[state] / normalizer : values[state];
+  if (!params.scaled)
+    return;
   const std::size_t destination_scale =
-      BranchScaleIndex(params, batch, operation.destination);
+      BranchScaleIndex(params, work.batch, operation.destination);
   const std::size_t source_scale =
-      BranchScaleIndex(params, batch, operation.source);
+      BranchScaleIndex(params, work.batch, operation.source);
   const Scalar input_scale =
       branch_scales[destination_scale] + branch_scales[source_scale];
   branch_scales[destination_scale] =
@@ -1421,36 +1426,36 @@ __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
                                      Scalar *node_scales,
                                      const Scalar *branch_scales,
                                      Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::BranchAbsorption operation =
-      operations[params.operation_offset + operation_in_batch];
-  const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
+      operations[params.operation_offset + work.operation];
+  const std::size_t node_base =
+      NodeIndex(params, work.batch, operation.parent, 0);
   const std::size_t branch_base =
-      BranchIndex(params, batch, operation.branch, 0);
+      BranchIndex(params, work.batch, operation.branch, 0);
+  Scalar values[kSmallStateLimit];
   Scalar maximum = 0.0f;
   for (std::size_t state = 0; state < params.states; ++state) {
     const Scalar value = accelerator_detail::Product(nodes[node_base + state],
                                          branches[branch_base + state]);
-    nodes[node_base + state] = value;
+    values[state] = value;
     maximum = fmax(maximum, value);
   }
-  if (!params.scaled)
-    return;
   const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
-    nodes[node_base + state] /= normalizer;
+    nodes[node_base + state] =
+        params.scaled ? values[state] / normalizer : values[state];
+  if (!params.scaled)
+    return;
   const std::size_t node_scale =
-      NodeScaleIndex(params, batch, operation.parent);
+      NodeScaleIndex(params, work.batch, operation.parent);
   const Scalar input_scale =
       node_scales[node_scale] +
-      branch_scales[BranchScaleIndex(params, batch, operation.branch)];
-  node_scales[node_scale] = accelerator_detail::UpdatedLogScale(input_scale, maximum);
+      branch_scales[BranchScaleIndex(params, work.batch, operation.branch)];
+  node_scales[node_scale] =
+      accelerator_detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void Compress(const btrc::Compression *operations,
@@ -1527,32 +1532,29 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
                                 const btrc::Index *mutable_path_slots,
                                 const Scalar *node_scales, Scalar *path_scales,
                                 Params params) {
-  const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t count =
-      static_cast<std::size_t>(params.batch) * params.operation_count;
-  if (index >= count)
+  const SmallStateWorkItem work = SmallStateWork();
+  if (work.operation >= params.operation_count || work.batch >= params.batch)
     return;
-  const std::size_t batch = index % params.batch;
-  const std::size_t operation_in_batch = index / params.batch;
   const btrc::Compression operation =
-      operations[params.operation_offset + operation_in_batch];
+      operations[params.operation_offset + work.operation];
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kMatrix = kStates * kStates;
   Scalar left[kMatrix];
   Scalar right[kMatrix];
   Scalar middle[kStates];
+  Scalar output[kMatrix];
+  const std::size_t left_base = PathIndex(
+      params, mutable_path_slots, work.batch, operation.left_edge, 0, 0);
+  const std::size_t right_base = PathIndex(
+      params, mutable_path_slots, work.batch, operation.right_edge, 0, 0);
+  const std::size_t middle_base =
+      NodeIndex(params, work.batch, operation.middle, 0);
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
-    const std::size_t parent_state = entry / kStates;
-    const std::size_t child_state = entry % kStates;
-    left[entry] =
-        paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
-                        parent_state, child_state)];
-    right[entry] =
-        paths[PathIndex(params, mutable_path_slots, batch, operation.right_edge,
-                        parent_state, child_state)];
+    left[entry] = paths[left_base + entry];
+    right[entry] = paths[right_base + entry];
   }
   for (std::size_t state = 0; state < kStates; ++state)
-    middle[state] = nodes[NodeIndex(params, batch, operation.middle, state)];
+    middle[state] = nodes[middle_base + state];
   for (std::size_t entry = 0; entry < kMatrix; ++entry)
     right[entry] *= middle[entry / kStates];
 
@@ -1561,28 +1563,26 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
     for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
       const Scalar value = accelerator_detail::MatrixProductValue(
           left, right, kStates, parent_state, child_state);
-      paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
-                      parent_state, child_state)] = value;
+      output[parent_state * kStates + child_state] = value;
       maximum = fmax(maximum, value);
     }
   }
+  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
+  for (std::size_t entry = 0; entry < kMatrix; ++entry)
+    paths[left_base + entry] =
+        params.scaled ? output[entry] / normalizer : output[entry];
   if (!params.scaled)
     return;
-  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
-  for (std::size_t entry = 0; entry < kMatrix; ++entry) {
-    const std::size_t parent_state = entry / kStates;
-    const std::size_t child_state = entry % kStates;
-    paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
-                    parent_state, child_state)] /= normalizer;
-  }
   const std::size_t left_scale =
-      PathScaleIndex(params, mutable_path_slots, batch, operation.left_edge);
+      PathScaleIndex(params, mutable_path_slots, work.batch,
+                     operation.left_edge);
   const Scalar input_scale =
       path_scales[left_scale] +
-      node_scales[NodeScaleIndex(params, batch, operation.middle)] +
-      path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+      node_scales[NodeScaleIndex(params, work.batch, operation.middle)] +
+      path_scales[PathScaleIndex(params, mutable_path_slots, work.batch,
                                  operation.right_edge)];
-  path_scales[left_scale] = accelerator_detail::UpdatedLogScale(input_scale, maximum);
+  path_scales[left_scale] =
+      accelerator_detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void FinishRoot(const Scalar *nodes, const Scalar *node_scales,
@@ -1603,7 +1603,32 @@ __global__ void FinishRoot(const Scalar *nodes, const Scalar *node_scales,
 }
 
 std::uint32_t Blocks(std::size_t count, std::size_t block_size) {
-  return CheckedU32((count + block_size - 1) / block_size, "accelerator grid size");
+  return CheckedU32((count + block_size - 1) / block_size,
+                    "accelerator grid size");
+}
+
+struct SmallStateLaunch {
+  dim3 grid;
+  dim3 block;
+};
+
+SmallStateLaunch SmallStateLaunchDimensions(std::size_t operations,
+                                            std::size_t batch,
+                                            std::size_t threads) {
+  constexpr std::uint32_t kMaximumGridHeight = 65535;
+  std::size_t batch_threads = 1;
+  while (batch_threads < std::min(batch, threads))
+    batch_threads *= 2;
+  const std::size_t operation_threads = threads / batch_threads;
+  const std::uint32_t batch_blocks = Blocks(batch, batch_threads);
+  const std::uint32_t height = std::min(batch_blocks, kMaximumGridHeight);
+  const std::uint32_t depth =
+      Blocks(batch_blocks, kMaximumGridHeight);
+  if (depth > kMaximumGridHeight)
+    throw std::length_error("small-state batch grid exceeds accelerator limits");
+  return {dim3(Blocks(operations, operation_threads), height, depth),
+          dim3(CheckedU32(batch_threads, "small-state batch block"),
+               CheckedU32(operation_threads, "small-state operation block"))};
 }
 
 } // namespace
@@ -2219,16 +2244,18 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
         CheckedProduct({batch, primitive_batch.count}, "primitive accelerator grid");
     const std::uint32_t operation_blocks =
         CheckedU32(operations, "primitive accelerator grid");
-    const std::uint32_t serial_blocks = Blocks(operations, kThreads);
+    const std::uint32_t linear_blocks = Blocks(operations, kThreads);
+    const SmallStateLaunch small_state =
+        SmallStateLaunchDimensions(primitive_batch.count, batch, kThreads);
     if (sampling && primitive_batch.primitive == btrc::Primitive::kRake) {
-      SaveRakeTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      SaveRakeTapes<<<linear_blocks, kThreads, 0, storage.stream>>>(
           storage.rakes, storage.nodes, storage.paths,
           storage.mutable_path_slots, storage.rake_path_tape,
           storage.rake_leaf_tape, params);
     }
     if (sampling &&
         primitive_batch.primitive == btrc::Primitive::kCompression) {
-      SaveCompressionTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      SaveCompressionTapes<<<linear_blocks, kThreads, 0, storage.stream>>>(
           storage.compressions, storage.nodes, storage.paths,
           storage.mutable_path_slots, storage.compression_left_tape,
           storage.compression_middle_tape, storage.compression_right_tape,
@@ -2236,8 +2263,8 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
     }
     switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
-      if (states <= 8) {
-        RakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      if (states <= kSmallStateLimit) {
+        RakeSerial<<<small_state.grid, small_state.block, 0, storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths, storage.branches,
             storage.mutable_path_slots, storage.node_scales,
             storage.path_scales, storage.branch_scales, params);
@@ -2249,8 +2276,9 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
       }
       break;
     case btrc::Primitive::kBranchCombination:
-      if (states <= 8) {
-        CombineBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      if (states <= kSmallStateLimit) {
+        CombineBranchesSerial<<<small_state.grid, small_state.block, 0,
+                                storage.stream>>>(
             storage.combinations, storage.branches, storage.branch_scales,
             params);
       } else {
@@ -2260,8 +2288,9 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
       }
       break;
     case btrc::Primitive::kBranchAbsorption:
-      if (states <= 8) {
-        AbsorbBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      if (states <= kSmallStateLimit) {
+        AbsorbBranchesSerial<<<small_state.grid, small_state.block, 0,
+                               storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches,
             storage.node_scales, storage.branch_scales, params);
       } else {
@@ -2272,7 +2301,8 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
       break;
     case btrc::Primitive::kCompression:
       if (states == 4) {
-        CompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
+        CompressSerial4<<<small_state.grid, small_state.block, 0,
+                           storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
             storage.mutable_path_slots, storage.node_scales,
             storage.path_scales, params);
@@ -2437,11 +2467,13 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
         CheckedProduct({batch, primitive_batch.count}, "MAP primitive grid");
     const std::uint32_t operation_blocks =
         CheckedU32(operations, "MAP primitive grid");
-    const std::uint32_t serial_blocks = Blocks(operations, kThreads);
+    const SmallStateLaunch small_state =
+        SmallStateLaunchDimensions(primitive_batch.count, batch, kThreads);
     switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
-      if (states <= 8) {
-        MaximumRakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      if (states <= kSmallStateLimit) {
+        MaximumRakeSerial<<<small_state.grid, small_state.block, 0,
+                            storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths,
             storage.mutable_path_slots, storage.branches, storage.rake_choices,
             params);
@@ -2453,8 +2485,8 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       }
       break;
     case btrc::Primitive::kBranchCombination:
-      if (states <= 8) {
-        LogCombineBranchesSerial<<<serial_blocks, kThreads, 0,
+      if (states <= kSmallStateLimit) {
+        LogCombineBranchesSerial<<<small_state.grid, small_state.block, 0,
                                    storage.stream>>>(storage.combinations,
                                                      storage.branches, params);
       } else {
@@ -2463,8 +2495,9 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       }
       break;
     case btrc::Primitive::kBranchAbsorption:
-      if (states <= 8) {
-        LogAbsorbBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
+      if (states <= kSmallStateLimit) {
+        LogAbsorbBranchesSerial<<<small_state.grid, small_state.block, 0,
+                                  storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches, params);
       } else {
         LogAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
@@ -2473,7 +2506,8 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       break;
     case btrc::Primitive::kCompression:
       if (states == 4) {
-        MaximumCompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
+        MaximumCompressSerial4<<<small_state.grid, small_state.block, 0,
+                                  storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
             storage.mutable_path_slots, storage.compression_choices, params);
       } else {

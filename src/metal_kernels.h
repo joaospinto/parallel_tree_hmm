@@ -48,6 +48,11 @@ struct Params {
   uint mutable_paths;
 };
 
+// This execution policy depends only on state count and is shared by every
+// model using the Metal backend; it is not a precision- or application-specific
+// path.
+constant uint small_state_limit = 8;
+
 inline uint node_index(constant Params &p, uint batch, uint node, uint state) {
   return (node * p.batch + batch) * p.states + state;
 }
@@ -1014,6 +1019,7 @@ kernel void rake_serial(
   const uint path_base =
       path_index(p, mutable_path_slots, batch_index, op.edge, 0, 0);
   const uint branch_base = branch_index(p, batch_index, op.branch, 0);
+  float values[small_state_limit];
   float maximum = 0.0f;
   for (uint parent_state = 0; parent_state < p.states; ++parent_state) {
     float value = 0.0f;
@@ -1021,14 +1027,15 @@ kernel void rake_serial(
       value += paths[path_base + parent_state * p.states + child_state] *
                nodes[node_base + child_state];
     }
-    branches[branch_base + parent_state] = value;
+    values[parent_state] = value;
     maximum = max(maximum, value);
   }
-  if (!p.scaled)
-    return;
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (uint state = 0; state < p.states; ++state)
-    branches[branch_base + state] /= normalizer;
+    branches[branch_base + state] =
+        p.scaled ? values[state] / normalizer : values[state];
+  if (!p.scaled)
+    return;
   const float input_scale =
       node_scales[node_scale_index(p, batch_index, op.leaf)] +
       path_scales[path_scale_index(p, mutable_path_slots, batch_index,
@@ -1088,18 +1095,20 @@ kernel void combine_branches_serial(
   const uint destination_base =
       branch_index(p, batch_index, op.destination, 0);
   const uint source_base = branch_index(p, batch_index, op.source, 0);
+  float values[small_state_limit];
   float maximum = 0.0f;
   for (uint state = 0; state < p.states; ++state) {
     const float value =
         branches[destination_base + state] * branches[source_base + state];
-    branches[destination_base + state] = value;
+    values[state] = value;
     maximum = max(maximum, value);
   }
-  if (!p.scaled)
-    return;
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (uint state = 0; state < p.states; ++state)
-    branches[destination_base + state] /= normalizer;
+    branches[destination_base + state] =
+        p.scaled ? values[state] / normalizer : values[state];
+  if (!p.scaled)
+    return;
   const uint destination_scale =
       branch_scale_index(p, batch_index, op.destination);
   const uint source_scale = branch_scale_index(p, batch_index, op.source);
@@ -1161,18 +1170,20 @@ kernel void absorb_branches_serial(
       operations[p.operation_offset + operation_index];
   const uint node_base = node_index(p, batch_index, op.parent, 0);
   const uint branch_base = branch_index(p, batch_index, op.branch, 0);
+  float values[small_state_limit];
   float maximum = 0.0f;
   for (uint state = 0; state < p.states; ++state) {
     const float value =
         nodes[node_base + state] * branches[branch_base + state];
-    nodes[node_base + state] = value;
+    values[state] = value;
     maximum = max(maximum, value);
   }
-  if (!p.scaled)
-    return;
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (uint state = 0; state < p.states; ++state)
-    nodes[node_base + state] /= normalizer;
+    nodes[node_base + state] =
+        p.scaled ? values[state] / normalizer : values[state];
+  if (!p.scaled)
+    return;
   const uint node_scale = node_scale_index(p, batch_index, op.parent);
   const float input_scale =
       node_scales[node_scale] +
@@ -1272,6 +1283,7 @@ kernel void compress_serial4(
   float left[matrix_size];
   float right[matrix_size];
   float middle[states];
+  float output[matrix_size];
   for (uint entry = 0; entry < matrix_size; ++entry) {
     left[entry] = paths[left_base + entry];
     right[entry] = paths[right_base + entry];
@@ -1289,15 +1301,16 @@ kernel void compress_serial4(
         value += left[parent_state * states + middle_state] *
                  right[middle_state * states + child_state];
       }
-      paths[left_base + parent_state * states + child_state] = value;
+      output[parent_state * states + child_state] = value;
       maximum = max(maximum, value);
     }
   }
-  if (!p.scaled)
-    return;
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (uint entry = 0; entry < matrix_size; ++entry)
-    paths[left_base + entry] /= normalizer;
+    paths[left_base + entry] =
+        p.scaled ? output[entry] / normalizer : output[entry];
+  if (!p.scaled)
+    return;
   const uint left_scale =
       path_scale_index(p, mutable_path_slots, batch_index, op.left_edge);
   const float input_scale =

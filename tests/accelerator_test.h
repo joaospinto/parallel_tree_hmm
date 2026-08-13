@@ -19,7 +19,9 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   const btrc::Plan plan =
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 0, 1, 1, 2, 2});
   constexpr std::size_t kStates = 4;
-  constexpr std::size_t kBatch = 7;
+  // Exceed one small-state thread block so real accelerators exercise multiple
+  // batch blocks, including multidimensional CUDA-compatible launch indexing.
+  constexpr std::size_t kBatch = 257;
   std::vector<tree_hmm::Scalar> nodes(kBatch * plan.num_nodes() * kStates);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
