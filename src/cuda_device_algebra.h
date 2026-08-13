@@ -24,12 +24,12 @@ TREE_HMM_CUDA_HOST_DEVICE inline Scalar RakeValue(const Scalar *path,
 }
 
 TREE_HMM_CUDA_HOST_DEVICE inline Scalar
-CompressionValue(const Scalar *left, const Scalar *middle, const Scalar *right,
-                 unsigned states, unsigned parent_state, unsigned child_state) {
+MatrixProductValue(const Scalar *left, const Scalar *right, unsigned states,
+                   unsigned parent_state, unsigned child_state) {
   Scalar result = 0.0f;
   for (unsigned middle_state = 0; middle_state < states; ++middle_state) {
     result += left[parent_state * states + middle_state] *
-              middle[middle_state] * right[middle_state * states + child_state];
+              right[middle_state * states + child_state];
   }
   return result;
 }

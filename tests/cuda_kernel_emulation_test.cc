@@ -23,7 +23,7 @@ public:
         nodes_(nodes.begin(), nodes.end()), paths_(paths.begin(), paths.end()),
         branches_(plan.num_branches() * states), node_scales_(plan.num_nodes()),
         path_scales_(plan.num_edges()), branch_scales_(plan.num_branches()),
-        scratch_(matrix_), scaled_(scaled) {}
+        scratch_(matrix_), weighted_right_(matrix_), scaled_(scaled) {}
 
   void Rake(std::span<const btrc::Rake> operations) {
     for (const btrc::Rake &operation : operations) {
@@ -78,11 +78,14 @@ public:
       const tree_hmm::Scalar *middle = Node(operation.middle);
       const tree_hmm::Scalar *right = Path(operation.right_edge);
       std::copy(left, left + matrix_, scratch_.begin());
+      for (std::size_t entry = 0; entry < matrix_; ++entry)
+        weighted_right_[entry] = right[entry] * middle[entry / states_];
       for (std::size_t parent = 0; parent < states_; ++parent) {
         for (std::size_t child = 0; child < states_; ++child) {
           left[parent * states_ + child] =
-              tree_hmm::cuda::detail::CompressionValue(
-                  scratch_.data(), middle, right, states_, parent, child);
+              tree_hmm::cuda::detail::MatrixProductValue(
+                  scratch_.data(), weighted_right_.data(), states_, parent,
+                  child);
         }
       }
       if (scaled_) {
@@ -154,6 +157,7 @@ private:
   std::vector<tree_hmm::Scalar> path_scales_;
   std::vector<tree_hmm::Scalar> branch_scales_;
   std::vector<tree_hmm::Scalar> scratch_;
+  std::vector<tree_hmm::Scalar> weighted_right_;
   bool scaled_;
 };
 

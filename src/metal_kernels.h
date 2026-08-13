@@ -45,23 +45,22 @@ struct Params {
   uint operation_offset;
   uint operation_count;
   uint scaled;
-  uint paths_batched;
+  uint mutable_paths;
 };
 
 inline uint node_index(constant Params &p, uint batch, uint node, uint state) {
   return (node * p.batch + batch) * p.states + state;
 }
 
-inline uint path_batches(constant Params &p) {
-  return p.paths_batched ? p.batch : 1;
-}
-
-inline uint path_index(constant Params &p, uint batch, uint edge,
+inline uint path_index(constant Params &p,
+                       device const uint *mutable_slot_by_edge, uint batch,
+                       uint edge,
                        uint parent_state, uint child_state) {
-  const uint path_batch = p.paths_batched ? batch : 0;
-  return ((edge * path_batches(p) + path_batch) * p.states + parent_state) *
-             p.states +
-         child_state;
+  const uint slot = mutable_slot_by_edge[edge];
+  const uint path = slot == 0xffffffffu
+                        ? edge
+                        : p.edges + slot * p.batch + batch;
+  return (path * p.states + parent_state) * p.states + child_state;
 }
 
 inline uint branch_index(constant Params &p, uint batch, uint branch,
@@ -73,9 +72,11 @@ inline uint node_scale_index(constant Params &p, uint batch, uint node) {
   return node * p.batch + batch;
 }
 
-inline uint path_scale_index(constant Params &p, uint batch, uint edge) {
-  const uint path_batch = p.paths_batched ? batch : 0;
-  return edge * path_batches(p) + path_batch;
+inline uint path_scale_index(constant Params &p,
+                             device const uint *mutable_slot_by_edge,
+                             uint batch, uint edge) {
+  const uint slot = mutable_slot_by_edge[edge];
+  return slot == 0xffffffffu ? edge : p.edges + slot * p.batch + batch;
 }
 
 inline uint branch_scale_index(constant Params &p, uint batch, uint branch) {
@@ -228,15 +229,17 @@ kernel void initialize_paths(
     device const float *input [[buffer(0)]],
     device float *paths [[buffer(1)]],
     constant Params &p [[buffer(2)]],
+    device const uint *edge_by_mutable_slot [[buffer(3)]],
     uint index [[thread_position_in_grid]]) {
-  const uint batches = path_batches(p);
-  const uint count = p.edges * batches;
+  const uint count = p.edges + p.mutable_paths * p.batch;
   if (index >= count)
     return;
-  const uint batch = index % batches;
-  const uint edge = index / batches;
+  const bool immutable = index < p.edges;
+  const uint mutable_index = immutable ? 0 : index - p.edges;
+  const uint mutable_slot = immutable ? 0 : mutable_index / p.batch;
+  const uint edge = immutable ? index : edge_by_mutable_slot[mutable_slot];
   const uint matrix_size = p.states * p.states;
-  const uint destination = path_index(p, batch, edge, 0, 0);
+  const uint destination = index * matrix_size;
   const uint source = edge * matrix_size;
   for (uint entry = 0; entry < matrix_size; ++entry)
     paths[destination + entry] = input[source + entry];
@@ -258,12 +261,14 @@ kernel void log_rake(
     device float *leaf_tape [[buffer(5)]],
     device float *message_tape [[buffer(6)]],
     constant Params &p [[buffer(7)]],
+    device const uint *mutable_path_slots [[buffer(8)]],
     uint3 gid [[thread_position_in_grid]]) {
   if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
     return;
   const Rake op = operations[p.operation_offset + gid.y];
   const uint node_base = node_index(p, gid.z, op.leaf, 0);
-  const uint path_base = path_index(p, gid.z, op.edge, 0, 0);
+  const uint path_base =
+      path_index(p, mutable_path_slots, gid.z, op.edge, 0, 0);
   leaf_tape[rake_leaf_tape_index(p, gid.z, op.branch, gid.x)] =
       nodes[node_base + gid.x];
   for (uint child_state = 0; child_state < p.states; ++child_state) {
@@ -300,6 +305,7 @@ kernel void log_compress(
     device float *right_tape [[buffer(5)]],
     device float *output_tape [[buffer(6)]],
     constant Params &p [[buffer(7)]],
+    device const uint *mutable_path_slots [[buffer(8)]],
     threadgroup float *scratch [[threadgroup(0)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]]) {
@@ -316,9 +322,11 @@ kernel void log_compress(
     const uint tape_index =
         compression_matrix_tape_index(p, group.y, op.tape, thread_index);
     left[thread_index] =
-        paths[path_index(p, group.y, op.left_edge, parent_state, child_state)];
+        paths[path_index(p, mutable_path_slots, group.y, op.left_edge,
+                         parent_state, child_state)];
     right[thread_index] = paths[path_index(
-        p, group.y, op.right_edge, parent_state, child_state)];
+        p, mutable_path_slots, group.y, op.right_edge, parent_state,
+        child_state)];
     left_tape[tape_index] = left[thread_index];
     right_tape[tape_index] = right[thread_index];
   }
@@ -351,8 +359,8 @@ kernel void log_compress(
     }
     output += log(total);
   }
-  paths[path_index(p, group.y, op.left_edge, parent_state, child_state)] =
-      output;
+  paths[path_index(p, mutable_path_slots, group.y, op.left_edge, parent_state,
+                   child_state)] = output;
   output_tape[compression_matrix_tape_index(
       p, group.y, op.tape, thread_index)] = output;
 }
@@ -573,6 +581,7 @@ kernel void save_rake_tapes(
     device float *path_tape [[buffer(3)]],
     device float *leaf_tape [[buffer(4)]],
     constant Params &p [[buffer(5)]],
+    device const uint *mutable_path_slots [[buffer(6)]],
     uint index [[thread_position_in_grid]]) {
   const uint count = p.operation_count * p.batch;
   if (index >= count)
@@ -581,7 +590,8 @@ kernel void save_rake_tapes(
   const uint operation_index = index / p.batch;
   const Rake op = operations[p.operation_offset + operation_index];
   const uint matrix_size = p.states * p.states;
-  const uint path_base = path_index(p, batch_index, op.edge, 0, 0);
+  const uint path_base =
+      path_index(p, mutable_path_slots, batch_index, op.edge, 0, 0);
   const uint node_base = node_index(p, batch_index, op.leaf, 0);
   for (uint entry = 0; entry < matrix_size; ++entry) {
     path_tape[rake_path_tape_index(p, batch_index, op.branch, entry)] =
@@ -601,6 +611,7 @@ kernel void save_compression_tapes(
     device float *middle_tape [[buffer(4)]],
     device float *right_tape [[buffer(5)]],
     constant Params &p [[buffer(6)]],
+    device const uint *mutable_path_slots [[buffer(7)]],
     uint index [[thread_position_in_grid]]) {
   const uint count = p.operation_count * p.batch;
   if (index >= count)
@@ -609,8 +620,10 @@ kernel void save_compression_tapes(
   const uint operation_index = index / p.batch;
   const Compression op = operations[p.operation_offset + operation_index];
   const uint matrix_size = p.states * p.states;
-  const uint left_base = path_index(p, batch_index, op.left_edge, 0, 0);
-  const uint right_base = path_index(p, batch_index, op.right_edge, 0, 0);
+  const uint left_base =
+      path_index(p, mutable_path_slots, batch_index, op.left_edge, 0, 0);
+  const uint right_base =
+      path_index(p, mutable_path_slots, batch_index, op.right_edge, 0, 0);
   const uint middle_base = node_index(p, batch_index, op.middle, 0);
   for (uint entry = 0; entry < matrix_size; ++entry) {
     const uint tape_index =
@@ -775,12 +788,14 @@ kernel void maximum_rake(
     device float *branches [[buffer(3)]],
     device uint *choices [[buffer(4)]],
     constant Params &p [[buffer(5)]],
+    device const uint *mutable_path_slots [[buffer(6)]],
     uint3 gid [[thread_position_in_grid]]) {
   if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
     return;
   const Rake op = operations[p.operation_offset + gid.y];
   const uint node_base = node_index(p, gid.z, op.leaf, 0);
-  const uint path_base = path_index(p, gid.z, op.edge, 0, 0);
+  const uint path_base =
+      path_index(p, mutable_path_slots, gid.z, op.edge, 0, 0);
   float best = paths[path_base + gid.x * p.states] + nodes[node_base];
   uint choice = 0;
   for (uint child_state = 1; child_state < p.states; ++child_state) {
@@ -827,6 +842,7 @@ kernel void maximum_compress(
     device float *paths [[buffer(2)]],
     device uint *choices [[buffer(3)]],
     constant Params &p [[buffer(4)]],
+    device const uint *mutable_path_slots [[buffer(5)]],
     threadgroup float *scratch [[threadgroup(0)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]]) {
@@ -837,8 +853,10 @@ kernel void maximum_compress(
   threadgroup float *left = scratch;
   threadgroup float *middle = left + matrix_size;
   threadgroup float *right = middle + p.states;
-  const uint left_base = path_index(p, group.y, op.left_edge, 0, 0);
-  const uint right_base = path_index(p, group.y, op.right_edge, 0, 0);
+  const uint left_base =
+      path_index(p, mutable_path_slots, group.y, op.left_edge, 0, 0);
+  const uint right_base =
+      path_index(p, mutable_path_slots, group.y, op.right_edge, 0, 0);
   const uint middle_base = node_index(p, group.y, op.middle, 0);
   if (thread_index < matrix_size) {
     left[thread_index] = paths[left_base + thread_index];
@@ -938,13 +956,15 @@ kernel void rake(
     device const float *path_scales [[buffer(5)]],
     device float *branch_scales [[buffer(6)]],
     constant Params &p [[buffer(7)]],
+    device const uint *mutable_path_slots [[buffer(8)]],
     uint3 gid [[thread_position_in_grid]]) {
   threadgroup float normalizer;
   if (gid.x >= p.states || gid.y >= p.operation_count || gid.z >= p.batch)
     return;
   const Rake op = operations[p.operation_offset + gid.y];
   const uint node_base = node_index(p, gid.z, op.leaf, 0);
-  const uint path_base = path_index(p, gid.z, op.edge, 0, 0);
+  const uint path_base =
+      path_index(p, mutable_path_slots, gid.z, op.edge, 0, 0);
   const uint branch_base = branch_index(p, gid.z, op.branch, 0);
   float value = 0.0f;
   for (uint child_state = 0; child_state < p.states; ++child_state) {
@@ -962,7 +982,7 @@ kernel void rake(
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const float input_scale =
         node_scales[node_scale_index(p, gid.z, op.leaf)] +
-        path_scales[path_scale_index(p, gid.z, op.edge)];
+        path_scales[path_scale_index(p, mutable_path_slots, gid.z, op.edge)];
     branch_scales[branch_scale_index(p, gid.z, op.branch)] =
         maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
   }
@@ -982,6 +1002,7 @@ kernel void rake_serial(
     device const float *path_scales [[buffer(5)]],
     device float *branch_scales [[buffer(6)]],
     constant Params &p [[buffer(7)]],
+    device const uint *mutable_path_slots [[buffer(8)]],
     uint index [[thread_position_in_grid]]) {
   const uint count = p.operation_count * p.batch;
   if (index >= count)
@@ -990,7 +1011,8 @@ kernel void rake_serial(
   const uint operation_index = index / p.batch;
   const Rake op = operations[p.operation_offset + operation_index];
   const uint node_base = node_index(p, batch_index, op.leaf, 0);
-  const uint path_base = path_index(p, batch_index, op.edge, 0, 0);
+  const uint path_base =
+      path_index(p, mutable_path_slots, batch_index, op.edge, 0, 0);
   const uint branch_base = branch_index(p, batch_index, op.branch, 0);
   float maximum = 0.0f;
   for (uint parent_state = 0; parent_state < p.states; ++parent_state) {
@@ -1009,7 +1031,8 @@ kernel void rake_serial(
     branches[branch_base + state] /= normalizer;
   const float input_scale =
       node_scales[node_scale_index(p, batch_index, op.leaf)] +
-      path_scales[path_scale_index(p, batch_index, op.edge)];
+      path_scales[path_scale_index(p, mutable_path_slots, batch_index,
+                                   op.edge)];
   branch_scales[branch_scale_index(p, batch_index, op.branch)] =
       maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
 }
@@ -1165,6 +1188,7 @@ kernel void compress(
     device const float *node_scales [[buffer(3)]],
     device float *path_scales [[buffer(4)]],
     constant Params &p [[buffer(5)]],
+    device const uint *mutable_path_slots [[buffer(6)]],
     threadgroup float *scratch [[threadgroup(0)]],
     uint thread_index [[thread_index_in_threadgroup]],
     uint2 group [[threadgroup_position_in_grid]]) {
@@ -1176,8 +1200,10 @@ kernel void compress(
   threadgroup float *middle = left + matrix_size;
   threadgroup float *right = middle + p.states;
   threadgroup float *normalizer = right + matrix_size;
-  const uint left_base = path_index(p, group.y, op.left_edge, 0, 0);
-  const uint right_base = path_index(p, group.y, op.right_edge, 0, 0);
+  const uint left_base =
+      path_index(p, mutable_path_slots, group.y, op.left_edge, 0, 0);
+  const uint right_base =
+      path_index(p, mutable_path_slots, group.y, op.right_edge, 0, 0);
   const uint middle_base = node_index(p, group.y, op.middle, 0);
   if (thread_index < matrix_size) {
     left[thread_index] = paths[left_base + thread_index];
@@ -1186,13 +1212,15 @@ kernel void compress(
   if (thread_index < p.states)
     middle[thread_index] = nodes[middle_base + thread_index];
   threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (thread_index < matrix_size)
+    right[thread_index] *= middle[thread_index / p.states];
+  threadgroup_barrier(mem_flags::mem_threadgroup);
 
   const uint parent_state = thread_index / p.states;
   const uint child_state = thread_index % p.states;
   float value = 0.0f;
   for (uint middle_state = 0; middle_state < p.states; ++middle_state) {
     value += left[parent_state * p.states + middle_state] *
-             middle[middle_state] *
              right[middle_state * p.states + child_state];
   }
   paths[left_base + thread_index] = value;
@@ -1204,11 +1232,13 @@ kernel void compress(
     for (uint entry = 0; entry < matrix_size; ++entry)
       maximum = max(maximum, paths[left_base + entry]);
     *normalizer = maximum > 0.0f ? maximum : 1.0f;
-    const uint left_scale = path_scale_index(p, group.y, op.left_edge);
+    const uint left_scale =
+        path_scale_index(p, mutable_path_slots, group.y, op.left_edge);
     const float input_scale =
         path_scales[left_scale] +
         node_scales[node_scale_index(p, group.y, op.middle)] +
-        path_scales[path_scale_index(p, group.y, op.right_edge)];
+        path_scales[path_scale_index(p, mutable_path_slots, group.y,
+                                     op.right_edge)];
     path_scales[left_scale] =
         maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
   }
@@ -1223,6 +1253,7 @@ kernel void compress_serial4(
     device const float *node_scales [[buffer(3)]],
     device float *path_scales [[buffer(4)]],
     constant Params &p [[buffer(5)]],
+    device const uint *mutable_path_slots [[buffer(6)]],
     uint index [[thread_position_in_grid]]) {
   const uint count = p.operation_count * p.batch;
   if (index >= count)
@@ -1233,8 +1264,10 @@ kernel void compress_serial4(
       operations[p.operation_offset + operation_index];
   constexpr uint states = 4;
   constexpr uint matrix_size = states * states;
-  const uint left_base = path_index(p, batch_index, op.left_edge, 0, 0);
-  const uint right_base = path_index(p, batch_index, op.right_edge, 0, 0);
+  const uint left_base =
+      path_index(p, mutable_path_slots, batch_index, op.left_edge, 0, 0);
+  const uint right_base =
+      path_index(p, mutable_path_slots, batch_index, op.right_edge, 0, 0);
   const uint middle_base = node_index(p, batch_index, op.middle, 0);
   float left[matrix_size];
   float right[matrix_size];
@@ -1245,6 +1278,8 @@ kernel void compress_serial4(
   }
   for (uint state = 0; state < states; ++state)
     middle[state] = nodes[middle_base + state];
+  for (uint entry = 0; entry < matrix_size; ++entry)
+    right[entry] *= middle[entry / states];
 
   float maximum = 0.0f;
   for (uint parent_state = 0; parent_state < states; ++parent_state) {
@@ -1252,7 +1287,6 @@ kernel void compress_serial4(
       float value = 0.0f;
       for (uint middle_state = 0; middle_state < states; ++middle_state) {
         value += left[parent_state * states + middle_state] *
-                 middle[middle_state] *
                  right[middle_state * states + child_state];
       }
       paths[left_base + parent_state * states + child_state] = value;
@@ -1264,11 +1298,13 @@ kernel void compress_serial4(
   const float normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (uint entry = 0; entry < matrix_size; ++entry)
     paths[left_base + entry] /= normalizer;
-  const uint left_scale = path_scale_index(p, batch_index, op.left_edge);
+  const uint left_scale =
+      path_scale_index(p, mutable_path_slots, batch_index, op.left_edge);
   const float input_scale =
       path_scales[left_scale] +
       node_scales[node_scale_index(p, batch_index, op.middle)] +
-      path_scales[path_scale_index(p, batch_index, op.right_edge)];
+      path_scales[path_scale_index(p, mutable_path_slots, batch_index,
+                                   op.right_edge)];
   path_scales[left_scale] =
       maximum > 0.0f ? input_scale + log(maximum) : -INFINITY;
 }

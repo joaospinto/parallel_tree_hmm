@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#include "src/accelerator_path_storage.h"
 #include "src/cuda_device_algebra.h"
 
 namespace tree_hmm::cuda {
@@ -32,7 +33,7 @@ struct Params {
   std::uint32_t operation_offset;
   std::uint32_t operation_count;
   std::uint32_t scaled;
-  std::uint32_t paths_batched;
+  std::uint32_t mutable_paths;
 };
 
 static_assert(sizeof(btrc::Rake) == 16);
@@ -125,14 +126,18 @@ __device__ std::size_t NodeIndex(const Params &params, std::size_t batch,
   return (node * params.batch + batch) * params.states + state;
 }
 
-__device__ std::size_t PathIndex(const Params &params, std::size_t batch,
-                                 std::size_t edge, std::size_t parent_state,
+__device__ std::size_t PathIndex(const Params &params,
+                                 const btrc::Index *mutable_slot_by_edge,
+                                 std::size_t batch, std::size_t edge,
+                                 std::size_t parent_state,
                                  std::size_t child_state) {
-  const std::size_t path_batch = params.paths_batched ? batch : 0;
-  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
-  return ((edge * path_batches + path_batch) * params.states + parent_state) *
-             params.states +
-         child_state;
+  const btrc::Index slot = mutable_slot_by_edge[edge];
+  const std::size_t path =
+      slot == tree_hmm::internal::kImmutablePath
+          ? edge
+          : params.edges + static_cast<std::size_t>(slot) * params.batch +
+                batch;
+  return (path * params.states + parent_state) * params.states + child_state;
 }
 
 __device__ std::size_t BranchIndex(const Params &params, std::size_t batch,
@@ -145,11 +150,14 @@ __device__ std::size_t NodeScaleIndex(const Params &params, std::size_t batch,
   return node * params.batch + batch;
 }
 
-__device__ std::size_t PathScaleIndex(const Params &params, std::size_t batch,
-                                      std::size_t edge) {
-  const std::size_t path_batch = params.paths_batched ? batch : 0;
-  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
-  return edge * path_batches + path_batch;
+__device__ std::size_t PathScaleIndex(const Params &params,
+                                      const btrc::Index *mutable_slot_by_edge,
+                                      std::size_t batch, std::size_t edge) {
+  const btrc::Index slot = mutable_slot_by_edge[edge];
+  return slot == tree_hmm::internal::kImmutablePath
+             ? edge
+             : params.edges + static_cast<std::size_t>(slot) * params.batch +
+                   batch;
 }
 
 __device__ std::size_t BranchScaleIndex(const Params &params, std::size_t batch,
@@ -348,19 +356,22 @@ __global__ void ApplyCategoricalObservations(
   }
 }
 
-__global__ void InitializePaths(const Scalar *input, Scalar *paths,
-                                Params params) {
+__global__ void InitializePaths(const Scalar *input,
+                                const btrc::Index *mutable_path_edges,
+                                Scalar *paths, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
-  const std::size_t path_batches = params.paths_batched ? params.batch : 1;
   const std::size_t count =
-      static_cast<std::size_t>(params.edges) * path_batches;
+      static_cast<std::size_t>(params.edges) +
+      static_cast<std::size_t>(params.mutable_paths) * params.batch;
   if (index >= count)
     return;
-  const std::size_t batch = index % path_batches;
-  const std::size_t edge = index / path_batches;
+  const bool immutable = index < params.edges;
+  const std::size_t mutable_index = immutable ? 0 : index - params.edges;
+  const std::size_t mutable_slot = immutable ? 0 : mutable_index / params.batch;
+  const std::size_t edge = immutable ? index : mutable_path_edges[mutable_slot];
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  const std::size_t output = PathIndex(params, batch, edge, 0, 0);
+  const std::size_t output = index * matrix;
   const std::size_t source = edge * matrix;
   for (std::size_t entry = 0; entry < matrix; ++entry)
     paths[output + entry] = input[source + entry];
@@ -373,7 +384,8 @@ __global__ void TakeLogs(Scalar *values, std::size_t count) {
 }
 
 __global__ void LogRake(const btrc::Rake *operations, const Scalar *nodes,
-                        const Scalar *paths, Scalar *branches,
+                        const Scalar *paths,
+                        const btrc::Index *mutable_path_slots, Scalar *branches,
                         Scalar *path_tape, Scalar *leaf_tape,
                         Scalar *message_tape, Params params) {
   const std::size_t parent_state = threadIdx.x;
@@ -384,7 +396,8 @@ __global__ void LogRake(const btrc::Rake *operations, const Scalar *nodes,
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
-  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t path_base =
+      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
   leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch, parent_state)] =
       nodes[node_base + parent_state];
   for (std::size_t child_state = 0; child_state < params.states;
@@ -420,6 +433,7 @@ __global__ void LogRake(const btrc::Rake *operations, const Scalar *nodes,
 
 __global__ void LogCompress(const btrc::Compression *operations,
                             const Scalar *nodes, Scalar *paths,
+                            const btrc::Index *mutable_path_slots,
                             Scalar *left_tape, Scalar *middle_tape,
                             Scalar *right_tape, Scalar *output_tape,
                             Params params) {
@@ -441,10 +455,12 @@ __global__ void LogCompress(const btrc::Compression *operations,
     const std::size_t child_state = entry % params.states;
     const std::size_t tape_index =
         CompressionMatrixTapeIndex(params, batch, operation.tape, entry);
-    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
-                                  parent_state, child_state)];
-    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
-                                   parent_state, child_state)];
+    left[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                        parent_state, child_state)];
+    right[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.right_edge,
+                        parent_state, child_state)];
     left_tape[tape_index] = left[entry];
     right_tape[tape_index] = right[entry];
   }
@@ -478,8 +494,8 @@ __global__ void LogCompress(const btrc::Compression *operations,
     }
     output += log(total);
   }
-  paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                  child_state)] = output;
+  paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                  parent_state, child_state)] = output;
   output_tape[CompressionMatrixTapeIndex(params, batch, operation.tape,
                                          entry)] = output;
 }
@@ -703,8 +719,10 @@ ReverseLogRakes(const btrc::Rake *operations, const Scalar *path_tape,
 }
 
 __global__ void SaveRakeTapes(const btrc::Rake *operations, const Scalar *nodes,
-                              const Scalar *paths, Scalar *path_tape,
-                              Scalar *leaf_tape, Params params) {
+                              const Scalar *paths,
+                              const btrc::Index *mutable_path_slots,
+                              Scalar *path_tape, Scalar *leaf_tape,
+                              Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -716,7 +734,8 @@ __global__ void SaveRakeTapes(const btrc::Rake *operations, const Scalar *nodes,
       operations[params.operation_offset + operation_in_batch];
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t path_base =
+      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
   for (std::size_t entry = 0; entry < matrix; ++entry) {
     path_tape[RakePathTapeIndex(params, batch, operation.branch, entry)] =
@@ -730,6 +749,7 @@ __global__ void SaveRakeTapes(const btrc::Rake *operations, const Scalar *nodes,
 
 __global__ void SaveCompressionTapes(const btrc::Compression *operations,
                                      const Scalar *nodes, const Scalar *paths,
+                                     const btrc::Index *mutable_path_slots,
                                      Scalar *left_tape, Scalar *middle_tape,
                                      Scalar *right_tape, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -744,9 +764,9 @@ __global__ void SaveCompressionTapes(const btrc::Compression *operations,
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
   const std::size_t left_base =
-      PathIndex(params, batch, operation.left_edge, 0, 0);
+      PathIndex(params, mutable_path_slots, batch, operation.left_edge, 0, 0);
   const std::size_t right_base =
-      PathIndex(params, batch, operation.right_edge, 0, 0);
+      PathIndex(params, mutable_path_slots, batch, operation.right_edge, 0, 0);
   const std::size_t middle_base = NodeIndex(params, batch, operation.middle, 0);
   for (std::size_t entry = 0; entry < matrix; ++entry) {
     const std::size_t tape_index =
@@ -905,6 +925,7 @@ ExpandSampleCompressions(const btrc::Compression *operations,
 
 __global__ void MaximumRakeSerial(const btrc::Rake *operations,
                                   const Scalar *nodes, const Scalar *paths,
+                                  const btrc::Index *mutable_path_slots,
                                   Scalar *branches, std::uint32_t *choices,
                                   Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -917,7 +938,8 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
-  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t path_base =
+      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
     Scalar best =
@@ -940,8 +962,10 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
 }
 
 __global__ void MaximumRake(const btrc::Rake *operations, const Scalar *nodes,
-                            const Scalar *paths, Scalar *branches,
-                            std::uint32_t *choices, Params params) {
+                            const Scalar *paths,
+                            const btrc::Index *mutable_path_slots,
+                            Scalar *branches, std::uint32_t *choices,
+                            Params params) {
   const std::size_t parent_state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -950,7 +974,8 @@ __global__ void MaximumRake(const btrc::Rake *operations, const Scalar *nodes,
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
-  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t path_base =
+      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
   Scalar best =
       paths[path_base + parent_state * params.states] + nodes[node_base];
   std::uint32_t choice = 0;
@@ -1034,6 +1059,7 @@ __global__ void LogAbsorbBranches(const btrc::BranchAbsorption *operations,
 
 __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
                                        const Scalar *nodes, Scalar *paths,
+                                       const btrc::Index *mutable_path_slots,
                                        std::uint32_t *choices, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -1050,9 +1076,9 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
   Scalar right[kMatrix];
   Scalar middle[kStates];
   const std::size_t left_base =
-      PathIndex(params, batch, operation.left_edge, 0, 0);
+      PathIndex(params, mutable_path_slots, batch, operation.left_edge, 0, 0);
   const std::size_t right_base =
-      PathIndex(params, batch, operation.right_edge, 0, 0);
+      PathIndex(params, mutable_path_slots, batch, operation.right_edge, 0, 0);
   const std::size_t middle_base = NodeIndex(params, batch, operation.middle, 0);
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     left[entry] = paths[left_base + entry];
@@ -1084,6 +1110,7 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
 
 __global__ void MaximumCompress(const btrc::Compression *operations,
                                 const Scalar *nodes, Scalar *paths,
+                                const btrc::Index *mutable_path_slots,
                                 std::uint32_t *choices, Params params) {
   extern __shared__ Scalar storage[];
   const std::size_t matrix =
@@ -1101,10 +1128,12 @@ __global__ void MaximumCompress(const btrc::Compression *operations,
   if (entry < matrix) {
     const std::size_t parent_state = entry / params.states;
     const std::size_t child_state = entry % params.states;
-    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
-                                  parent_state, child_state)];
-    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
-                                   parent_state, child_state)];
+    left[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                        parent_state, child_state)];
+    right[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.right_edge,
+                        parent_state, child_state)];
   }
   if (entry < params.states)
     middle[entry] = nodes[NodeIndex(params, batch, operation.middle, entry)];
@@ -1127,8 +1156,8 @@ __global__ void MaximumCompress(const btrc::Compression *operations,
       choice = middle_state;
     }
   }
-  paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                  child_state)] = best;
+  paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                  parent_state, child_state)] = best;
   choices[CompressionChoiceIndex(params, batch, operation.tape, parent_state,
                                  child_state)] = choice;
 }
@@ -1193,6 +1222,7 @@ __global__ void ExpandMaximumCompressions(const btrc::Compression *operations,
 
 __global__ void Rake(const btrc::Rake *operations, const Scalar *nodes,
                      const Scalar *paths, Scalar *branches,
+                     const btrc::Index *mutable_path_slots,
                      const Scalar *node_scales, const Scalar *path_scales,
                      Scalar *branch_scales, Params params) {
   __shared__ Scalar normalizer;
@@ -1204,7 +1234,8 @@ __global__ void Rake(const btrc::Rake *operations, const Scalar *nodes,
   if (state >= params.states || batch >= params.batch)
     return;
   const Scalar value =
-      detail::RakeValue(paths + PathIndex(params, batch, operation.edge, 0, 0),
+      detail::RakeValue(paths + PathIndex(params, mutable_path_slots, batch,
+                                          operation.edge, 0, 0),
                         nodes + NodeIndex(params, batch, operation.leaf, 0),
                         params.states, state);
   const std::size_t branch_base =
@@ -1219,7 +1250,8 @@ __global__ void Rake(const btrc::Rake *operations, const Scalar *nodes,
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const Scalar input_scale =
         node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
-        path_scales[PathScaleIndex(params, batch, operation.edge)];
+        path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+                                   operation.edge)];
     branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
         detail::UpdatedLogScale(input_scale, maximum);
   }
@@ -1229,6 +1261,7 @@ __global__ void Rake(const btrc::Rake *operations, const Scalar *nodes,
 
 __global__ void RakeSerial(const btrc::Rake *operations, const Scalar *nodes,
                            const Scalar *paths, Scalar *branches,
+                           const btrc::Index *mutable_path_slots,
                            const Scalar *node_scales, const Scalar *path_scales,
                            Scalar *branch_scales, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1241,7 +1274,8 @@ __global__ void RakeSerial(const btrc::Rake *operations, const Scalar *nodes,
   const btrc::Rake operation =
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
-  const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
+  const std::size_t path_base =
+      PathIndex(params, mutable_path_slots, batch, operation.edge, 0, 0);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
   Scalar maximum = 0.0f;
@@ -1259,7 +1293,8 @@ __global__ void RakeSerial(const btrc::Rake *operations, const Scalar *nodes,
     branches[branch_base + state] /= normalizer;
   const Scalar input_scale =
       node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
-      path_scales[PathScaleIndex(params, batch, operation.edge)];
+      path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+                                 operation.edge)];
   branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
       detail::UpdatedLogScale(input_scale, maximum);
 }
@@ -1414,6 +1449,7 @@ __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
 
 __global__ void Compress(const btrc::Compression *operations,
                          const Scalar *nodes, Scalar *paths,
+                         const btrc::Index *mutable_path_slots,
                          const Scalar *node_scales, Scalar *path_scales,
                          Params params) {
   extern __shared__ Scalar storage[];
@@ -1433,47 +1469,56 @@ __global__ void Compress(const btrc::Compression *operations,
   if (entry < matrix) {
     const std::size_t parent_state = entry / params.states;
     const std::size_t child_state = entry % params.states;
-    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
-                                  parent_state, child_state)];
-    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
-                                   parent_state, child_state)];
+    left[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                        parent_state, child_state)];
+    right[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.right_edge,
+                        parent_state, child_state)];
   }
   if (entry < params.states) {
     middle[entry] = nodes[NodeIndex(params, batch, operation.middle, entry)];
+  }
+  __syncthreads();
+  if (entry < matrix) {
+    const std::size_t middle_state = entry / params.states;
+    right[entry] *= middle[middle_state];
   }
   __syncthreads();
   if (entry >= matrix)
     return;
   const std::size_t parent_state = entry / params.states;
   const std::size_t child_state = entry % params.states;
-  const Scalar value = detail::CompressionValue(
-      left, middle, right, params.states, parent_state, child_state);
-  paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                  child_state)] = value;
+  const Scalar value = detail::MatrixProductValue(left, right, params.states,
+                                                  parent_state, child_state);
+  paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                  parent_state, child_state)] = value;
   if (!params.scaled)
     return;
   __syncthreads();
   if (entry == 0) {
     const std::size_t output_base =
-        PathIndex(params, batch, operation.left_edge, 0, 0);
+        PathIndex(params, mutable_path_slots, batch, operation.left_edge, 0, 0);
     const Scalar maximum =
         detail::Maximum(paths + output_base, static_cast<unsigned>(matrix));
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t left_scale =
-        PathScaleIndex(params, batch, operation.left_edge);
+        PathScaleIndex(params, mutable_path_slots, batch, operation.left_edge);
     const Scalar input_scale =
         path_scales[left_scale] +
         node_scales[NodeScaleIndex(params, batch, operation.middle)] +
-        path_scales[PathScaleIndex(params, batch, operation.right_edge)];
+        path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+                                   operation.right_edge)];
     path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
   }
   __syncthreads();
-  paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                  child_state)] = value / normalizer;
+  paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                  parent_state, child_state)] = value / normalizer;
 }
 
 __global__ void CompressSerial4(const btrc::Compression *operations,
                                 const Scalar *nodes, Scalar *paths,
+                                const btrc::Index *mutable_path_slots,
                                 const Scalar *node_scales, Scalar *path_scales,
                                 Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1493,21 +1538,25 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     const std::size_t parent_state = entry / kStates;
     const std::size_t child_state = entry % kStates;
-    left[entry] = paths[PathIndex(params, batch, operation.left_edge,
-                                  parent_state, child_state)];
-    right[entry] = paths[PathIndex(params, batch, operation.right_edge,
-                                   parent_state, child_state)];
+    left[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                        parent_state, child_state)];
+    right[entry] =
+        paths[PathIndex(params, mutable_path_slots, batch, operation.right_edge,
+                        parent_state, child_state)];
   }
   for (std::size_t state = 0; state < kStates; ++state)
     middle[state] = nodes[NodeIndex(params, batch, operation.middle, state)];
+  for (std::size_t entry = 0; entry < kMatrix; ++entry)
+    right[entry] *= middle[entry / kStates];
 
   Scalar maximum = 0.0f;
   for (std::size_t parent_state = 0; parent_state < kStates; ++parent_state) {
     for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
-      const Scalar value = detail::CompressionValue(
-          left, middle, right, kStates, parent_state, child_state);
-      paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                      child_state)] = value;
+      const Scalar value = detail::MatrixProductValue(
+          left, right, kStates, parent_state, child_state);
+      paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                      parent_state, child_state)] = value;
       maximum = fmax(maximum, value);
     }
   }
@@ -1517,15 +1566,16 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     const std::size_t parent_state = entry / kStates;
     const std::size_t child_state = entry % kStates;
-    paths[PathIndex(params, batch, operation.left_edge, parent_state,
-                    child_state)] /= normalizer;
+    paths[PathIndex(params, mutable_path_slots, batch, operation.left_edge,
+                    parent_state, child_state)] /= normalizer;
   }
   const std::size_t left_scale =
-      PathScaleIndex(params, batch, operation.left_edge);
+      PathScaleIndex(params, mutable_path_slots, batch, operation.left_edge);
   const Scalar input_scale =
       path_scales[left_scale] +
       node_scales[NodeScaleIndex(params, batch, operation.middle)] +
-      path_scales[PathScaleIndex(params, batch, operation.right_edge)];
+      path_scales[PathScaleIndex(params, mutable_path_slots, batch,
+                                 operation.right_edge)];
   path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
@@ -1570,6 +1620,8 @@ struct Workspace::Impl {
   btrc::BranchCombination *combinations = nullptr;
   btrc::BranchAbsorption *absorptions = nullptr;
   btrc::Compression *compressions = nullptr;
+  btrc::Index *mutable_path_slots = nullptr;
+  btrc::Index *mutable_path_edges = nullptr;
   Scalar *host_nodes = nullptr;
   Scalar *host_edges = nullptr;
   Scalar *host_output = nullptr;
@@ -1624,6 +1676,8 @@ struct Workspace::Impl {
     DeviceFree(combinations);
     DeviceFree(absorptions);
     DeviceFree(compressions);
+    DeviceFree(mutable_path_slots);
+    DeviceFree(mutable_path_edges);
     DeviceFree(input_nodes);
     DeviceFree(input_edges);
     DeviceFree(input_observations);
@@ -1736,7 +1790,7 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
       0,
       0,
       0,
-      plan.num_compressions() == 0 ? 0U : 1U,
+      0,
   };
 
   Check(cudaStreamCreateWithFlags(&storage.stream, cudaStreamNonBlocking),
@@ -1756,14 +1810,27 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
   Upload(storage.combinations, plan.branch_combinations(), storage.stream);
   Upload(storage.absorptions, plan.branch_absorptions(), storage.stream);
   Upload(storage.compressions, plan.compressions(), storage.stream);
+  const tree_hmm::internal::AcceleratorPathStorage path_storage =
+      tree_hmm::internal::MakeAcceleratorPathStorage(plan);
+  DeviceAllocate(storage.mutable_path_slots,
+                 path_storage.mutable_slot_by_edge.size());
+  DeviceAllocate(storage.mutable_path_edges,
+                 path_storage.edge_by_mutable_slot.size());
+  Upload(storage.mutable_path_slots, path_storage.mutable_slot_by_edge,
+         storage.stream);
+  Upload(storage.mutable_path_edges, path_storage.edge_by_mutable_slot,
+         storage.stream);
+  storage.params.mutable_paths = CheckedU32(
+      path_storage.edge_by_mutable_slot.size(), "mutable path count");
 
   const std::size_t node_values =
       CheckedProduct({batch, plan.num_nodes(), states}, "node workspace");
   const std::size_t edge_inputs =
       CheckedProduct({plan.num_edges(), matrix}, "edge inputs");
-  const std::size_t path_batches = plan.num_compressions() == 0 ? 1 : batch;
-  const std::size_t path_values = CheckedProduct(
-      {path_batches, plan.num_edges(), matrix}, "path workspace");
+  const std::size_t path_count = tree_hmm::internal::AcceleratorPathCount(
+      plan.num_edges(), path_storage.edge_by_mutable_slot.size(), batch);
+  const std::size_t path_values =
+      CheckedProduct({path_count, matrix}, "path workspace");
   const std::size_t branch_values =
       CheckedProduct({batch, plan.num_branches(), states}, "branch workspace");
   HostAllocate(storage.host_edges, edge_inputs);
@@ -1774,9 +1841,7 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
   DeviceAllocate(storage.branches, branch_values);
   DeviceAllocate(storage.node_scales,
                  CheckedProduct({batch, plan.num_nodes()}, "node scales"));
-  DeviceAllocate(
-      storage.path_scales,
-      CheckedProduct({path_batches, plan.num_edges()}, "path scales"));
+  DeviceAllocate(storage.path_scales, path_count);
   DeviceAllocate(storage.branch_scales,
                  CheckedProduct({batch, plan.num_branches()}, "branch scales"));
   DeviceAllocate(storage.output, batch);
@@ -2112,15 +2177,15 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   Params base_params = storage.params;
   base_params.batch = CheckedU32(batch, "batch count");
   base_params.scaled = scaled ? 1 : 0;
-  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
+  const std::size_t path_matrices = tree_hmm::internal::AcceleratorPathCount(
+      base_params.edges, base_params.mutable_paths, batch);
   if (scaled) {
     Check(cudaMemsetAsync(storage.node_scales, 0,
                           batch * plan.num_nodes() * sizeof(Scalar),
                           storage.stream),
           "cudaMemsetAsync node scales");
     Check(cudaMemsetAsync(storage.path_scales, 0,
-                          path_batches * plan.num_edges() * sizeof(Scalar),
-                          storage.stream),
+                          path_matrices * sizeof(Scalar), storage.stream),
           "cudaMemsetAsync path scales");
     Check(cudaMemsetAsync(storage.branch_scales, 0,
                           batch * plan.num_branches() * sizeof(Scalar),
@@ -2128,11 +2193,10 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
           "cudaMemsetAsync branch scales");
   }
   initialize_node_data(base_params);
-  const std::size_t path_values =
-      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
-  if (path_values != 0) {
-    InitializePaths<<<Blocks(path_values, kThreads), kThreads, 0,
+  if (path_matrices != 0) {
+    InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
+                                        storage.mutable_path_edges,
                                         base_params);
   }
 
@@ -2147,28 +2211,30 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
     const std::uint32_t serial_blocks = Blocks(operations, kThreads);
     if (sampling && primitive_batch.primitive == btrc::Primitive::kRake) {
       SaveRakeTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
-          storage.rakes, storage.nodes, storage.paths, storage.rake_path_tape,
+          storage.rakes, storage.nodes, storage.paths,
+          storage.mutable_path_slots, storage.rake_path_tape,
           storage.rake_leaf_tape, params);
     }
     if (sampling &&
         primitive_batch.primitive == btrc::Primitive::kCompression) {
       SaveCompressionTapes<<<serial_blocks, kThreads, 0, storage.stream>>>(
           storage.compressions, storage.nodes, storage.paths,
-          storage.compression_left_tape, storage.compression_middle_tape,
-          storage.compression_right_tape, params);
+          storage.mutable_path_slots, storage.compression_left_tape,
+          storage.compression_middle_tape, storage.compression_right_tape,
+          params);
     }
     switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
       if (states <= 8) {
         RakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths, storage.branches,
-            storage.node_scales, storage.path_scales, storage.branch_scales,
-            params);
+            storage.mutable_path_slots, storage.node_scales,
+            storage.path_scales, storage.branch_scales, params);
       } else {
         Rake<<<operation_blocks, states, 0, storage.stream>>>(
             storage.rakes, storage.nodes, storage.paths, storage.branches,
-            storage.node_scales, storage.path_scales, storage.branch_scales,
-            params);
+            storage.mutable_path_slots, storage.node_scales,
+            storage.path_scales, storage.branch_scales, params);
       }
       break;
     case btrc::Primitive::kBranchCombination:
@@ -2197,12 +2263,14 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
       if (states == 4) {
         CompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
-            storage.node_scales, storage.path_scales, params);
+            storage.mutable_path_slots, storage.node_scales,
+            storage.path_scales, params);
       } else {
         Compress<<<operation_blocks, matrix,
                    (2 * matrix + states) * sizeof(Scalar), storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
-            storage.node_scales, storage.path_scales, params);
+            storage.mutable_path_slots, storage.node_scales,
+            storage.path_scales, params);
       }
       break;
     }
@@ -2329,21 +2397,21 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
   Params base_params = storage.params;
   base_params.batch = CheckedU32(batch, "batch count");
   base_params.scaled = 0;
-  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
+  const std::size_t path_matrices = tree_hmm::internal::AcceleratorPathCount(
+      base_params.edges, base_params.mutable_paths, batch);
   initialize_node_data(base_params);
-  const std::size_t path_matrices =
-      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
   if (path_matrices != 0) {
     InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
+                                        storage.mutable_path_edges,
                                         base_params);
   }
   const std::size_t node_values =
       CheckedProduct({batch, plan.num_nodes(), states}, "MAP node values");
   TakeLogs<<<Blocks(node_values, kThreads), kThreads, 0, storage.stream>>>(
       storage.nodes, node_values);
-  const std::size_t path_values = CheckedProduct(
-      {path_batches, plan.num_edges(), matrix}, "MAP path values");
+  const std::size_t path_values =
+      CheckedProduct({path_matrices, matrix}, "MAP path values");
   if (path_values != 0) {
     TakeLogs<<<Blocks(path_values, kThreads), kThreads, 0, storage.stream>>>(
         storage.paths, path_values);
@@ -2362,12 +2430,14 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
     case btrc::Primitive::kRake:
       if (states <= 8) {
         MaximumRakeSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
-            storage.rakes, storage.nodes, storage.paths, storage.branches,
-            storage.rake_choices, params);
+            storage.rakes, storage.nodes, storage.paths,
+            storage.mutable_path_slots, storage.branches, storage.rake_choices,
+            params);
       } else {
         MaximumRake<<<operation_blocks, states, 0, storage.stream>>>(
-            storage.rakes, storage.nodes, storage.paths, storage.branches,
-            storage.rake_choices, params);
+            storage.rakes, storage.nodes, storage.paths,
+            storage.mutable_path_slots, storage.branches, storage.rake_choices,
+            params);
       }
       break;
     case btrc::Primitive::kBranchCombination:
@@ -2393,13 +2463,13 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       if (states == 4) {
         MaximumCompressSerial4<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
-            storage.compression_choices, params);
+            storage.mutable_path_slots, storage.compression_choices, params);
       } else {
         MaximumCompress<<<operation_blocks, matrix,
                           (2 * matrix + states) * sizeof(Scalar),
                           storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
-            storage.compression_choices, params);
+            storage.mutable_path_slots, storage.compression_choices, params);
       }
       break;
     }
@@ -2520,21 +2590,21 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
   Params base_params = storage.params;
   base_params.batch = CheckedU32(batch, "batch count");
   base_params.scaled = 0;
-  const std::size_t path_batches = base_params.paths_batched ? batch : 1;
+  const std::size_t path_matrices = tree_hmm::internal::AcceleratorPathCount(
+      base_params.edges, base_params.mutable_paths, batch);
   initialize_node_data(base_params);
-  const std::size_t path_matrices =
-      CheckedProduct({path_batches, plan.num_edges()}, "path matrices");
   if (path_matrices != 0) {
     InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
                       storage.stream>>>(storage.input_edges, storage.paths,
+                                        storage.mutable_path_edges,
                                         base_params);
   }
   const std::size_t node_values =
       CheckedProduct({batch, plan.num_nodes(), states}, "marginal node values");
   TakeLogs<<<Blocks(node_values, kThreads), kThreads, 0, storage.stream>>>(
       storage.nodes, node_values);
-  const std::size_t path_values = CheckedProduct(
-      {path_batches, plan.num_edges(), matrix}, "marginal path values");
+  const std::size_t path_values =
+      CheckedProduct({path_matrices, matrix}, "marginal path values");
   if (path_values != 0) {
     TakeLogs<<<Blocks(path_values, kThreads), kThreads, 0, storage.stream>>>(
         storage.paths, path_values);
@@ -2564,9 +2634,9 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
     switch (primitive_batch.primitive) {
     case btrc::Primitive::kRake:
       LogRake<<<operation_blocks, states, 0, storage.stream>>>(
-          storage.rakes, storage.nodes, storage.paths, storage.branches,
-          storage.rake_path_tape, storage.rake_leaf_tape,
-          storage.rake_message_tape, params);
+          storage.rakes, storage.nodes, storage.paths,
+          storage.mutable_path_slots, storage.branches, storage.rake_path_tape,
+          storage.rake_leaf_tape, storage.rake_message_tape, params);
       break;
     case btrc::Primitive::kBranchCombination:
       LogCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
@@ -2580,9 +2650,9 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
       LogCompress<<<operation_blocks, matrix,
                     (2 * matrix + states) * sizeof(Scalar), storage.stream>>>(
           storage.compressions, storage.nodes, storage.paths,
-          storage.compression_left_tape, storage.compression_middle_tape,
-          storage.compression_right_tape, storage.compression_output_tape,
-          params);
+          storage.mutable_path_slots, storage.compression_left_tape,
+          storage.compression_middle_tape, storage.compression_right_tape,
+          storage.compression_output_tape, params);
       break;
     }
   }

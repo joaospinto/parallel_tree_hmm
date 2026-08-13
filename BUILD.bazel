@@ -100,9 +100,21 @@ cc_test(
     ],
 )
 
+cc_test(
+    name = "accelerator_path_storage_test",
+    srcs = [
+        "src/accelerator_path_storage.h",
+        "tests/accelerator_path_storage_test.cc",
+    ],
+    deps = ["@bidirectional_tree_rake_compress//:btrc"],
+)
+
 cuda_library(
     name = "tree_hmm_cuda",
-    srcs = ["src/cuda.cu"],
+    srcs = [
+        "src/accelerator_path_storage.h",
+        "src/cuda.cu",
+    ],
     hdrs = [
         "include/tree_hmm/accelerator.h",
         "include/tree_hmm/cuda.h",
@@ -143,7 +155,10 @@ cc_test(
 
 cc_library(
     name = "tree_hmm_metal",
-    srcs = ["src/metal.cc"],
+    srcs = [
+        "src/accelerator_path_storage.h",
+        "src/metal.cc",
+    ],
     hdrs = [
         "include/tree_hmm/accelerator.h",
         "include/tree_hmm/metal.h",

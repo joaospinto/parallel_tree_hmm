@@ -18,6 +18,7 @@
 static_assert(std::is_same_v<tree_hmm::Scalar, float>,
               "the Metal backend supports FP32 only");
 
+#include "src/accelerator_path_storage.h"
 #include "src/metal_kernels.h"
 
 namespace tree_hmm::metal {
@@ -35,7 +36,7 @@ struct Params {
   std::uint32_t operation_offset;
   std::uint32_t operation_count;
   std::uint32_t scaled;
-  std::uint32_t paths_batched;
+  std::uint32_t mutable_paths;
 };
 
 static_assert(std::is_standard_layout_v<btrc::Rake>);
@@ -296,6 +297,8 @@ struct Workspace::Impl {
   id<MTLBuffer> combinations;
   id<MTLBuffer> absorptions;
   id<MTLBuffer> compressions;
+  id<MTLBuffer> mutable_path_slots;
+  id<MTLBuffer> mutable_path_edges;
   id<MTLBuffer> input_nodes;
   id<MTLBuffer> input_observations;
   id<MTLBuffer> input_root_potential;
@@ -381,7 +384,7 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
         0,
         0,
         0,
-        plan.num_compressions() == 0 ? 0U : 1U,
+        0,
     };
     storage.input_nodes = nil;
     storage.input_observations = nil;
@@ -416,6 +419,16 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
         MakeDataBuffer(runtime.device(), plan.branch_absorptions());
     storage.compressions =
         MakeDataBuffer(runtime.device(), plan.compressions());
+    const tree_hmm::internal::AcceleratorPathStorage path_storage =
+        tree_hmm::internal::MakeAcceleratorPathStorage(plan);
+    storage.mutable_path_slots = MakeDataBuffer(
+        runtime.device(),
+        std::span<const btrc::Index>(path_storage.mutable_slot_by_edge));
+    storage.mutable_path_edges = MakeDataBuffer(
+        runtime.device(),
+        std::span<const btrc::Index>(path_storage.edge_by_mutable_slot));
+    storage.params.mutable_paths = CheckedU32(
+        path_storage.edge_by_mutable_slot.size(), "mutable path count");
 
     const std::size_t matrix_size = CheckedProduct({states, states}, "matrix");
     storage.input_edges = MakeBuffer(
@@ -426,11 +439,12 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
         runtime.device(),
         CheckedProduct({batch, plan.num_nodes(), states, sizeof(Scalar)},
                        "Metal node workspace"));
-    const std::size_t path_batches = plan.num_compressions() == 0 ? 1 : batch;
-    storage.paths = MakeBuffer(runtime.device(),
-                               CheckedProduct({path_batches, plan.num_edges(),
-                                               matrix_size, sizeof(Scalar)},
-                                              "Metal path workspace"));
+    const std::size_t path_count = tree_hmm::internal::AcceleratorPathCount(
+        plan.num_edges(), path_storage.edge_by_mutable_slot.size(), batch);
+    storage.paths =
+        MakeBuffer(runtime.device(),
+                   CheckedProduct({path_count, matrix_size, sizeof(Scalar)},
+                                  "Metal path workspace"));
     storage.branches = MakeBuffer(
         runtime.device(),
         CheckedProduct({batch, plan.num_branches(), states, sizeof(Scalar)},
@@ -441,8 +455,7 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
                                   "Metal node scales"));
     storage.path_scales = MakeBuffer(
         runtime.device(),
-        CheckedProduct({path_batches, plan.num_edges(), sizeof(Scalar)},
-                       "Metal path scales"));
+        CheckedProduct({path_count, sizeof(Scalar)}, "Metal path scales"));
     storage.branch_scales =
         MakeBuffer(runtime.device(),
                    CheckedProduct({batch, plan.num_branches(), sizeof(Scalar)},
@@ -891,6 +904,8 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
     Params base_params = storage.params;
     base_params.batch = CheckedU32(model.batch, "batch count");
     base_params.scaled = scaled ? 1 : 0;
+    const std::size_t path_count = tree_hmm::internal::AcceleratorPathCount(
+        base_params.edges, base_params.mutable_paths, model.batch);
     if (scaled) {
       id<MTLBlitCommandEncoder> encoder = [command blitCommandEncoder];
       [encoder fillBuffer:storage.node_scales
@@ -901,11 +916,8 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
                     value:0];
       [encoder
           fillBuffer:storage.path_scales
-               range:NSMakeRange(
-                         0, CheckedProduct(
-                                {base_params.paths_batched ? model.batch : 1,
-                                 model.plan.num_edges(), sizeof(Scalar)},
-                                "Metal path scales"))
+               range:NSMakeRange(0, CheckedProduct({path_count, sizeof(Scalar)},
+                                                   "Metal path scales"))
                value:0];
       [encoder
           fillBuffer:storage.branch_scales
@@ -926,11 +938,8 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
     [encoder setBuffer:storage.input_edges offset:0 atIndex:0];
     [encoder setBuffer:storage.paths offset:0 atIndex:1];
     [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
-    DispatchOneDimensional(
-        encoder, runtime.initialize_paths(),
-        CheckedProduct({base_params.paths_batched ? model.batch : 1,
-                        model.plan.num_edges()},
-                       "Metal path initialization"));
+    [encoder setBuffer:storage.mutable_path_edges offset:0 atIndex:3];
+    DispatchOneDimensional(encoder, runtime.initialize_paths(), path_count);
 
     for (const btrc::PrimitiveBatch &primitive_batch :
          model.plan.primitive_batches()) {
@@ -945,6 +954,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
         [encoder setBuffer:storage.rake_path_tape offset:0 atIndex:3];
         [encoder setBuffer:storage.rake_leaf_tape offset:0 atIndex:4];
         [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:6];
         DispatchOneDimensional(
             encoder, runtime.save_rake_tapes(),
             CheckedProduct({model.batch, primitive_batch.count},
@@ -960,6 +970,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
         [encoder setBuffer:storage.compression_middle_tape offset:0 atIndex:4];
         [encoder setBuffer:storage.compression_right_tape offset:0 atIndex:5];
         [encoder setBytes:&params length:sizeof(Params) atIndex:6];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:7];
         DispatchOneDimensional(
             encoder, runtime.save_compression_tapes(),
             CheckedProduct({model.batch, primitive_batch.count},
@@ -979,6 +990,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
         [encoder setBuffer:storage.path_scales offset:0 atIndex:5];
         [encoder setBuffer:storage.branch_scales offset:0 atIndex:6];
         [encoder setBytes:&params length:sizeof(Params) atIndex:7];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:8];
         if (serial) {
           DispatchOneDimensional(
               encoder, pipeline,
@@ -1049,6 +1061,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
         [encoder setBuffer:storage.node_scales offset:0 atIndex:3];
         [encoder setBuffer:storage.path_scales offset:0 atIndex:4];
         [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:6];
         if (serial) {
           DispatchOneDimensional(
               encoder, pipeline,
@@ -1193,18 +1206,16 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
     Params base_params = storage.params;
     base_params.batch = CheckedU32(model.batch, "batch count");
     base_params.scaled = 0;
+    const std::size_t path_count = tree_hmm::internal::AcceleratorPathCount(
+        base_params.edges, base_params.mutable_paths, model.batch);
     EncodeInitializeNodes(encoder, runtime, base_params, model, storage);
 
     [encoder setComputePipelineState:runtime.initialize_paths()];
     [encoder setBuffer:storage.input_edges offset:0 atIndex:0];
     [encoder setBuffer:storage.paths offset:0 atIndex:1];
     [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
-    const std::size_t path_batches =
-        base_params.paths_batched ? model.batch : 1;
-    DispatchOneDimensional(
-        encoder, runtime.initialize_paths(),
-        CheckedProduct({path_batches, model.plan.num_edges()},
-                       "Metal path initialization"));
+    [encoder setBuffer:storage.mutable_path_edges offset:0 atIndex:3];
+    DispatchOneDimensional(encoder, runtime.initialize_paths(), path_count);
 
     [encoder setComputePipelineState:runtime.take_logs()];
     [encoder setBuffer:storage.nodes offset:0 atIndex:0];
@@ -1216,8 +1227,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
     DispatchOneDimensional(encoder, runtime.take_logs(), value_count);
     [encoder setBuffer:storage.paths offset:0 atIndex:0];
     value_count =
-        CheckedU32(CheckedProduct({path_batches, model.plan.num_edges(),
-                                   model.states, model.states},
+        CheckedU32(CheckedProduct({path_count, model.states, model.states},
                                   "Metal log paths"),
                    "Metal log path count");
     [encoder setBytes:&value_count length:sizeof(value_count) atIndex:1];
@@ -1237,6 +1247,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
         [encoder setBuffer:storage.branches offset:0 atIndex:3];
         [encoder setBuffer:storage.rake_choices offset:0 atIndex:4];
         [encoder setBytes:&params length:sizeof(Params) atIndex:5];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:6];
         [encoder dispatchThreads:MTLSizeMake(model.states,
                                              primitive_batch.count, model.batch)
             threadsPerThreadgroup:MTLSizeMake(model.states, 1, 1)];
@@ -1267,6 +1278,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
         [encoder setBuffer:storage.paths offset:0 atIndex:2];
         [encoder setBuffer:storage.compression_choices offset:0 atIndex:3];
         [encoder setBytes:&params length:sizeof(Params) atIndex:4];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:5];
         const std::size_t matrix = model.states * model.states;
         [encoder setThreadgroupMemoryLength:(2 * matrix + model.states) *
                                             sizeof(Scalar)
@@ -1412,18 +1424,16 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
     Params base_params = storage.params;
     base_params.batch = CheckedU32(model.batch, "batch count");
     base_params.scaled = 0;
+    const std::size_t path_count = tree_hmm::internal::AcceleratorPathCount(
+        base_params.edges, base_params.mutable_paths, model.batch);
     EncodeInitializeNodes(encoder, runtime, base_params, model, storage);
 
     [encoder setComputePipelineState:runtime.initialize_paths()];
     [encoder setBuffer:storage.input_edges offset:0 atIndex:0];
     [encoder setBuffer:storage.paths offset:0 atIndex:1];
     [encoder setBytes:&base_params length:sizeof(Params) atIndex:2];
-    const std::size_t path_batches =
-        base_params.paths_batched ? model.batch : 1;
-    DispatchOneDimensional(
-        encoder, runtime.initialize_paths(),
-        CheckedProduct({path_batches, model.plan.num_edges()},
-                       "Metal path initialization"));
+    [encoder setBuffer:storage.mutable_path_edges offset:0 atIndex:3];
+    DispatchOneDimensional(encoder, runtime.initialize_paths(), path_count);
 
     [encoder setComputePipelineState:runtime.take_logs()];
     [encoder setBuffer:storage.nodes offset:0 atIndex:0];
@@ -1431,10 +1441,9 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
     [encoder setBytes:&value_count length:sizeof(value_count) atIndex:1];
     DispatchOneDimensional(encoder, runtime.take_logs(), value_count);
     [encoder setBuffer:storage.paths offset:0 atIndex:0];
-    value_count = CheckedU32(
-        CheckedProduct({path_batches, model.plan.num_edges(), matrix_size},
-                       "Metal log paths"),
-        "Metal log path count");
+    value_count =
+        CheckedU32(CheckedProduct({path_count, matrix_size}, "Metal log paths"),
+                   "Metal log path count");
     [encoder setBytes:&value_count length:sizeof(value_count) atIndex:1];
     DispatchOneDimensional(encoder, runtime.take_logs(), value_count);
 
@@ -1454,6 +1463,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
         [encoder setBuffer:storage.rake_leaf_tape offset:0 atIndex:5];
         [encoder setBuffer:storage.rake_message_tape offset:0 atIndex:6];
         [encoder setBytes:&params length:sizeof(Params) atIndex:7];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:8];
         [encoder dispatchThreads:MTLSizeMake(model.states,
                                              primitive_batch.count, model.batch)
             threadsPerThreadgroup:MTLSizeMake(model.states, 1, 1)];
@@ -1487,6 +1497,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
         [encoder setBuffer:storage.compression_right_tape offset:0 atIndex:5];
         [encoder setBuffer:storage.compression_output_tape offset:0 atIndex:6];
         [encoder setBytes:&params length:sizeof(Params) atIndex:7];
+        [encoder setBuffer:storage.mutable_path_slots offset:0 atIndex:8];
         [encoder setThreadgroupMemoryLength:(2 * matrix_size + model.states) *
                                             sizeof(Scalar)
                                     atIndex:0];
