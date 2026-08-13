@@ -113,11 +113,25 @@ PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
 }
 
 tree_hmm::PartitionView
+PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
+                          Workspace &workspace) {
+  return PartitionFunctionPrepared(model, workspace,
+                                   tree_hmm::CategoricalInputUpdate::kAll);
+}
+
+tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView,
                              Workspace &,
                              tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
+}
+
+tree_hmm::PartitionView
+LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
+                             Workspace &workspace) {
+  return LogPartitionFunctionPrepared(model, workspace,
+                                      tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 tree_hmm::BatchedMaximumAssignmentView
@@ -131,6 +145,13 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
                            tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
+  return MaximumAPosterioriPrepared(model, workspace,
+                                    tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 tree_hmm::BatchedPosteriorSampleView
@@ -154,11 +175,26 @@ PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
       TREE_HMM_GPU_STUB_ERROR);
 }
 
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
+                        std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
+  return PosteriorSamplePrepared(model, uniforms, workspace,
+                                 tree_hmm::CategoricalInputUpdate::kAll);
+}
+
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
                            tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
+}
+
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
+  return PosteriorMarginalsPrepared(model, workspace,
+                                    tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 } // namespace tree_hmm::TREE_HMM_GPU_STUB_NAMESPACE

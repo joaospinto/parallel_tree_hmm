@@ -1674,9 +1674,23 @@ LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView
 PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
+                          Workspace &workspace) {
+  return PartitionFunctionPrepared(model, workspace,
+                                   tree_hmm::CategoricalInputUpdate::kAll);
+}
+
+tree_hmm::PartitionView
+PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
                           Workspace &workspace,
                           tree_hmm::CategoricalInputUpdate update) {
   return Run(model, *workspace.impl_, false, {}, update);
+}
+
+tree_hmm::PartitionView
+LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
+                             Workspace &workspace) {
+  return LogPartitionFunctionPrepared(model, workspace,
+                                      tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 tree_hmm::PartitionView
@@ -1690,6 +1704,13 @@ tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace) {
   return RunMaximum(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedMaximumAssignmentView
+MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
+  return MaximumAPosterioriPrepared(model, workspace,
+                                    tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 tree_hmm::BatchedMaximumAssignmentView
@@ -1713,6 +1734,14 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
                         std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
+  return PosteriorSamplePrepared(model, uniforms, workspace,
+                                 tree_hmm::CategoricalInputUpdate::kAll);
+}
+
+tree_hmm::BatchedPosteriorSampleView
+PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
+                        std::span<const Scalar> uniforms,
                         Workspace &workspace,
                         tree_hmm::CategoricalInputUpdate update) {
   const tree_hmm::PartitionView result =
@@ -1726,6 +1755,13 @@ tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace) {
   return RunMarginals(model, *workspace.impl_);
+}
+
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
+  return PosteriorMarginalsPrepared(model, workspace,
+                                    tree_hmm::CategoricalInputUpdate::kAll);
 }
 
 tree_hmm::BatchedMarginalView

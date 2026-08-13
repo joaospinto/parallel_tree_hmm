@@ -100,38 +100,44 @@ LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
                              Workspace &workspace);
 tree_hmm::PartitionView
 PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                          Workspace &workspace,
-                          tree_hmm::CategoricalInputUpdate update =
-                              tree_hmm::CategoricalInputUpdate::kAll);
+                          Workspace &workspace);
+tree_hmm::PartitionView PartitionFunctionPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace,
+    tree_hmm::CategoricalInputUpdate update);
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                             Workspace &workspace,
-                             tree_hmm::CategoricalInputUpdate update =
-                                 tree_hmm::CategoricalInputUpdate::kAll);
+                             Workspace &workspace);
+tree_hmm::PartitionView LogPartitionFunctionPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace,
+    tree_hmm::CategoricalInputUpdate update);
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace);
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace,
-                           tree_hmm::CategoricalInputUpdate update =
-                               tree_hmm::CategoricalInputUpdate::kAll);
+                           Workspace &workspace);
+tree_hmm::BatchedMaximumAssignmentView MaximumAPosterioriPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace,
+    tree_hmm::CategoricalInputUpdate update);
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
                         std::span<const Scalar> uniforms, Workspace &workspace);
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
-                        std::span<const Scalar> uniforms, Workspace &workspace,
-                        tree_hmm::CategoricalInputUpdate update =
-                            tree_hmm::CategoricalInputUpdate::kAll);
+                        std::span<const Scalar> uniforms, Workspace &workspace);
+tree_hmm::BatchedPosteriorSampleView PosteriorSamplePrepared(
+    tree_hmm::BatchedCategoricalModelView model,
+    std::span<const Scalar> uniforms, Workspace &workspace,
+    tree_hmm::CategoricalInputUpdate update);
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace);
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace,
-                           tree_hmm::CategoricalInputUpdate update =
-                               tree_hmm::CategoricalInputUpdate::kAll);
+                           Workspace &workspace);
+tree_hmm::BatchedMarginalView PosteriorMarginalsPrepared(
+    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace,
+    tree_hmm::CategoricalInputUpdate update);
 
 } // namespace tree_hmm::metal
 
