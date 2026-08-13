@@ -1,7 +1,6 @@
 #include "tree_hmm/rocm.h"
 
-#include <hip/hip_runtime.h>
-
+#include "src/rocm_runtime.h"
 #include "src/hip_cuda_runtime_compat.h"
 
 #define TREE_HMM_GPU_BACKEND_NAMESPACE rocm

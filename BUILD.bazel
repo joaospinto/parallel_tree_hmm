@@ -272,12 +272,12 @@ cc_library(
         "src/gpu_backend_impl.inc",
         "src/gpu_device_algebra.h",
         "src/hip_cuda_runtime_compat.h",
+        "src/rocm_runtime.h",
     ],
     copts = [
         "-x",
         "hip",
         "-std=c++20",
-        "-Wno-error",
     ] + ROCM_ARCH_COPTS,
     includes = ["include"],
     linkopts = ["--hip-link"],
