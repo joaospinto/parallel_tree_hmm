@@ -58,6 +58,19 @@ int main() {
       [&](tree_hmm::BatchedCategoricalModelView model) {
         return tree_hmm::metal::PosteriorMarginalsPrepared(model, workspace);
       });
+  TestCategoricalResidentInputs(
+      "Metal", tree_hmm::metal::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategorical(plan, states, batch, categories,
+                                     observation_nodes);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model,
+          tree_hmm::CategoricalInputUpdate update) {
+        return tree_hmm::metal::LogPartitionFunctionPrepared(model, workspace,
+                                                              update);
+      });
   TestMaximumAccelerator(
       "Metal", tree_hmm::metal::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {

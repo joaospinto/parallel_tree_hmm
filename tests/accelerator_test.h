@@ -517,6 +517,138 @@ void TestCategoricalAccelerator(const char *name, bool available,
   }
 }
 
+template <class Reserve, class Solve>
+void TestCategoricalResidentInputs(const char *name, bool available,
+                                   Reserve reserve, Solve solve) {
+  if (!available)
+    return;
+  const btrc::Plan plan =
+      btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 0, 1, 1, 2, 2});
+  constexpr std::size_t kStates = 4;
+  constexpr std::size_t kBatch = 5;
+  constexpr std::size_t kCategories = 4;
+  const std::vector<btrc::Index> observation_nodes{3, 4, 5, 6};
+  reserve(plan, kStates, kBatch, kCategories, observation_nodes);
+  std::vector<std::uint8_t> observations(kBatch * observation_nodes.size());
+  for (std::size_t index = 0; index < observations.size(); ++index)
+    observations[index] = static_cast<std::uint8_t>(index % kCategories);
+  std::vector<tree_hmm::Scalar> root_potential(kStates);
+  for (std::size_t state = 0; state < kStates; ++state) {
+    root_potential[state] =
+        0.1f * static_cast<tree_hmm::Scalar>(state + 1);
+  }
+  std::vector<tree_hmm::Scalar> emission_potentials(kCategories * kStates,
+                                                     0.0f);
+  for (std::size_t state = 0; state < kStates; ++state)
+    emission_potentials[state * kStates + state] = 1.0f;
+  std::vector<tree_hmm::Scalar> edge_potentials(plan.num_edges() * kStates *
+                                                 kStates);
+  for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
+    for (std::size_t parent = 0; parent < kStates; ++parent) {
+      for (std::size_t child = 0; child < kStates; ++child) {
+        edge_potentials[(edge * kStates + parent) * kStates + child] =
+            0.02f + 0.003f * static_cast<tree_hmm::Scalar>(
+                                1 + edge + 2 * parent + 3 * child);
+      }
+    }
+  }
+  const tree_hmm::BatchedCategoricalModelView model{
+      plan,         kStates,        kBatch,       kCategories,
+      observation_nodes, observations, root_potential, emission_potentials,
+      edge_potentials};
+
+  for (const tree_hmm::CategoricalInputUpdate update :
+       {tree_hmm::CategoricalInputUpdate::kFactors,
+        tree_hmm::CategoricalInputUpdate::kNone}) {
+    bool rejected = false;
+    try {
+      static_cast<void>(solve(model, update));
+    } catch (const std::logic_error &) {
+      rejected = true;
+    }
+    if (!rejected) {
+      throw std::runtime_error(std::string(name) +
+                               " accepted reuse before staging inputs");
+    }
+  }
+
+  const tree_hmm::PartitionView staged_result =
+      solve(model, tree_hmm::CategoricalInputUpdate::kAll);
+  const std::vector<tree_hmm::Scalar> baseline(staged_result.values.begin(),
+                                               staged_result.values.end());
+  observations.front() =
+      static_cast<std::uint8_t>((observations.front() + 1) % kCategories);
+  const tree_hmm::PartitionView observations_reused =
+      solve(model, tree_hmm::CategoricalInputUpdate::kFactors);
+  if (!std::equal(observations_reused.values.begin(),
+                  observations_reused.values.end(), baseline.begin())) {
+    throw std::runtime_error(std::string(name) +
+                             " did not reuse resident observations");
+  }
+  const tree_hmm::PartitionView observations_updated =
+      solve(model, tree_hmm::CategoricalInputUpdate::kAll);
+  if (std::equal(observations_updated.values.begin(),
+                 observations_updated.values.end(), baseline.begin())) {
+    throw std::runtime_error(std::string(name) +
+                             " did not stage changed observations");
+  }
+
+  const std::vector<tree_hmm::Scalar> before_factor_change(
+      observations_updated.values.begin(), observations_updated.values.end());
+  for (tree_hmm::Scalar &value : edge_potentials)
+    value *= 0.9f;
+  const tree_hmm::PartitionView factors_reused =
+      solve(model, tree_hmm::CategoricalInputUpdate::kNone);
+  if (!std::equal(factors_reused.values.begin(), factors_reused.values.end(),
+                  before_factor_change.begin())) {
+    throw std::runtime_error(std::string(name) +
+                             " did not reuse resident factors");
+  }
+  const tree_hmm::PartitionView factors_updated =
+      solve(model, tree_hmm::CategoricalInputUpdate::kFactors);
+  if (std::equal(factors_updated.values.begin(), factors_updated.values.end(),
+                 before_factor_change.begin())) {
+    throw std::runtime_error(std::string(name) +
+                             " did not stage changed factors");
+  }
+
+  constexpr std::size_t kTailBatch = 3;
+  const tree_hmm::BatchedCategoricalModelView tail_model{
+      plan,
+      kStates,
+      kTailBatch,
+      kCategories,
+      observation_nodes,
+      std::span<const std::uint8_t>(observations).first(
+          kTailBatch * observation_nodes.size()),
+      root_potential,
+      emission_potentials,
+      edge_potentials};
+  bool batch_mismatch_rejected = false;
+  try {
+    static_cast<void>(
+        solve(tail_model, tree_hmm::CategoricalInputUpdate::kFactors));
+  } catch (const std::logic_error &) {
+    batch_mismatch_rejected = true;
+  }
+  if (!batch_mismatch_rejected) {
+    throw std::runtime_error(std::string(name) +
+                             " reused observations for a different batch");
+  }
+
+  reserve(plan, kStates, kBatch, kCategories, observation_nodes);
+  bool reserve_invalidation_rejected = false;
+  try {
+    static_cast<void>(solve(model, tree_hmm::CategoricalInputUpdate::kNone));
+  } catch (const std::logic_error &) {
+    reserve_invalidation_rejected = true;
+  }
+  if (!reserve_invalidation_rejected) {
+    throw std::runtime_error(std::string(name) +
+                             " retained resident inputs across Reserve");
+  }
+}
+
 template <class Reserve, class Inputs, class Solve>
 void TestMaximumAccelerator(const char *name, bool available, Reserve reserve,
                             Inputs inputs, Solve solve) {

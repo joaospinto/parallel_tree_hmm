@@ -54,6 +54,20 @@ int main() {
       [&](tree_hmm::BatchedCategoricalModelView model) {
         return tree_hmm::TREE_HMM_GPU_TEST_NAMESPACE::PosteriorMarginalsPrepared(model, workspace);
       });
+  TestCategoricalResidentInputs(
+      TREE_HMM_GPU_TEST_NAME,
+      tree_hmm::TREE_HMM_GPU_TEST_NAMESPACE::Available(),
+      [&](const btrc::Plan &plan, std::size_t states, std::size_t batch,
+          std::size_t categories,
+          std::span<const btrc::Index> observation_nodes) {
+        workspace.ReserveCategorical(plan, states, batch, categories,
+                                     observation_nodes);
+      },
+      [&](tree_hmm::BatchedCategoricalModelView model,
+          tree_hmm::CategoricalInputUpdate update) {
+        return tree_hmm::TREE_HMM_GPU_TEST_NAMESPACE::LogPartitionFunctionPrepared(
+            model, workspace, update);
+      });
   TestMaximumAccelerator(
       TREE_HMM_GPU_TEST_NAME, tree_hmm::TREE_HMM_GPU_TEST_NAMESPACE::Available(),
       [&](const btrc::Plan &plan, std::size_t states, std::size_t batch) {

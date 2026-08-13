@@ -53,6 +53,18 @@ remain compact: an initialization kernel combines the observations with a
 shared emission table directly in the inference workspace instead of
 materializing a batch of dense node factors on the host.
 
+Categorical prepared calls accept a `CategoricalInputUpdate` policy. The
+default, `kAll`, preserves the ordinary stateless-call behavior. After one
+`kAll` call, `kFactors` leaves the observations resident while explicitly
+updating the root, emission, and edge factors; this matches repeated
+phylogenetic likelihood evaluations with fixed tip data and changing model or
+branch parameters. `kNone` reuses both observations and factors for
+fixed-model throughput measurements. The workspace rejects either reuse mode
+until the required data have been staged, rejects observation reuse at a
+different batch size, and invalidates residency whenever it is reserved
+again. The returned timings distinguish requested host-to-device updates,
+accelerator execution, result download, and full prepared-call latency.
+
 CUDA and ROCm share one kernel and execution implementation over the common
 CUDA/HIP runtime subset; thin wrappers select the public namespace and runtime.
 The shared CUDA/HIP device algebra is also compiled and exercised as ordinary

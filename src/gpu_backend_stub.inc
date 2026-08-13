@@ -106,14 +106,16 @@ tree_hmm::PartitionView LogPartitionFunctionPrepared(tree_hmm::BatchedModelView,
 }
 
 tree_hmm::PartitionView
-PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
+PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
+                          tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
 }
 
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView,
-                             Workspace &) {
+                             Workspace &,
+                             tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
 }
@@ -125,7 +127,8 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedModelView, Workspace &) {
 }
 
 tree_hmm::BatchedMaximumAssignmentView
-MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
+MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
+                           tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
 }
@@ -145,13 +148,15 @@ PosteriorMarginalsPrepared(tree_hmm::BatchedModelView, Workspace &) {
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
-                        std::span<const Scalar>, Workspace &) {
+                        std::span<const Scalar>, Workspace &,
+                        tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
 }
 
 tree_hmm::BatchedMarginalView
-PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
+PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &,
+                           tree_hmm::CategoricalInputUpdate) {
   throw std::runtime_error(
       TREE_HMM_GPU_STUB_ERROR);
 }

@@ -83,10 +83,30 @@ struct MutableBatchedCategoricalModelView {
   }
 };
 
+// Selects which categorical inputs are staged before a prepared accelerator
+// call. kFactors and kNone reuse observations staged by the latest kAll call
+// for the same batch size; kNone also reuses the numerical factors staged by
+// that call (or a later kFactors call). ReserveCategorical invalidates all
+// staged inputs. A caller must not modify workspace-backed storage for a
+// component it asks the backend to reuse.
+enum class CategoricalInputUpdate {
+  kAll,
+  kFactors,
+  kNone,
+};
+
 struct AcceleratorTimings {
+  // Host-to-device transfers requested by CategoricalInputUpdate (or all
+  // inputs for a dense model). Metal reports host writes to shared buffers.
   double upload_ms = 0.0;
+  // Accelerator command execution, excluding the transfers above and result
+  // transfer below.
   double kernel_ms = 0.0;
+  // Device-to-host result transfers. Shared-memory Metal results require no
+  // explicit transfer and report zero.
   double download_ms = 0.0;
+  // Entire prepared-call latency, including validation, staging, command
+  // submission, synchronization, and output checks.
   double wall_ms = 0.0;
 };
 

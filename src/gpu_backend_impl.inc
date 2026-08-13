@@ -1697,6 +1697,8 @@ struct Workspace::Impl {
   bool maximum = false;
   bool sampling = false;
   bool marginals = false;
+  std::size_t resident_observation_batch = 0;
+  bool resident_categorical_factors = false;
 
   void Clear() noexcept {
     if (stream != nullptr) {
@@ -1765,6 +1767,8 @@ struct Workspace::Impl {
     maximum = false;
     sampling = false;
     marginals = false;
+    resident_observation_batch = 0;
+    resident_categorical_factors = false;
   }
 
   ~Impl() { Clear(); }
@@ -2153,7 +2157,7 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
             std::span<const Scalar> edge_potentials, Workspace::Impl &storage,
             bool scaled, std::span<const Scalar> uniforms,
             StageInputs stage_inputs, UploadInputs upload_inputs,
-            InitializeNodeData initialize_node_data) {
+            InitializeNodeData initialize_node_data, bool update_edges = true) {
   const auto wall_start = Clock::now();
   if (storage.plan != &plan || storage.states != states || batch == 0 ||
       batch > storage.batch) {
@@ -2182,7 +2186,7 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
     }
   }
   stage_inputs();
-  if (edge_potentials.data() != storage.host_edges) {
+  if (update_edges && edge_potentials.data() != storage.host_edges) {
     std::memcpy(storage.host_edges, edge_potentials.data(),
                 edge_potentials.size_bytes());
   }
@@ -2193,10 +2197,12 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   Check(cudaEventRecord(storage.upload_start, storage.stream),
         "GPU runtime EventRecord upload start");
   upload_inputs();
-  Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
-                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
-                        storage.stream),
-        "GPU runtime MemcpyAsync edge upload");
+  if (update_edges) {
+    Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
+                          edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                          storage.stream),
+          "GPU runtime MemcpyAsync edge upload");
+  }
   if (sampling) {
     Check(cudaMemcpyAsync(storage.uniforms, storage.host_uniforms,
                           uniforms.size_bytes(), cudaMemcpyHostToDevice,
@@ -2402,7 +2408,8 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
                    std::size_t batch, std::span<const Scalar> edge_potentials,
                    Workspace::Impl &storage, StageInputs stage_inputs,
                    UploadInputs upload_inputs,
-                   InitializeNodeData initialize_node_data) {
+                   InitializeNodeData initialize_node_data,
+                   bool update_edges = true) {
   const auto wall_start = Clock::now();
   if (!storage.maximum || storage.plan != &plan || storage.states != states ||
       batch == 0 || batch > storage.batch) {
@@ -2417,7 +2424,7 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
   if (edge_potentials.size() != edge_values)
     throw std::invalid_argument("accelerator edge input shape is wrong");
   stage_inputs();
-  if (edge_potentials.data() != storage.host_edges) {
+  if (update_edges && edge_potentials.data() != storage.host_edges) {
     std::memcpy(storage.host_edges, edge_potentials.data(),
                 edge_potentials.size_bytes());
   }
@@ -2425,10 +2432,12 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
   Check(cudaEventRecord(storage.upload_start, storage.stream),
         "GPU runtime EventRecord upload start");
   upload_inputs();
-  Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
-                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
-                        storage.stream),
-        "GPU runtime MemcpyAsync edge upload");
+  if (update_edges) {
+    Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
+                          edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                          storage.stream),
+          "GPU runtime MemcpyAsync edge upload");
+  }
   Check(cudaEventRecord(storage.upload_stop, storage.stream),
         "GPU runtime EventRecord upload stop");
 
@@ -2600,7 +2609,8 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
                      std::size_t batch, std::span<const Scalar> edge_potentials,
                      Workspace::Impl &storage, StageInputs stage_inputs,
                      UploadInputs upload_inputs,
-                     InitializeNodeData initialize_node_data) {
+                     InitializeNodeData initialize_node_data,
+                     bool update_edges = true) {
   const auto wall_start = Clock::now();
   if (!storage.marginals || storage.plan != &plan || storage.states != states ||
       batch == 0 || batch > storage.batch) {
@@ -2615,7 +2625,7 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
   if (edge_potentials.size() != edge_values)
     throw std::invalid_argument("accelerator edge input shape is wrong");
   stage_inputs();
-  if (edge_potentials.data() != storage.host_edges) {
+  if (update_edges && edge_potentials.data() != storage.host_edges) {
     std::memcpy(storage.host_edges, edge_potentials.data(),
                 edge_potentials.size_bytes());
   }
@@ -2623,10 +2633,12 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
   Check(cudaEventRecord(storage.upload_start, storage.stream),
         "GPU runtime EventRecord upload start");
   upload_inputs();
-  Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
-                        edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
-                        storage.stream),
-        "GPU runtime MemcpyAsync edge upload");
+  if (update_edges) {
+    Check(cudaMemcpyAsync(storage.input_edges, storage.host_edges,
+                          edge_potentials.size_bytes(), cudaMemcpyHostToDevice,
+                          storage.stream),
+          "GPU runtime MemcpyAsync edge upload");
+  }
   Check(cudaEventRecord(storage.upload_stop, storage.stream),
         "GPU runtime EventRecord upload stop");
 
@@ -2828,7 +2840,9 @@ auto WithDenseInputs(tree_hmm::BatchedModelView model, Workspace::Impl &storage,
 
 template <class Execute>
 auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace::Impl &storage, Execute execute) {
+                           Workspace::Impl &storage,
+                           tree_hmm::CategoricalInputUpdate update,
+                           Execute execute) {
   if (!storage.categorical || model.categories != storage.categories ||
       model.observation_nodes.size() != storage.observation_nodes.size() ||
       !std::equal(model.observation_nodes.begin(),
@@ -2847,17 +2861,32 @@ auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
       model.emission_potentials.size() != emission_values) {
     throw std::invalid_argument("accelerator categorical input shapes are wrong");
   }
-  return execute(
+  const bool update_observations =
+      update == tree_hmm::CategoricalInputUpdate::kAll;
+  const bool update_factors =
+      update != tree_hmm::CategoricalInputUpdate::kNone;
+  if (!update_observations &&
+      storage.resident_observation_batch != model.batch) {
+    throw std::logic_error(
+        "categorical observations are not resident for this batch; use kAll");
+  }
+  if (!update_factors && !storage.resident_categorical_factors) {
+    throw std::logic_error(
+        "categorical factors are not resident; use kAll or kFactors");
+  }
+  auto result = execute(
       [&] {
-        if (model.observations.data() != storage.host_observations) {
+        if (update_observations &&
+            model.observations.data() != storage.host_observations) {
           std::memcpy(storage.host_observations, model.observations.data(),
                       model.observations.size_bytes());
         }
-        if (model.root_potential.data() != storage.host_root_potential) {
+        if (update_factors &&
+            model.root_potential.data() != storage.host_root_potential) {
           std::memcpy(storage.host_root_potential, model.root_potential.data(),
                       model.root_potential.size_bytes());
         }
-        if (model.emission_potentials.data() !=
+        if (update_factors && model.emission_potentials.data() !=
             storage.host_emission_potentials) {
           std::memcpy(storage.host_emission_potentials,
                       model.emission_potentials.data(),
@@ -2865,21 +2894,25 @@ auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
         }
       },
       [&] {
-        Check(cudaMemcpyAsync(storage.input_observations,
-                              storage.host_observations,
-                              model.observations.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "GPU runtime MemcpyAsync categorical observation upload");
-        Check(cudaMemcpyAsync(storage.input_root_potential,
-                              storage.host_root_potential,
-                              model.root_potential.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "GPU runtime MemcpyAsync root-potential upload");
-        Check(cudaMemcpyAsync(storage.input_emission_potentials,
-                              storage.host_emission_potentials,
-                              model.emission_potentials.size_bytes(),
-                              cudaMemcpyHostToDevice, storage.stream),
-              "GPU runtime MemcpyAsync emission-potential upload");
+        if (update_observations) {
+          Check(cudaMemcpyAsync(storage.input_observations,
+                                storage.host_observations,
+                                model.observations.size_bytes(),
+                                cudaMemcpyHostToDevice, storage.stream),
+                "GPU runtime MemcpyAsync categorical observation upload");
+        }
+        if (update_factors) {
+          Check(cudaMemcpyAsync(storage.input_root_potential,
+                                storage.host_root_potential,
+                                model.root_potential.size_bytes(),
+                                cudaMemcpyHostToDevice, storage.stream),
+                "GPU runtime MemcpyAsync root-potential upload");
+          Check(cudaMemcpyAsync(storage.input_emission_potentials,
+                                storage.host_emission_potentials,
+                                model.emission_potentials.size_bytes(),
+                                cudaMemcpyHostToDevice, storage.stream),
+                "GPU runtime MemcpyAsync emission-potential upload");
+        }
       },
       [&](const Params &params) {
         constexpr std::size_t kThreads = 256;
@@ -2905,7 +2938,12 @@ auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
                          "categorical observation count"),
               CheckedU32(model.categories, "category count"));
         }
-      });
+      }, update_factors);
+  if (update_observations)
+    storage.resident_observation_batch = model.batch;
+  if (update_factors)
+    storage.resident_categorical_factors = true;
+  return result;
 }
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
@@ -2921,12 +2959,14 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
                             Workspace::Impl &storage, bool scaled,
-                            std::span<const Scalar> uniforms = {}) {
+                            std::span<const Scalar> uniforms,
+                            tree_hmm::CategoricalInputUpdate update) {
   return WithCategoricalInputs(
-      model, storage, [&](auto stage, auto upload, auto initialize) {
+      model, storage, update, [&](auto stage, auto upload, auto initialize,
+                                 bool update_edges) {
         return RunPrepared(model.plan, model.states, model.batch,
                            model.edge_potentials, storage, scaled, uniforms,
-                           stage, upload, initialize);
+                           stage, upload, initialize, update_edges);
       });
 }
 
@@ -2942,12 +2982,14 @@ RunMaximum(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
 
 tree_hmm::BatchedMaximumAssignmentView
 RunMaximum(tree_hmm::BatchedCategoricalModelView model,
-           Workspace::Impl &storage) {
+           Workspace::Impl &storage,
+           tree_hmm::CategoricalInputUpdate update) {
   return WithCategoricalInputs(
-      model, storage, [&](auto stage, auto upload, auto initialize) {
+      model, storage, update, [&](auto stage, auto upload, auto initialize,
+                                 bool update_edges) {
         return RunMaximumPrepared(model.plan, model.states, model.batch,
                                   model.edge_potentials, storage, stage, upload,
-                                  initialize);
+                                  initialize, update_edges);
       });
 }
 
@@ -2963,12 +3005,14 @@ tree_hmm::BatchedMarginalView RunMarginals(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedMarginalView
 RunMarginals(tree_hmm::BatchedCategoricalModelView model,
-             Workspace::Impl &storage) {
+             Workspace::Impl &storage,
+             tree_hmm::CategoricalInputUpdate update) {
   return WithCategoricalInputs(
-      model, storage, [&](auto stage, auto upload, auto initialize) {
+      model, storage, update, [&](auto stage, auto upload, auto initialize,
+                                 bool update_edges) {
         return RunMarginalsPrepared(model.plan, model.states, model.batch,
                                     model.edge_potentials, storage, stage,
-                                    upload, initialize);
+                                    upload, initialize, update_edges);
       });
 }
 
@@ -2988,14 +3032,16 @@ LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView
 PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                          Workspace &workspace) {
-  return Run(model, *workspace.impl_, false);
+                          Workspace &workspace,
+                          tree_hmm::CategoricalInputUpdate update) {
+  return Run(model, *workspace.impl_, false, {}, update);
 }
 
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                             Workspace &workspace) {
-  return Run(model, *workspace.impl_, true);
+                             Workspace &workspace,
+                             tree_hmm::CategoricalInputUpdate update) {
+  return Run(model, *workspace.impl_, true, {}, update);
 }
 
 tree_hmm::BatchedMaximumAssignmentView
@@ -3006,8 +3052,9 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace) {
-  return RunMaximum(model, *workspace.impl_);
+                           Workspace &workspace,
+                           tree_hmm::CategoricalInputUpdate update) {
+  return RunMaximum(model, *workspace.impl_, update);
 }
 
 tree_hmm::BatchedPosteriorSampleView
@@ -3024,9 +3071,10 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
                         std::span<const Scalar> uniforms,
-                        Workspace &workspace) {
+                        Workspace &workspace,
+                        tree_hmm::CategoricalInputUpdate update) {
   const tree_hmm::PartitionView result =
-      Run(model, *workspace.impl_, true, uniforms);
+      Run(model, *workspace.impl_, true, uniforms, update);
   return {
       {workspace.impl_->host_assignments, model.batch * model.plan.num_nodes()},
       result.timings};
@@ -3040,8 +3088,9 @@ PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace) {
-  return RunMarginals(model, *workspace.impl_);
+                           Workspace &workspace,
+                           tree_hmm::CategoricalInputUpdate update) {
+  return RunMarginals(model, *workspace.impl_, update);
 }
 
 } // namespace tree_hmm::TREE_HMM_GPU_BACKEND_NAMESPACE

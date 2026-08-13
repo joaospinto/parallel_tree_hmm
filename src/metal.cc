@@ -332,6 +332,8 @@ struct Workspace::Impl {
   bool maximum = false;
   bool sampling = false;
   bool marginals = false;
+  std::size_t resident_observation_batch = 0;
+  bool resident_categorical_factors = false;
 };
 
 bool Available() {
@@ -386,6 +388,8 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
         0,
         0,
     };
+    storage.resident_observation_batch = 0;
+    storage.resident_categorical_factors = false;
     storage.input_nodes = nil;
     storage.input_observations = nil;
     storage.input_root_potential = nil;
@@ -754,8 +758,9 @@ std::span<Scalar> Workspace::Uniforms(std::size_t batch) {
 
 namespace {
 
-void StageNodeInputs(tree_hmm::BatchedModelView model,
-                     Workspace::Impl &storage) {
+bool StageNodeInputs(tree_hmm::BatchedModelView model,
+                     Workspace::Impl &storage,
+                     tree_hmm::CategoricalInputUpdate) {
   if (storage.categorical)
     throw std::invalid_argument(
         "dense Metal inference cannot use a categorical workspace");
@@ -767,10 +772,12 @@ void StageNodeInputs(tree_hmm::BatchedModelView model,
     std::memcpy(storage.input_nodes.contents, model.node_potentials.data(),
                 model.node_potentials.size_bytes());
   }
+  return true;
 }
 
-void StageNodeInputs(tree_hmm::BatchedCategoricalModelView model,
-                     Workspace::Impl &storage) {
+bool StageNodeInputs(tree_hmm::BatchedCategoricalModelView model,
+                     Workspace::Impl &storage,
+                     tree_hmm::CategoricalInputUpdate update) {
   if (!storage.categorical || model.categories != storage.categories ||
       model.observation_nodes.size() != storage.observation_nodes.size() ||
       !std::equal(model.observation_nodes.begin(),
@@ -789,20 +796,48 @@ void StageNodeInputs(tree_hmm::BatchedCategoricalModelView model,
       model.emission_potentials.size() != emission_values) {
     throw std::invalid_argument("Metal categorical input shapes are wrong");
   }
-  if (model.observations.data() != storage.input_observations.contents) {
+  const bool update_observations =
+      update == tree_hmm::CategoricalInputUpdate::kAll;
+  const bool update_factors =
+      update != tree_hmm::CategoricalInputUpdate::kNone;
+  if (!update_observations &&
+      storage.resident_observation_batch != model.batch) {
+    throw std::logic_error(
+        "categorical observations are not resident for this batch; use kAll");
+  }
+  if (!update_factors && !storage.resident_categorical_factors) {
+    throw std::logic_error(
+        "categorical factors are not resident; use kAll or kFactors");
+  }
+  if (update_observations &&
+      model.observations.data() != storage.input_observations.contents) {
     std::memcpy(storage.input_observations.contents, model.observations.data(),
                 model.observations.size_bytes());
   }
-  if (model.root_potential.data() != storage.input_root_potential.contents) {
+  if (update_factors &&
+      model.root_potential.data() != storage.input_root_potential.contents) {
     std::memcpy(storage.input_root_potential.contents,
                 model.root_potential.data(), model.root_potential.size_bytes());
   }
-  if (model.emission_potentials.data() !=
+  if (update_factors && model.emission_potentials.data() !=
       storage.input_emission_potentials.contents) {
     std::memcpy(storage.input_emission_potentials.contents,
                 model.emission_potentials.data(),
                 model.emission_potentials.size_bytes());
   }
+  return update_factors;
+}
+
+void MarkResidentInputs(tree_hmm::BatchedModelView, Workspace::Impl &,
+                        tree_hmm::CategoricalInputUpdate) {}
+
+void MarkResidentInputs(tree_hmm::BatchedCategoricalModelView model,
+                        Workspace::Impl &storage,
+                        tree_hmm::CategoricalInputUpdate update) {
+  if (update == tree_hmm::CategoricalInputUpdate::kAll)
+    storage.resident_observation_batch = model.batch;
+  if (update != tree_hmm::CategoricalInputUpdate::kNone)
+    storage.resident_categorical_factors = true;
 }
 
 void EncodeInitializeNodes(id<MTLComputeCommandEncoder> encoder,
@@ -854,7 +889,9 @@ void EncodeInitializeNodes(id<MTLComputeCommandEncoder> encoder,
 
 template <class Model>
 tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
-                            std::span<const Scalar> uniforms = {}) {
+                            std::span<const Scalar> uniforms = {},
+                            tree_hmm::CategoricalInputUpdate update =
+                                tree_hmm::CategoricalInputUpdate::kAll) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (storage.plan != &model.plan || storage.states != model.states ||
@@ -885,8 +922,9 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
     }
 
     const auto upload_start = Clock::now();
-    StageNodeInputs(model, storage);
-    if (model.edge_potentials.data() != storage.input_edges.contents) {
+    const bool update_edges = StageNodeInputs(model, storage, update);
+    if (update_edges &&
+        model.edge_potentials.data() != storage.input_edges.contents) {
       std::memcpy(storage.input_edges.contents, model.edge_potentials.data(),
                   model.edge_potentials.size_bytes());
     }
@@ -1165,13 +1203,17 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
         }
       }
     }
+    MarkResidentInputs(model, storage, update);
     return {{output, model.batch}, {upload_ms, kernel_ms, 0.0, wall_ms}};
   }
 }
 
 template <class Model>
 tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
-                                                  Workspace::Impl &storage) {
+                                                  Workspace::Impl &storage,
+                                                  tree_hmm::CategoricalInputUpdate
+                                                      update =
+                                                          tree_hmm::CategoricalInputUpdate::kAll) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (!storage.maximum || storage.plan != &model.plan ||
@@ -1188,8 +1230,9 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
       throw std::invalid_argument("Metal MAP edge input shape is wrong");
 
     const auto upload_start = Clock::now();
-    StageNodeInputs(model, storage);
-    if (model.edge_potentials.data() != storage.input_edges.contents) {
+    const bool update_edges = StageNodeInputs(model, storage, update);
+    if (update_edges &&
+        model.edge_potentials.data() != storage.input_edges.contents) {
       std::memcpy(storage.input_edges.contents, model.edge_potentials.data(),
                   model.edge_potentials.size_bytes());
     }
@@ -1360,6 +1403,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
         1000.0 * (command.GPUEndTime - command.GPUStartTime);
     const auto *assignments =
         static_cast<const std::uint32_t *>(storage.assignments.contents);
+    MarkResidentInputs(model, storage, update);
     return {{log_weights, model.batch},
             {assignments, model.batch * model.plan.num_nodes()},
             {upload_ms, kernel_ms, 0.0, wall_ms}};
@@ -1368,7 +1412,9 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
 
 template <class Model>
 tree_hmm::BatchedMarginalView RunMarginals(Model model,
-                                           Workspace::Impl &storage) {
+                                           Workspace::Impl &storage,
+                                           tree_hmm::CategoricalInputUpdate
+                                               update = tree_hmm::CategoricalInputUpdate::kAll) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (!storage.marginals || storage.plan != &model.plan ||
@@ -1388,8 +1434,9 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
       throw std::invalid_argument("Metal marginal edge input shape is wrong");
 
     const auto upload_start = Clock::now();
-    StageNodeInputs(model, storage);
-    if (model.edge_potentials.data() != storage.input_edges.contents) {
+    const bool update_edges = StageNodeInputs(model, storage, update);
+    if (update_edges &&
+        model.edge_potentials.data() != storage.input_edges.contents) {
       std::memcpy(storage.input_edges.contents, model.edge_potentials.data(),
                   model.edge_potentials.size_bytes());
     }
@@ -1601,6 +1648,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
             .count();
     const double kernel_ms =
         1000.0 * (command.GPUEndTime - command.GPUStartTime);
+    MarkResidentInputs(model, storage, update);
     return {{log_partitions, model.batch},
             {static_cast<const Scalar *>(storage.node_marginals.contents),
              node_values},
@@ -1626,14 +1674,16 @@ LogPartitionFunctionPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView
 PartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                          Workspace &workspace) {
-  return Run(model, *workspace.impl_, false);
+                          Workspace &workspace,
+                          tree_hmm::CategoricalInputUpdate update) {
+  return Run(model, *workspace.impl_, false, {}, update);
 }
 
 tree_hmm::PartitionView
 LogPartitionFunctionPrepared(tree_hmm::BatchedCategoricalModelView model,
-                             Workspace &workspace) {
-  return Run(model, *workspace.impl_, true);
+                             Workspace &workspace,
+                             tree_hmm::CategoricalInputUpdate update) {
+  return Run(model, *workspace.impl_, true, {}, update);
 }
 
 tree_hmm::BatchedMaximumAssignmentView
@@ -1644,8 +1694,9 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedMaximumAssignmentView
 MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace) {
-  return RunMaximum(model, *workspace.impl_);
+                           Workspace &workspace,
+                           tree_hmm::CategoricalInputUpdate update) {
+  return RunMaximum(model, *workspace.impl_, update);
 }
 
 tree_hmm::BatchedPosteriorSampleView
@@ -1662,9 +1713,10 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
                         std::span<const Scalar> uniforms,
-                        Workspace &workspace) {
+                        Workspace &workspace,
+                        tree_hmm::CategoricalInputUpdate update) {
   const tree_hmm::PartitionView result =
-      Run(model, *workspace.impl_, true, uniforms);
+      Run(model, *workspace.impl_, true, uniforms, update);
   const auto *assignments =
       static_cast<const std::uint32_t *>(workspace.impl_->assignments.contents);
   return {{assignments, model.batch * model.plan.num_nodes()}, result.timings};
@@ -1678,8 +1730,9 @@ PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
-                           Workspace &workspace) {
-  return RunMarginals(model, *workspace.impl_);
+                           Workspace &workspace,
+                           tree_hmm::CategoricalInputUpdate update) {
+  return RunMarginals(model, *workspace.impl_, update);
 }
 
 } // namespace tree_hmm::metal
