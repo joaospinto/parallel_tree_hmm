@@ -68,10 +68,10 @@ int main(int argc, char **argv) {
     const std::string_view topology = argc > 3 ? argv[3] : "balanced";
     constexpr std::size_t kStates = 4;
     const btrc::Plan plan = MakePlan(leaves, topology);
-    std::vector<double> nodes(plan.num_nodes() * kStates);
+    std::vector<tree_hmm::Scalar> nodes(plan.num_nodes() * kStates);
     for (std::size_t index = 0; index < nodes.size(); ++index)
       nodes[index] = 0.2 + 0.01 * static_cast<double>(index % 17);
-    std::vector<double> edges(plan.num_edges() * kStates * kStates);
+    std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
     for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
       for (std::size_t parent = 0; parent < kStates; ++parent) {
         for (std::size_t child = 0; child < kStates; ++child) {
@@ -81,7 +81,7 @@ int main(int argc, char **argv) {
       }
     }
     const tree_hmm::ModelView model{plan, kStates, nodes, edges};
-    std::vector<double> uniforms(plan.num_nodes(), 0.5);
+    std::vector<tree_hmm::Scalar> uniforms(plan.num_nodes(), 0.5);
     tree_hmm::Workspace workspace;
     workspace.Reserve(plan, kStates);
     static_cast<void>(tree_hmm::LogPartitionFunctionPrepared(model, workspace));
@@ -120,12 +120,13 @@ int main(int argc, char **argv) {
         },
         &checksum);
     std::cout << std::setprecision(10)
-              << "topology,leaves,nodes,states,repeats,log_partition_ms,"
+              << "precision,topology,leaves,nodes,states,repeats,"
+                 "log_partition_ms,"
                  "marginals_ms,map_ms,sample_ms,checksum\n"
-              << topology << ',' << leaves << ',' << plan.num_nodes() << ','
-              << kStates << ',' << repeats << ',' << log_partition_ms << ','
-              << marginals_ms << ',' << maximum_ms << ',' << sample_ms << ','
-              << checksum << '\n';
+              << tree_hmm::kPrecisionName << ',' << topology << ',' << leaves
+              << ',' << plan.num_nodes() << ',' << kStates << ',' << repeats
+              << ',' << log_partition_ms << ',' << marginals_ms << ','
+              << maximum_ms << ',' << sample_ms << ',' << checksum << '\n';
     return 0;
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';

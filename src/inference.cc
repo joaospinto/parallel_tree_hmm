@@ -16,29 +16,29 @@ struct Workspace::Impl {
   const btrc::Plan *plan = nullptr;
   std::size_t states = 0;
 
-  std::vector<double> nodes;
-  std::vector<double> paths;
-  std::vector<double> branches;
-  std::vector<double> node_log_scales;
-  std::vector<double> path_log_scales;
-  std::vector<double> branch_log_scales;
-  std::vector<double> node_adjoints;
-  std::vector<double> path_adjoints;
-  std::vector<double> branch_adjoints;
+  std::vector<Scalar> nodes;
+  std::vector<Scalar> paths;
+  std::vector<Scalar> branches;
+  std::vector<Scalar> node_log_scales;
+  std::vector<Scalar> path_log_scales;
+  std::vector<Scalar> branch_log_scales;
+  std::vector<Scalar> node_adjoints;
+  std::vector<Scalar> path_adjoints;
+  std::vector<Scalar> branch_adjoints;
 
-  std::vector<double> rake_paths;
-  std::vector<double> rake_leaves;
-  std::vector<double> compression_left;
-  std::vector<double> compression_middle;
-  std::vector<double> compression_right;
-  std::vector<double> reverse_scratch;
+  std::vector<Scalar> rake_paths;
+  std::vector<Scalar> rake_leaves;
+  std::vector<Scalar> compression_left;
+  std::vector<Scalar> compression_middle;
+  std::vector<Scalar> compression_right;
+  std::vector<Scalar> reverse_scratch;
 
   std::vector<std::size_t> rake_choices;
   std::vector<std::size_t> compression_choices;
   std::vector<std::size_t> assignments;
-  double partition = 0.0;
-  double log_partition = 0.0;
-  double maximum_log_weight = 0.0;
+  Scalar partition = 0.0;
+  Scalar log_partition = 0.0;
+  Scalar maximum_log_weight = 0.0;
 };
 
 namespace {
@@ -63,7 +63,7 @@ void Validate(ModelView model) {
     throw std::invalid_argument("node-potential shape does not match the plan");
   if (model.edge_potentials.size() != expected_edges)
     throw std::invalid_argument("edge-potential shape does not match the plan");
-  const auto invalid = [](double value) {
+  const auto invalid = [](Scalar value) {
     return !std::isfinite(value) || value < 0.0;
   };
   if (std::any_of(model.node_potentials.begin(), model.node_potentials.end(),
@@ -92,29 +92,29 @@ Workspace::Impl &Prepare(ModelView model, Workspace::Impl &storage) {
   return storage;
 }
 
-double PotentialLog(double value) {
+Scalar PotentialLog(Scalar value) {
   return value > 0.0 ? std::log(value)
-                     : -std::numeric_limits<double>::infinity();
+                     : -std::numeric_limits<Scalar>::infinity();
 }
 
-template <class Term> double LogSumExp(std::size_t size, Term term) {
-  double maximum = -std::numeric_limits<double>::infinity();
+template <class Term> Scalar LogSumExp(std::size_t size, Term term) {
+  Scalar maximum = -std::numeric_limits<Scalar>::infinity();
   for (std::size_t index = 0; index < size; ++index)
     maximum = std::max(maximum, term(index));
   if (!std::isfinite(maximum))
     return maximum;
-  double sum = 0.0;
+  Scalar sum = 0.0;
   for (std::size_t index = 0; index < size; ++index)
     sum += std::exp(term(index) - maximum);
   return maximum + std::log(sum);
 }
 
 template <class Term>
-std::size_t Argmax(std::size_t size, Term term, double *maximum = nullptr) {
+std::size_t Argmax(std::size_t size, Term term, Scalar *maximum = nullptr) {
   std::size_t result = 0;
-  double value = term(0);
+  Scalar value = term(0);
   for (std::size_t index = 1; index < size; ++index) {
-    const double candidate = term(index);
+    const Scalar candidate = term(index);
     if (candidate > value) {
       result = index;
       value = candidate;
@@ -126,12 +126,12 @@ std::size_t Argmax(std::size_t size, Term term, double *maximum = nullptr) {
 }
 
 template <class Term>
-std::size_t SampleLogWeights(std::size_t size, Term term, double normalizer,
-                             double uniform) {
-  double cumulative = 0.0;
+std::size_t SampleLogWeights(std::size_t size, Term term, Scalar normalizer,
+                             Scalar uniform) {
+  Scalar cumulative = 0.0;
   std::size_t last_supported = size;
   for (std::size_t index = 0; index < size; ++index) {
-    const double log_weight = term(index);
+    const Scalar log_weight = term(index);
     if (!std::isfinite(log_weight))
       continue;
     last_supported = index;
@@ -154,12 +154,12 @@ public:
 
   void Rake(std::span<const btrc::Rake> operations) {
     for (const auto &operation : operations) {
-      const double *path = Path(operation.edge);
-      const double *leaf = Node(operation.leaf);
-      double *message = Branch(operation.branch);
+      const Scalar *path = Path(operation.edge);
+      const Scalar *leaf = Node(operation.leaf);
+      Scalar *message = Branch(operation.branch);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
-        double value = 0.0;
+        Scalar value = 0.0;
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
           value +=
@@ -172,8 +172,8 @@ public:
 
   void CombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (const auto &operation : operations) {
-      double *left = Branch(operation.destination);
-      const double *right = Branch(operation.source);
+      Scalar *left = Branch(operation.destination);
+      const Scalar *right = Branch(operation.source);
       for (std::size_t state = 0; state < states_; ++state)
         left[state] *= right[state];
     }
@@ -181,8 +181,8 @@ public:
 
   void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (const auto &operation : operations) {
-      double *node = Node(operation.parent);
-      const double *branch = Branch(operation.branch);
+      Scalar *node = Node(operation.parent);
+      const Scalar *branch = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state)
         node[state] *= branch[state];
     }
@@ -190,21 +190,22 @@ public:
 
   void Compress(std::span<const btrc::Compression> operations) {
     for (const auto &operation : operations) {
-      double *left = Path(operation.left_edge);
-      const double *middle = Node(operation.middle);
-      const double *right = Path(operation.right_edge);
+      Scalar *left = Path(operation.left_edge);
+      const Scalar *middle = Node(operation.middle);
+      const Scalar *right = Path(operation.right_edge);
       std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          double value = 0.0;
+          Scalar value = 0.0;
           for (std::size_t middle_state = 0; middle_state < states_;
                ++middle_state) {
-            value += storage_.reverse_scratch[parent_state * states_ +
-                                              middle_state] *
-                     middle[middle_state] *
-                     right[middle_state * states_ + child_state];
+            value +=
+                storage_
+                    .reverse_scratch[parent_state * states_ + middle_state] *
+                middle[middle_state] *
+                right[middle_state * states_ + child_state];
           }
           left[parent_state * states_ + child_state] = value;
         }
@@ -212,29 +213,29 @@ public:
     }
   }
 
-  double FinishRoot() {
-    const double *root = Node(plan_.root());
-    storage_.partition = std::accumulate(root, root + states_, 0.0);
+  Scalar FinishRoot() {
+    const Scalar *root = Node(plan_.root());
+    storage_.partition = std::accumulate(root, root + states_, Scalar{0});
     return storage_.partition;
   }
 
 private:
-  double *Node(btrc::Index node) {
+  Scalar *Node(btrc::Index node) {
     return storage_.nodes.data() + node * states_;
   }
-  const double *Node(btrc::Index node) const {
+  const Scalar *Node(btrc::Index node) const {
     return storage_.nodes.data() + node * states_;
   }
-  double *Path(btrc::Index edge) {
+  Scalar *Path(btrc::Index edge) {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  const double *Path(btrc::Index edge) const {
+  const Scalar *Path(btrc::Index edge) const {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  double *Branch(btrc::Index branch) {
+  Scalar *Branch(btrc::Index branch) {
     return storage_.branches.data() + branch * states_;
   }
-  const double *Branch(btrc::Index branch) const {
+  const Scalar *Branch(btrc::Index branch) const {
     return storage_.branches.data() + branch * states_;
   }
   const btrc::Plan &plan_;
@@ -257,13 +258,13 @@ public:
 
   void Rake(std::span<const btrc::Rake> operations) {
     for (const auto &operation : operations) {
-      const double *path = Path(operation.edge);
-      const double *leaf = Node(operation.leaf);
+      const Scalar *path = Path(operation.edge);
+      const Scalar *leaf = Node(operation.leaf);
       std::copy(path, path + matrix_size_,
                 storage_.rake_paths.begin() + operation.branch * matrix_size_);
       std::copy(leaf, leaf + states_,
                 storage_.rake_leaves.begin() + operation.branch * states_);
-      double *message = Branch(operation.branch);
+      Scalar *message = Branch(operation.branch);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         message[parent_state] =
@@ -277,8 +278,8 @@ public:
 
   void CombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (const auto &operation : operations) {
-      double *destination = Branch(operation.destination);
-      const double *source = Branch(operation.source);
+      Scalar *destination = Branch(operation.destination);
+      const Scalar *source = Branch(operation.source);
       for (std::size_t state = 0; state < states_; ++state)
         destination[state] += source[state];
     }
@@ -286,8 +287,8 @@ public:
 
   void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (const auto &operation : operations) {
-      double *node = Node(operation.parent);
-      const double *branch = Branch(operation.branch);
+      Scalar *node = Node(operation.parent);
+      const Scalar *branch = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state)
         node[state] += branch[state];
     }
@@ -295,14 +296,14 @@ public:
 
   void Compress(std::span<const btrc::Compression> operations) {
     for (const auto &operation : operations) {
-      double *left = Path(operation.left_edge);
-      const double *middle = Node(operation.middle);
-      const double *right = Path(operation.right_edge);
-      double *saved_left =
+      Scalar *left = Path(operation.left_edge);
+      const Scalar *middle = Node(operation.middle);
+      const Scalar *right = Path(operation.right_edge);
+      Scalar *saved_left =
           storage_.compression_left.data() + operation.tape * matrix_size_;
-      double *saved_middle =
+      Scalar *saved_middle =
           storage_.compression_middle.data() + operation.tape * states_;
-      double *saved_right =
+      Scalar *saved_right =
           storage_.compression_right.data() + operation.tape * matrix_size_;
       std::copy(left, left + matrix_size_, saved_left);
       std::copy(middle, middle + states_, saved_middle);
@@ -322,8 +323,8 @@ public:
     }
   }
 
-  double FinishRoot() {
-    const double *root = Node(plan_.root());
+  Scalar FinishRoot() {
+    const Scalar *root = Node(plan_.root());
     storage_.log_partition =
         LogSumExp(states_, [&](std::size_t state) { return root[state]; });
     if (!std::isfinite(storage_.log_partition)) {
@@ -335,25 +336,25 @@ public:
   }
 
   void SeedRootAdjoint() {
-    const double *root = Node(plan_.root());
-    double *root_adjoint = NodeAdjoint(plan_.root());
+    const Scalar *root = Node(plan_.root());
+    Scalar *root_adjoint = NodeAdjoint(plan_.root());
     for (std::size_t state = 0; state < states_; ++state)
       root_adjoint[state] = std::exp(root[state] - storage_.log_partition);
   }
 
-  void SeedRootSample(std::span<const double> uniforms) {
+  void SeedRootSample(std::span<const Scalar> uniforms) {
     if (uniforms.size() != plan_.num_nodes()) {
       throw std::invalid_argument(
           "posterior sampling requires one uniform variate per node");
     }
-    for (double uniform : uniforms) {
+    for (Scalar uniform : uniforms) {
       if (!std::isfinite(uniform) || uniform < 0.0 || uniform >= 1.0) {
         throw std::invalid_argument(
             "posterior-sampling variates must lie in [0, 1)");
       }
     }
     uniforms_ = uniforms;
-    const double *root = Node(plan_.root());
+    const Scalar *root = Node(plan_.root());
     storage_.assignments[plan_.root()] = SampleLogWeights(
         states_, [&](std::size_t state) { return root[state]; },
         storage_.log_partition, uniforms[plan_.root()]);
@@ -362,16 +363,16 @@ public:
   void ExpandRakes(std::span<const btrc::Rake> operations) {
     for (const btrc::Rake &operation : operations) {
       const std::size_t parent_state = storage_.assignments[operation.parent];
-      const double *path =
+      const Scalar *path =
           storage_.rake_paths.data() + operation.branch * matrix_size_;
-      const double *leaf =
+      const Scalar *leaf =
           storage_.rake_leaves.data() + operation.branch * states_;
-      double *conditional = storage_.reverse_scratch.data();
+      Scalar *conditional = storage_.reverse_scratch.data();
       for (std::size_t child_state = 0; child_state < states_; ++child_state) {
         conditional[child_state] =
             path[parent_state * states_ + child_state] + leaf[child_state];
       }
-      const double normalizer =
+      const Scalar normalizer =
           LogSumExp(states_, [&](std::size_t child_state) {
             return conditional[child_state];
           });
@@ -386,21 +387,20 @@ public:
     for (const btrc::Compression &operation : operations) {
       const std::size_t parent_state = storage_.assignments[operation.parent];
       const std::size_t child_state = storage_.assignments[operation.child];
-      const double *left =
+      const Scalar *left =
           storage_.compression_left.data() + operation.tape * matrix_size_;
-      const double *middle =
+      const Scalar *middle =
           storage_.compression_middle.data() + operation.tape * states_;
-      const double *right =
+      const Scalar *right =
           storage_.compression_right.data() + operation.tape * matrix_size_;
-      double *conditional = storage_.reverse_scratch.data();
+      Scalar *conditional = storage_.reverse_scratch.data();
       for (std::size_t middle_state = 0; middle_state < states_;
            ++middle_state) {
         conditional[middle_state] =
-            left[parent_state * states_ + middle_state] +
-            middle[middle_state] +
+            left[parent_state * states_ + middle_state] + middle[middle_state] +
             right[middle_state * states_ + child_state];
       }
-      const double normalizer =
+      const Scalar normalizer =
           LogSumExp(states_, [&](std::size_t middle_state) {
             return conditional[middle_state];
           });
@@ -416,24 +416,24 @@ public:
   void ReverseCompressions(std::span<const btrc::Compression> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *left =
+      const Scalar *left =
           storage_.compression_left.data() + operation.tape * matrix_size_;
-      const double *middle =
+      const Scalar *middle =
           storage_.compression_middle.data() + operation.tape * states_;
-      const double *right =
+      const Scalar *right =
           storage_.compression_right.data() + operation.tape * matrix_size_;
-      double *output_adjoint = PathAdjoint(operation.left_edge);
+      Scalar *output_adjoint = PathAdjoint(operation.left_edge);
       std::fill(storage_.reverse_scratch.begin(),
                 storage_.reverse_scratch.end(), 0.0);
-      double *middle_adjoint = NodeAdjoint(operation.middle);
-      double *right_adjoint = PathAdjoint(operation.right_edge);
+      Scalar *middle_adjoint = NodeAdjoint(operation.middle);
+      Scalar *right_adjoint = PathAdjoint(operation.right_edge);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
           const std::size_t output_index = parent_state * states_ + child_state;
-          const double adjoint = output_adjoint[output_index];
-          const double output =
+          const Scalar adjoint = output_adjoint[output_index];
+          const Scalar output =
               LogSumExp(states_, [&](std::size_t middle_state) {
                 return left[parent_state * states_ + middle_state] +
                        middle[middle_state] +
@@ -447,11 +447,11 @@ public:
                 parent_state * states_ + middle_state;
             const std::size_t right_index =
                 middle_state * states_ + child_state;
-            const double term =
+            const Scalar term =
                 left[left_index] + middle[middle_state] + right[right_index];
             if (!std::isfinite(term))
               continue;
-            const double contribution = adjoint * std::exp(term - output);
+            const Scalar contribution = adjoint * std::exp(term - output);
             storage_.reverse_scratch[left_index] += contribution;
             middle_adjoint[middle_state] += contribution;
             right_adjoint[right_index] += contribution;
@@ -467,8 +467,8 @@ public:
   ReverseAbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *node_adjoint = NodeAdjoint(operation.parent);
-      double *branch_adjoint = BranchAdjoint(operation.branch);
+      const Scalar *node_adjoint = NodeAdjoint(operation.parent);
+      Scalar *branch_adjoint = BranchAdjoint(operation.branch);
       for (std::size_t state = 0; state < states_; ++state)
         branch_adjoint[state] += node_adjoint[state];
     }
@@ -478,8 +478,8 @@ public:
   ReverseCombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *destination_adjoint = BranchAdjoint(operation.destination);
-      double *source_adjoint = BranchAdjoint(operation.source);
+      const Scalar *destination_adjoint = BranchAdjoint(operation.destination);
+      Scalar *source_adjoint = BranchAdjoint(operation.source);
       for (std::size_t state = 0; state < states_; ++state)
         source_adjoint[state] += destination_adjoint[state];
     }
@@ -488,16 +488,16 @@ public:
   void ReverseRakes(std::span<const btrc::Rake> operations) {
     for (std::size_t index = operations.size(); index-- > 0;) {
       const auto &operation = operations[index];
-      const double *path =
+      const Scalar *path =
           storage_.rake_paths.data() + operation.branch * matrix_size_;
-      const double *leaf =
+      const Scalar *leaf =
           storage_.rake_leaves.data() + operation.branch * states_;
-      const double *message_adjoint = BranchAdjoint(operation.branch);
-      double *path_adjoint = PathAdjoint(operation.edge);
-      double *leaf_adjoint = NodeAdjoint(operation.leaf);
+      const Scalar *message_adjoint = BranchAdjoint(operation.branch);
+      Scalar *path_adjoint = PathAdjoint(operation.edge);
+      Scalar *leaf_adjoint = NodeAdjoint(operation.leaf);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
-        const double message = LogSumExp(states_, [&](std::size_t child_state) {
+        const Scalar message = LogSumExp(states_, [&](std::size_t child_state) {
           return path[parent_state * states_ + child_state] + leaf[child_state];
         });
         if (!std::isfinite(message))
@@ -505,10 +505,10 @@ public:
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
           const std::size_t path_index = parent_state * states_ + child_state;
-          const double term = path[path_index] + leaf[child_state];
+          const Scalar term = path[path_index] + leaf[child_state];
           if (!std::isfinite(term))
             continue;
-          const double contribution =
+          const Scalar contribution =
               message_adjoint[parent_state] * std::exp(term - message);
           path_adjoint[path_index] += contribution;
           leaf_adjoint[child_state] += contribution;
@@ -523,34 +523,34 @@ public:
   }
 
 private:
-  double *Node(btrc::Index node) {
+  Scalar *Node(btrc::Index node) {
     return storage_.nodes.data() + node * states_;
   }
-  const double *Node(btrc::Index node) const {
+  const Scalar *Node(btrc::Index node) const {
     return storage_.nodes.data() + node * states_;
   }
-  double *Path(btrc::Index edge) {
+  Scalar *Path(btrc::Index edge) {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  const double *Path(btrc::Index edge) const {
+  const Scalar *Path(btrc::Index edge) const {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  double *Branch(btrc::Index branch) {
+  Scalar *Branch(btrc::Index branch) {
     return storage_.branches.data() + branch * states_;
   }
-  double *NodeAdjoint(btrc::Index node) {
+  Scalar *NodeAdjoint(btrc::Index node) {
     return storage_.node_adjoints.data() + node * states_;
   }
-  const double *NodeAdjoint(btrc::Index node) const {
+  const Scalar *NodeAdjoint(btrc::Index node) const {
     return storage_.node_adjoints.data() + node * states_;
   }
-  double *PathAdjoint(btrc::Index edge) {
+  Scalar *PathAdjoint(btrc::Index edge) {
     return storage_.path_adjoints.data() + edge * matrix_size_;
   }
-  double *BranchAdjoint(btrc::Index branch) {
+  Scalar *BranchAdjoint(btrc::Index branch) {
     return storage_.branch_adjoints.data() + branch * states_;
   }
-  const double *BranchAdjoint(btrc::Index branch) const {
+  const Scalar *BranchAdjoint(btrc::Index branch) const {
     return storage_.branch_adjoints.data() + branch * states_;
   }
 
@@ -558,7 +558,7 @@ private:
   std::size_t states_;
   std::size_t matrix_size_;
   Workspace::Impl &storage_;
-  std::span<const double> uniforms_;
+  std::span<const Scalar> uniforms_;
 };
 
 class MaxProductDispatcher {
@@ -575,9 +575,9 @@ public:
 
   void Rake(std::span<const btrc::Rake> operations) {
     for (const btrc::Rake &operation : operations) {
-      const double *path = Path(operation.edge);
-      const double *leaf = Node(operation.leaf);
-      double *message = Branch(operation.branch);
+      const Scalar *path = Path(operation.edge);
+      const Scalar *leaf = Node(operation.leaf);
+      Scalar *message = Branch(operation.branch);
       std::size_t *choices =
           storage_.rake_choices.data() + operation.branch * states_;
       for (std::size_t parent_state = 0; parent_state < states_;
@@ -595,8 +595,8 @@ public:
 
   void CombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (const btrc::BranchCombination &operation : operations) {
-      double *destination = Branch(operation.destination);
-      const double *source = Branch(operation.source);
+      Scalar *destination = Branch(operation.destination);
+      const Scalar *source = Branch(operation.source);
       for (std::size_t state = 0; state < states_; ++state)
         destination[state] += source[state];
     }
@@ -604,8 +604,8 @@ public:
 
   void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (const btrc::BranchAbsorption &operation : operations) {
-      double *node = Node(operation.parent);
-      const double *branch = Branch(operation.branch);
+      Scalar *node = Node(operation.parent);
+      const Scalar *branch = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state)
         node[state] += branch[state];
     }
@@ -613,9 +613,9 @@ public:
 
   void Compress(std::span<const btrc::Compression> operations) {
     for (const btrc::Compression &operation : operations) {
-      double *left = Path(operation.left_edge);
-      const double *middle = Node(operation.middle);
-      const double *right = Path(operation.right_edge);
+      Scalar *left = Path(operation.left_edge);
+      const Scalar *middle = Node(operation.middle);
+      const Scalar *right = Path(operation.right_edge);
       std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
       std::size_t *choices =
           storage_.compression_choices.data() + operation.tape * matrix_size_;
@@ -639,7 +639,7 @@ public:
   }
 
   void FinishRoot() {
-    const double *root = Node(plan_.root());
+    const Scalar *root = Node(plan_.root());
     storage_.assignments[plan_.root()] = Argmax(
         states_, [&](std::size_t state) { return root[state]; },
         &storage_.maximum_log_weight);
@@ -672,19 +672,19 @@ public:
   }
 
 private:
-  double *Node(btrc::Index node) {
+  Scalar *Node(btrc::Index node) {
     return storage_.nodes.data() + node * states_;
   }
-  const double *Node(btrc::Index node) const {
+  const Scalar *Node(btrc::Index node) const {
     return storage_.nodes.data() + node * states_;
   }
-  double *Path(btrc::Index edge) {
+  Scalar *Path(btrc::Index edge) {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  const double *Path(btrc::Index edge) const {
+  const Scalar *Path(btrc::Index edge) const {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  double *Branch(btrc::Index branch) {
+  Scalar *Branch(btrc::Index branch) {
     return storage_.branches.data() + branch * states_;
   }
 
@@ -703,12 +703,12 @@ public:
 
   void Rake(std::span<const btrc::Rake> operations) {
     for (const auto &operation : operations) {
-      const double *path = Path(operation.edge);
-      const double *leaf = Node(operation.leaf);
-      double *message = Branch(operation.branch);
+      const Scalar *path = Path(operation.edge);
+      const Scalar *leaf = Node(operation.leaf);
+      Scalar *message = Branch(operation.branch);
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
-        double value = 0.0;
+        Scalar value = 0.0;
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
           value +=
@@ -724,8 +724,8 @@ public:
 
   void CombineBranches(std::span<const btrc::BranchCombination> operations) {
     for (const auto &operation : operations) {
-      double *destination = Branch(operation.destination);
-      const double *source = Branch(operation.source);
+      Scalar *destination = Branch(operation.destination);
+      const Scalar *source = Branch(operation.source);
       for (std::size_t state = 0; state < states_; ++state)
         destination[state] *= source[state];
       BranchScale(operation.destination) = Normalize(
@@ -736,8 +736,8 @@ public:
 
   void AbsorbBranches(std::span<const btrc::BranchAbsorption> operations) {
     for (const auto &operation : operations) {
-      double *node = Node(operation.parent);
-      const double *branch = Branch(operation.branch);
+      Scalar *node = Node(operation.parent);
+      const Scalar *branch = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state)
         node[state] *= branch[state];
       NodeScale(operation.parent) = Normalize(
@@ -748,15 +748,15 @@ public:
 
   void Compress(std::span<const btrc::Compression> operations) {
     for (const auto &operation : operations) {
-      double *left = Path(operation.left_edge);
-      const double *middle = Node(operation.middle);
-      const double *right = Path(operation.right_edge);
+      Scalar *left = Path(operation.left_edge);
+      const Scalar *middle = Node(operation.middle);
+      const Scalar *right = Path(operation.right_edge);
       std::copy(left, left + matrix_size_, storage_.reverse_scratch.begin());
       for (std::size_t parent_state = 0; parent_state < states_;
            ++parent_state) {
         for (std::size_t child_state = 0; child_state < states_;
              ++child_state) {
-          double value = 0.0;
+          Scalar value = 0.0;
           for (std::size_t middle_state = 0; middle_state < states_;
                ++middle_state) {
             value +=
@@ -775,57 +775,57 @@ public:
     }
   }
 
-  double FinishRoot() const {
-    const double *root = Node(plan_.root());
-    const double sum = std::accumulate(root, root + states_, 0.0);
+  Scalar FinishRoot() const {
+    const Scalar *root = Node(plan_.root());
+    const Scalar sum = std::accumulate(root, root + states_, Scalar{0});
     if (!(sum > 0.0))
-      return -std::numeric_limits<double>::infinity();
+      return -std::numeric_limits<Scalar>::infinity();
     return NodeScale(plan_.root()) + std::log(sum);
   }
 
 private:
-  static double Normalize(double *values, std::size_t size,
-                          double input_scale) {
-    const double maximum = *std::max_element(values, values + size);
+  static Scalar Normalize(Scalar *values, std::size_t size,
+                          Scalar input_scale) {
+    const Scalar maximum = *std::max_element(values, values + size);
     if (!(maximum > 0.0)) {
-      return -std::numeric_limits<double>::infinity();
+      return -std::numeric_limits<Scalar>::infinity();
     }
-    const double inverse = 1.0 / maximum;
+    const Scalar inverse = Scalar{1} / maximum;
     for (std::size_t index = 0; index < size; ++index)
       values[index] *= inverse;
     return input_scale + std::log(maximum);
   }
 
-  double *Node(btrc::Index node) {
+  Scalar *Node(btrc::Index node) {
     return storage_.nodes.data() + node * states_;
   }
-  const double *Node(btrc::Index node) const {
+  const Scalar *Node(btrc::Index node) const {
     return storage_.nodes.data() + node * states_;
   }
-  double *Path(btrc::Index edge) {
+  Scalar *Path(btrc::Index edge) {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  const double *Path(btrc::Index edge) const {
+  const Scalar *Path(btrc::Index edge) const {
     return storage_.paths.data() + edge * matrix_size_;
   }
-  double *Branch(btrc::Index branch) {
+  Scalar *Branch(btrc::Index branch) {
     return storage_.branches.data() + branch * states_;
   }
-  const double *Branch(btrc::Index branch) const {
+  const Scalar *Branch(btrc::Index branch) const {
     return storage_.branches.data() + branch * states_;
   }
-  double &NodeScale(btrc::Index node) { return storage_.node_log_scales[node]; }
-  double NodeScale(btrc::Index node) const {
+  Scalar &NodeScale(btrc::Index node) { return storage_.node_log_scales[node]; }
+  Scalar NodeScale(btrc::Index node) const {
     return storage_.node_log_scales[node];
   }
-  double &PathScale(btrc::Index edge) { return storage_.path_log_scales[edge]; }
-  double PathScale(btrc::Index edge) const {
+  Scalar &PathScale(btrc::Index edge) { return storage_.path_log_scales[edge]; }
+  Scalar PathScale(btrc::Index edge) const {
     return storage_.path_log_scales[edge];
   }
-  double &BranchScale(btrc::Index branch) {
+  Scalar &BranchScale(btrc::Index branch) {
     return storage_.branch_log_scales[branch];
   }
-  double BranchScale(btrc::Index branch) const {
+  Scalar BranchScale(btrc::Index branch) const {
     return storage_.branch_log_scales[branch];
   }
 
@@ -882,14 +882,14 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states) {
   storage.assignments.resize(plan.num_nodes());
 }
 
-double PartitionFunctionPrepared(ModelView model, Workspace &workspace) {
+Scalar PartitionFunctionPrepared(ModelView model, Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
   SumProductDispatcher dispatcher(model.plan, model.states, storage);
   btrc::Contract(model.plan, dispatcher);
   return dispatcher.FinishRoot();
 }
 
-double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace) {
+Scalar LogPartitionFunctionPrepared(ModelView model, Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
   std::fill(storage.node_log_scales.begin(), storage.node_log_scales.end(),
             0.0);
@@ -927,7 +927,7 @@ MaximumAssignmentView MaximumAPosterioriPrepared(ModelView model,
 }
 
 std::span<const std::size_t>
-PosteriorSamplePrepared(ModelView model, std::span<const double> uniforms,
+PosteriorSamplePrepared(ModelView model, std::span<const Scalar> uniforms,
                         Workspace &workspace) {
   Workspace::Impl &storage = Prepare(model, *workspace.impl_);
   LogSumProductDispatcher dispatcher(model.plan, model.states, storage);
@@ -942,8 +942,8 @@ Marginals Materialize(MarginalView view) {
   return {
       .partition = view.partition,
       .log_partition = view.log_partition,
-      .nodes = std::vector<double>(view.nodes.begin(), view.nodes.end()),
-      .edges = std::vector<double>(view.edges.begin(), view.edges.end()),
+      .nodes = std::vector<Scalar>(view.nodes.begin(), view.nodes.end()),
+      .edges = std::vector<Scalar>(view.edges.begin(), view.edges.end()),
   };
 }
 
@@ -956,13 +956,13 @@ MaximumAssignment Materialize(MaximumAssignmentView view) {
   };
 }
 
-double PartitionFunction(ModelView model) {
+Scalar PartitionFunction(ModelView model) {
   Workspace workspace;
   workspace.Reserve(model.plan, model.states);
   return PartitionFunctionPrepared(model, workspace);
 }
 
-double LogPartitionFunction(ModelView model) {
+Scalar LogPartitionFunction(ModelView model) {
   Workspace workspace;
   workspace.Reserve(model.plan, model.states);
   return LogPartitionFunctionPrepared(model, workspace);
@@ -981,7 +981,7 @@ MaximumAssignment MaximumAPosteriori(ModelView model) {
 }
 
 std::vector<std::size_t> PosteriorSample(ModelView model,
-                                         std::span<const double> uniforms) {
+                                         std::span<const Scalar> uniforms) {
   Workspace workspace;
   workspace.Reserve(model.plan, model.states);
   const std::span<const std::size_t> sample =

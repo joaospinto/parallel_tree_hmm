@@ -20,16 +20,17 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 0, 1, 1, 2, 2});
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kBatch = 7;
-  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  std::vector<tree_hmm::Scalar> nodes(kBatch * plan.num_nodes() * kStates);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
       for (std::size_t state = 0; state < kStates; ++state) {
         nodes[(batch * plan.num_nodes() + node) * kStates + state] =
-            0.2f + 0.01f * static_cast<float>(1 + batch + 2 * node + state);
+            0.2f +
+            0.01f * static_cast<tree_hmm::Scalar>(1 + batch + 2 * node + state);
       }
     }
   }
-  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
   for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
@@ -45,12 +46,11 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   if (result.values.size() != kBatch)
     throw std::runtime_error(std::string(name) + " output shape is wrong");
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    std::vector<double> host_nodes(plan.num_nodes() * kStates);
-    std::transform(nodes.begin() + batch * host_nodes.size(),
-                   nodes.begin() + (batch + 1) * host_nodes.size(),
-                   host_nodes.begin(),
-                   [](float value) { return static_cast<double>(value); });
-    std::vector<double> host_edges(edges.begin(), edges.end());
+    std::vector<tree_hmm::Scalar> host_nodes(plan.num_nodes() * kStates);
+    std::copy(nodes.begin() + batch * host_nodes.size(),
+              nodes.begin() + (batch + 1) * host_nodes.size(),
+              host_nodes.begin());
+    std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::PartitionFunction({plan, kStates, host_nodes, host_edges});
     const double actual = result.values[batch];
@@ -70,12 +70,11 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   const tree_hmm::PartitionView staged_result =
       solve(static_cast<tree_hmm::BatchedModelView>(staged));
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    std::vector<double> host_nodes(plan.num_nodes() * kStates);
-    std::transform(nodes.begin() + batch * host_nodes.size(),
-                   nodes.begin() + (batch + 1) * host_nodes.size(),
-                   host_nodes.begin(),
-                   [](float value) { return static_cast<double>(value); });
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    std::vector<tree_hmm::Scalar> host_nodes(plan.num_nodes() * kStates);
+    std::copy(nodes.begin() + batch * host_nodes.size(),
+              nodes.begin() + (batch + 1) * host_nodes.size(),
+              host_nodes.begin());
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::PartitionFunction({plan, kStates, host_nodes, host_edges});
     if (std::abs(staged_result.values[batch] - expected) >
@@ -98,10 +97,10 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
                              " capacity-backed output shape is wrong");
   for (std::size_t batch = 0; batch < kTailBatch; ++batch) {
     const std::size_t node_values = plan.num_nodes() * kStates;
-    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
-                                         nodes.begin() +
-                                             (batch + 1) * node_values);
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_nodes(
+        nodes.begin() + batch * node_values,
+        nodes.begin() + (batch + 1) * node_values);
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::LogPartitionFunction({plan, kStates, host_nodes, host_edges});
     if (std::abs(tail_result.values[batch] - expected) >
@@ -115,12 +114,11 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   const tree_hmm::PartitionView log_result = solve_log(
       tree_hmm::BatchedModelView{plan, kStates, kBatch, nodes, edges});
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    std::vector<double> host_nodes(plan.num_nodes() * kStates);
-    std::transform(nodes.begin() + batch * host_nodes.size(),
-                   nodes.begin() + (batch + 1) * host_nodes.size(),
-                   host_nodes.begin(),
-                   [](float value) { return static_cast<double>(value); });
-    std::vector<double> host_edges(edges.begin(), edges.end());
+    std::vector<tree_hmm::Scalar> host_nodes(plan.num_nodes() * kStates);
+    std::copy(nodes.begin() + batch * host_nodes.size(),
+              nodes.begin() + (batch + 1) * host_nodes.size(),
+              host_nodes.begin());
+    std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::LogPartitionFunction({plan, kStates, host_nodes, host_edges});
     const double actual = log_result.values[batch];
@@ -138,17 +136,19 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   const btrc::Plan chain_plan =
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 2, 3, 4, 5});
   constexpr std::size_t kChainBatch = 5;
-  std::vector<float> chain_nodes(kChainBatch * chain_plan.num_nodes() *
-                                 kStates);
+  std::vector<tree_hmm::Scalar> chain_nodes(kChainBatch *
+                                            chain_plan.num_nodes() * kStates);
   for (std::size_t index = 0; index < chain_nodes.size(); ++index)
-    chain_nodes[index] = 0.15f + 0.007f * static_cast<float>(index % 17);
-  std::vector<float> chain_edges(chain_plan.num_edges() * kStates * kStates);
+    chain_nodes[index] =
+        0.15f + 0.007f * static_cast<tree_hmm::Scalar>(index % 17);
+  std::vector<tree_hmm::Scalar> chain_edges(chain_plan.num_edges() * kStates *
+                                            kStates);
   for (std::size_t edge = 0; edge < chain_plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
         chain_edges[(edge * kStates + parent) * kStates + child] =
-            0.02f +
-            0.01f * static_cast<float>(1 + edge + 2 * parent + 3 * child);
+            0.02f + 0.01f * static_cast<tree_hmm::Scalar>(
+                                1 + edge + 2 * parent + 3 * child);
       }
     }
   }
@@ -158,11 +158,11 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
                                            chain_nodes, chain_edges});
   for (std::size_t batch = 0; batch < kChainBatch; ++batch) {
     const std::size_t node_values = chain_plan.num_nodes() * kStates;
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         chain_nodes.begin() + batch * node_values,
         chain_nodes.begin() + (batch + 1) * node_values);
-    const std::vector<double> host_edges(chain_edges.begin(),
-                                         chain_edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(chain_edges.begin(),
+                                                   chain_edges.end());
     const double expected = tree_hmm::LogPartitionFunction(
         {chain_plan, kStates, host_nodes, host_edges});
     const double actual = chain_result.values[batch];
@@ -179,8 +179,8 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   for (std::size_t node = 1; node < kLongNodes; ++node)
     long_parents[node] = static_cast<std::int64_t>(node - 1);
   const btrc::Plan long_plan = btrc::MakePlan(long_parents);
-  const std::vector<float> long_nodes(kLongNodes, 0.5f);
-  const std::vector<float> long_edges(kLongNodes - 1, 1.0f);
+  const std::vector<tree_hmm::Scalar> long_nodes(kLongNodes, 0.5f);
+  const std::vector<tree_hmm::Scalar> long_edges(kLongNodes - 1, 1.0f);
   reserve(long_plan, 1, 1);
   const tree_hmm::PartitionView long_result = solve_log(
       tree_hmm::BatchedModelView{long_plan, 1, 1, long_nodes, long_edges});
@@ -196,25 +196,27 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
   constexpr std::size_t kGenericBatch = 2;
   const btrc::Plan generic_plan =
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 2, 3});
-  std::vector<float> generic_nodes(kGenericBatch * generic_plan.num_nodes() *
-                                   kGenericStates);
+  std::vector<tree_hmm::Scalar> generic_nodes(
+      kGenericBatch * generic_plan.num_nodes() * kGenericStates);
   for (std::size_t index = 0; index < generic_nodes.size(); ++index)
-    generic_nodes[index] = 0.1f + 0.003f * static_cast<float>(index % 23);
-  std::vector<float> generic_edges(generic_plan.num_edges() * kGenericStates *
-                                   kGenericStates);
+    generic_nodes[index] =
+        0.1f + 0.003f * static_cast<tree_hmm::Scalar>(index % 23);
+  std::vector<tree_hmm::Scalar> generic_edges(generic_plan.num_edges() *
+                                              kGenericStates * kGenericStates);
   for (std::size_t index = 0; index < generic_edges.size(); ++index)
-    generic_edges[index] = 0.02f + 0.001f * static_cast<float>(index % 31);
+    generic_edges[index] =
+        0.02f + 0.001f * static_cast<tree_hmm::Scalar>(index % 31);
   reserve(generic_plan, kGenericStates, kGenericBatch);
   const tree_hmm::PartitionView generic_result =
       solve_log({generic_plan, kGenericStates, kGenericBatch, generic_nodes,
                  generic_edges});
   for (std::size_t batch = 0; batch < kGenericBatch; ++batch) {
     const std::size_t node_values = generic_plan.num_nodes() * kGenericStates;
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         generic_nodes.begin() + batch * node_values,
         generic_nodes.begin() + (batch + 1) * node_values);
-    const std::vector<double> host_edges(generic_edges.begin(),
-                                         generic_edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(generic_edges.begin(),
+                                                   generic_edges.end());
     const double expected = tree_hmm::LogPartitionFunction(
         {generic_plan, kGenericStates, host_nodes, host_edges});
     const double actual = generic_result.values[batch];
@@ -238,21 +240,26 @@ void TestAccelerator(const char *name, bool available, Reserve reserve,
     throw std::runtime_error(std::string(name) +
                              " wide-star plan is not multi-stage");
   }
-  std::vector<float> wide_nodes(kWideBatch * kWideNodes * kWideStates);
+  std::vector<tree_hmm::Scalar> wide_nodes(kWideBatch * kWideNodes *
+                                           kWideStates);
   for (std::size_t index = 0; index < wide_nodes.size(); ++index)
-    wide_nodes[index] = 0.14f + 0.006f * static_cast<float>(index % 19);
-  std::vector<float> wide_edges(kWideLeaves * kWideStates * kWideStates);
+    wide_nodes[index] =
+        0.14f + 0.006f * static_cast<tree_hmm::Scalar>(index % 19);
+  std::vector<tree_hmm::Scalar> wide_edges(kWideLeaves * kWideStates *
+                                           kWideStates);
   for (std::size_t index = 0; index < wide_edges.size(); ++index)
-    wide_edges[index] = 0.03f + 0.004f * static_cast<float>(index % 23);
+    wide_edges[index] =
+        0.03f + 0.004f * static_cast<tree_hmm::Scalar>(index % 23);
   reserve(wide_plan, kWideStates, kWideBatch);
-  const tree_hmm::PartitionView wide_result = solve_log(
-      {wide_plan, kWideStates, kWideBatch, wide_nodes, wide_edges});
+  const tree_hmm::PartitionView wide_result =
+      solve_log({wide_plan, kWideStates, kWideBatch, wide_nodes, wide_edges});
   for (std::size_t batch = 0; batch < kWideBatch; ++batch) {
     const std::size_t node_values = kWideNodes * kWideStates;
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         wide_nodes.begin() + batch * node_values,
         wide_nodes.begin() + (batch + 1) * node_values);
-    const std::vector<double> host_edges(wide_edges.begin(), wide_edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(wide_edges.begin(),
+                                                   wide_edges.end());
     const double expected = tree_hmm::LogPartitionFunction(
         {wide_plan, kWideStates, host_nodes, host_edges});
     const double actual = wide_result.values[batch];
@@ -283,8 +290,8 @@ void TestCategoricalAccelerator(const char *name, bool available,
   constexpr std::size_t kBatch = 7;
   constexpr std::size_t kCategories = 6;
   const std::vector<btrc::Index> observation_nodes{2, 3, 6, 7};
-  const std::vector<float> root_potential{0.1f, 0.2f, 0.3f, 0.4f};
-  const std::vector<float> emissions{
+  const std::vector<tree_hmm::Scalar> root_potential{0.1f, 0.2f, 0.3f, 0.4f};
+  const std::vector<tree_hmm::Scalar> emissions{
       1.0f, 1.0f, 1.0f, 1.0f, // unobserved
       1.0f, 0.0f, 0.0f, 0.0f, // state 0
       0.0f, 1.0f, 0.0f, 0.0f, // state 1
@@ -300,7 +307,7 @@ void TestCategoricalAccelerator(const char *name, bool available,
           static_cast<std::uint8_t>((batch + 2 * observation) % kCategories);
     }
   }
-  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
   for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
@@ -321,11 +328,12 @@ void TestCategoricalAccelerator(const char *name, bool available,
   std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
   const tree_hmm::PartitionView result =
       solve_log(static_cast<tree_hmm::BatchedCategoricalModelView>(staged));
-  const std::vector<float> log_values(result.values.begin(),
-                                      result.values.end());
+  const std::vector<tree_hmm::Scalar> log_values(result.values.begin(),
+                                                 result.values.end());
   const tree_hmm::BatchedMaximumAssignmentView maximum =
       solve_maximum(static_cast<tree_hmm::BatchedCategoricalModelView>(staged));
-  std::vector<float> dense_nodes(kBatch * plan.num_nodes() * kStates, 1.0f);
+  std::vector<tree_hmm::Scalar> dense_nodes(kBatch * plan.num_nodes() * kStates,
+                                            1.0f);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     std::copy(root_potential.begin(), root_potential.end(),
               dense_nodes.begin() + batch * plan.num_nodes() * kStates);
@@ -344,7 +352,7 @@ void TestCategoricalAccelerator(const char *name, bool available,
   const tree_hmm::PartitionView dense =
       solve_dense({plan, kStates, kBatch, dense_nodes, edges});
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
+    std::vector<tree_hmm::Scalar> nodes(plan.num_nodes() * kStates, 1.0);
     std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
     for (std::size_t observation = 0; observation < observation_nodes.size();
          ++observation) {
@@ -355,7 +363,7 @@ void TestCategoricalAccelerator(const char *name, bool available,
             emissions[category * kStates + state];
       }
     }
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const double expected =
         tree_hmm::LogPartitionFunction({plan, kStates, nodes, host_edges});
     const double actual = log_values[batch];
@@ -419,14 +427,15 @@ void TestCategoricalAccelerator(const char *name, bool available,
             sampling_staged.emission_potentials.begin());
   std::copy(edges.begin(), edges.end(),
             sampling_staged.edge_potentials.begin());
-  std::span<float> staged_uniforms = uniforms(kBatch);
+  std::span<tree_hmm::Scalar> staged_uniforms = uniforms(kBatch);
   for (std::size_t index = 0; index < staged_uniforms.size(); ++index)
-    staged_uniforms[index] = 0.13f + 0.12f * static_cast<float>(index % 7);
+    staged_uniforms[index] =
+        0.13f + 0.12f * static_cast<tree_hmm::Scalar>(index % 7);
   const tree_hmm::BatchedPosteriorSampleView samples = solve_sampling(
       static_cast<tree_hmm::BatchedCategoricalModelView>(sampling_staged),
       staged_uniforms);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    std::vector<double> nodes(plan.num_nodes() * kStates, 1.0);
+    std::vector<tree_hmm::Scalar> nodes(plan.num_nodes() * kStates, 1.0);
     std::copy(root_potential.begin(), root_potential.end(), nodes.begin());
     for (std::size_t observation = 0; observation < observation_nodes.size();
          ++observation) {
@@ -437,11 +446,11 @@ void TestCategoricalAccelerator(const char *name, bool available,
             emissions[category * kStates + state];
       }
     }
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const std::size_t offset = batch * plan.num_nodes();
-    const std::vector<double> host_uniforms(staged_uniforms.begin() + offset,
-                                            staged_uniforms.begin() + offset +
-                                                plan.num_nodes());
+    const std::vector<tree_hmm::Scalar> host_uniforms(
+        staged_uniforms.begin() + offset,
+        staged_uniforms.begin() + offset + plan.num_nodes());
     const std::vector<std::size_t> expected = tree_hmm::PosteriorSample(
         {plan, kStates, nodes, host_edges}, host_uniforms);
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
@@ -474,14 +483,15 @@ void TestCategoricalAccelerator(const char *name, bool available,
                              " categorical marginal shape is wrong");
   }
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    const std::vector<double> nodes(
+    const std::vector<tree_hmm::Scalar> nodes(
         dense_nodes.begin() + batch * nodes_per_batch,
         dense_nodes.begin() + (batch + 1) * nodes_per_batch);
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const tree_hmm::Marginals expected =
         tree_hmm::PosteriorMarginals({plan, kStates, nodes, host_edges});
     if (std::abs(marginals.log_partitions[batch] - expected.log_partition) >
-        1e-4 * std::max(1.0, std::abs(expected.log_partition))) {
+        1e-4 * std::max(1.0, std::abs(static_cast<double>(
+                                 expected.log_partition)))) {
       throw std::runtime_error(
           std::string(name) +
           " categorical marginal log partition disagrees with CPU");
@@ -514,23 +524,23 @@ void TestMaximumAccelerator(const char *name, bool available, Reserve reserve,
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kBatch = 5;
-  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  std::vector<tree_hmm::Scalar> nodes(kBatch * plan.num_nodes() * kStates);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
       for (std::size_t state = 0; state < kStates; ++state) {
         nodes[(batch * plan.num_nodes() + node) * kStates + state] =
-            0.11f +
-            0.013f * static_cast<float>(1 + 3 * batch + 5 * node + state);
+            0.11f + 0.013f * static_cast<tree_hmm::Scalar>(1 + 3 * batch +
+                                                           5 * node + state);
       }
     }
   }
-  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
   for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
         edges[(edge * kStates + parent) * kStates + child] =
-            0.03f +
-            0.007f * static_cast<float>(1 + edge + 2 * parent + 3 * child);
+            0.03f + 0.007f * static_cast<tree_hmm::Scalar>(
+                                 1 + edge + 2 * parent + 3 * child);
       }
     }
   }
@@ -547,10 +557,10 @@ void TestMaximumAccelerator(const char *name, bool available, Reserve reserve,
   }
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     const std::size_t node_values = plan.num_nodes() * kStates;
-    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
-                                         nodes.begin() +
-                                             (batch + 1) * node_values);
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_nodes(
+        nodes.begin() + batch * node_values,
+        nodes.begin() + (batch + 1) * node_values);
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const tree_hmm::MaximumAssignment expected =
         tree_hmm::MaximumAPosteriori({plan, kStates, host_nodes, host_edges});
     if (std::abs(actual.log_weights[batch] - expected.log_weight) > 2e-5) {
@@ -576,35 +586,35 @@ void TestSamplingAccelerator(const char *name, bool available, Reserve reserve,
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kBatch = 5;
-  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  std::vector<tree_hmm::Scalar> nodes(kBatch * plan.num_nodes() * kStates);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
       for (std::size_t state = 0; state < kStates; ++state) {
         nodes[(batch * plan.num_nodes() + node) * kStates + state] =
-            0.2f +
-            0.01f * static_cast<float>(1 + 2 * batch + 3 * node + 5 * state);
+            0.2f + 0.01f * static_cast<tree_hmm::Scalar>(1 + 2 * batch +
+                                                         3 * node + 5 * state);
       }
     }
   }
-  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
   for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
         edges[(edge * kStates + parent) * kStates + child] =
-            0.1f +
-            0.015f * static_cast<float>(1 + edge + 2 * parent + 4 * child);
+            0.1f + 0.015f * static_cast<tree_hmm::Scalar>(
+                                1 + edge + 2 * parent + 4 * child);
       }
     }
   }
-  std::vector<float> variates(kBatch * plan.num_nodes());
+  std::vector<tree_hmm::Scalar> variates(kBatch * plan.num_nodes());
   for (std::size_t index = 0; index < variates.size(); ++index)
-    variates[index] = 0.07f + 0.11f * static_cast<float>(index % 8);
+    variates[index] = 0.07f + 0.11f * static_cast<tree_hmm::Scalar>(index % 8);
 
   reserve(plan, kStates, kBatch);
   tree_hmm::MutableBatchedModelView staged = inputs(kBatch);
   std::copy(nodes.begin(), nodes.end(), staged.node_potentials.begin());
   std::copy(edges.begin(), edges.end(), staged.edge_potentials.begin());
-  std::span<float> staged_uniforms = uniforms(kBatch);
+  std::span<tree_hmm::Scalar> staged_uniforms = uniforms(kBatch);
   std::copy(variates.begin(), variates.end(), staged_uniforms.begin());
   const tree_hmm::BatchedPosteriorSampleView actual =
       solve(static_cast<tree_hmm::BatchedModelView>(staged), staged_uniforms);
@@ -614,14 +624,14 @@ void TestSamplingAccelerator(const char *name, bool available, Reserve reserve,
   }
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     const std::size_t node_values = plan.num_nodes() * kStates;
-    const std::vector<double> host_nodes(nodes.begin() + batch * node_values,
-                                         nodes.begin() +
-                                             (batch + 1) * node_values);
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_nodes(
+        nodes.begin() + batch * node_values,
+        nodes.begin() + (batch + 1) * node_values);
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const std::size_t uniform_offset = batch * plan.num_nodes();
-    const std::vector<double> host_uniforms(variates.begin() + uniform_offset,
-                                            variates.begin() + uniform_offset +
-                                                plan.num_nodes());
+    const std::vector<tree_hmm::Scalar> host_uniforms(
+        variates.begin() + uniform_offset,
+        variates.begin() + uniform_offset + plan.num_nodes());
     const std::vector<std::size_t> expected = tree_hmm::PosteriorSample(
         {plan, kStates, host_nodes, host_edges}, host_uniforms);
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
@@ -654,7 +664,7 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
       btrc::MakePlan(std::vector<std::int64_t>{-1, 0, 1, 1, 0, 4, 5, 5});
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kBatch = 5;
-  std::vector<float> nodes(kBatch * plan.num_nodes() * kStates);
+  std::vector<tree_hmm::Scalar> nodes(kBatch * plan.num_nodes() * kStates);
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
       for (std::size_t state = 0; state < kStates; ++state) {
@@ -663,12 +673,12 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
         nodes[index] =
             (batch + 2 * node + 3 * state) % 13 == 0
                 ? 0.0f
-                : 0.17f + 0.011f * static_cast<float>(1 + batch + 2 * node +
-                                                      5 * state);
+                : 0.17f + 0.011f * static_cast<tree_hmm::Scalar>(
+                                       1 + batch + 2 * node + 5 * state);
       }
     }
   }
-  std::vector<float> edges(plan.num_edges() * kStates * kStates);
+  std::vector<tree_hmm::Scalar> edges(plan.num_edges() * kStates * kStates);
   for (std::size_t edge = 0; edge < plan.num_edges(); ++edge) {
     for (std::size_t parent = 0; parent < kStates; ++parent) {
       for (std::size_t child = 0; child < kStates; ++child) {
@@ -676,8 +686,8 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
         edges[index] =
             (edge + 3 * parent + 5 * child) % 17 == 0
                 ? 0.0f
-                : 0.09f + 0.008f *
-                              static_cast<float>(1 + edge + parent + 2 * child);
+                : 0.09f + 0.008f * static_cast<tree_hmm::Scalar>(
+                                       1 + edge + parent + 2 * child);
       }
     }
   }
@@ -697,14 +707,15 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
                              " marginal output shape is wrong");
   }
   for (std::size_t batch = 0; batch < kBatch; ++batch) {
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         nodes.begin() + batch * nodes_per_batch,
         nodes.begin() + (batch + 1) * nodes_per_batch);
-    const std::vector<double> host_edges(edges.begin(), edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
     const tree_hmm::Marginals expected =
         tree_hmm::PosteriorMarginals({plan, kStates, host_nodes, host_edges});
     if (std::abs(actual.log_partitions[batch] - expected.log_partition) >
-        1e-4 * std::max(1.0, std::abs(expected.log_partition))) {
+        1e-4 * std::max(1.0, std::abs(static_cast<double>(
+                                 expected.log_partition)))) {
       throw std::runtime_error(std::string(name) +
                                " marginal log partition disagrees with CPU");
     }
@@ -723,7 +734,7 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
       }
     }
     for (std::size_t node = 0; node < plan.num_nodes(); ++node) {
-      float total = 0.0f;
+      tree_hmm::Scalar total = 0.0f;
       for (std::size_t state = 0; state < kStates; ++state) {
         total +=
             actual.nodes[(batch * plan.num_nodes() + node) * kStates + state];
@@ -738,9 +749,9 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
   const btrc::Plan root_plan = btrc::MakePlan(std::vector<std::int64_t>{-1});
   constexpr std::size_t kRootBatch = 3;
   constexpr std::size_t kRootStates = 3;
-  const std::vector<float> root_nodes{0.2f, 0.3f, 0.5f, 0.1f, 0.0f,
-                                      0.9f, 0.4f, 0.4f, 0.2f};
-  const std::vector<double> root_edges;
+  const std::vector<tree_hmm::Scalar> root_nodes{0.2f, 0.3f, 0.5f, 0.1f, 0.0f,
+                                                 0.9f, 0.4f, 0.4f, 0.2f};
+  const std::vector<tree_hmm::Scalar> root_edges;
   reserve(root_plan, kRootStates, kRootBatch);
   tree_hmm::MutableBatchedModelView root_staged = inputs(kRootBatch);
   std::copy(root_nodes.begin(), root_nodes.end(),
@@ -748,7 +759,7 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
   const tree_hmm::BatchedMarginalView root_result =
       solve(static_cast<tree_hmm::BatchedModelView>(root_staged));
   for (std::size_t batch = 0; batch < kRootBatch; ++batch) {
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         root_nodes.begin() + batch * kRootStates,
         root_nodes.begin() + (batch + 1) * kRootStates);
     const tree_hmm::Marginals expected = tree_hmm::PosteriorMarginals(
@@ -771,16 +782,19 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
   std::vector<std::int64_t> wide_parents(kWideNodes, 0);
   wide_parents[0] = -1;
   const btrc::Plan wide_plan = btrc::MakePlan(wide_parents);
-  std::vector<float> wide_nodes(kWideBatch * kWideNodes * kWideStates);
+  std::vector<tree_hmm::Scalar> wide_nodes(kWideBatch * kWideNodes *
+                                           kWideStates);
   for (std::size_t index = 0; index < wide_nodes.size(); ++index) {
     wide_nodes[index] =
         index % 29 == 0
             ? 0.0f
-            : 0.16f + 0.005f * static_cast<float>(index % 17);
+            : 0.16f + 0.005f * static_cast<tree_hmm::Scalar>(index % 17);
   }
-  std::vector<float> wide_edges(kWideLeaves * kWideStates * kWideStates);
+  std::vector<tree_hmm::Scalar> wide_edges(kWideLeaves * kWideStates *
+                                           kWideStates);
   for (std::size_t index = 0; index < wide_edges.size(); ++index)
-    wide_edges[index] = 0.04f + 0.003f * static_cast<float>(index % 31);
+    wide_edges[index] =
+        0.04f + 0.003f * static_cast<tree_hmm::Scalar>(index % 31);
   reserve(wide_plan, kWideStates, kWideBatch);
   tree_hmm::MutableBatchedModelView wide_staged = inputs(kWideBatch);
   std::copy(wide_nodes.begin(), wide_nodes.end(),
@@ -790,13 +804,13 @@ void TestMarginalAccelerator(const char *name, bool available, Reserve reserve,
   const tree_hmm::BatchedMarginalView wide_actual =
       solve(static_cast<tree_hmm::BatchedModelView>(wide_staged));
   const std::size_t wide_node_values = kWideNodes * kWideStates;
-  const std::size_t wide_edge_values =
-      kWideLeaves * kWideStates * kWideStates;
+  const std::size_t wide_edge_values = kWideLeaves * kWideStates * kWideStates;
   for (std::size_t batch = 0; batch < kWideBatch; ++batch) {
-    const std::vector<double> host_nodes(
+    const std::vector<tree_hmm::Scalar> host_nodes(
         wide_nodes.begin() + batch * wide_node_values,
         wide_nodes.begin() + (batch + 1) * wide_node_values);
-    const std::vector<double> host_edges(wide_edges.begin(), wide_edges.end());
+    const std::vector<tree_hmm::Scalar> host_edges(wide_edges.begin(),
+                                                   wide_edges.end());
     const tree_hmm::Marginals expected = tree_hmm::PosteriorMarginals(
         {wide_plan, kWideStates, host_nodes, host_edges});
     for (std::size_t index = 0; index < wide_node_values; ++index) {

@@ -209,15 +209,13 @@ __device__ std::size_t CompressionVectorTapeIndex(const Params &params,
 }
 
 __device__ std::size_t NodeMarginalIndex(const Params &params,
-                                         std::size_t batch,
-                                         std::size_t node,
+                                         std::size_t batch, std::size_t node,
                                          std::size_t state) {
   return (batch * params.nodes + node) * params.states + state;
 }
 
 __device__ std::size_t EdgeMarginalIndex(const Params &params,
-                                         std::size_t batch,
-                                         std::size_t edge,
+                                         std::size_t batch, std::size_t edge,
                                          std::size_t parent_state,
                                          std::size_t child_state) {
   return ((batch * params.edges + edge) * params.states + parent_state) *
@@ -225,16 +223,16 @@ __device__ std::size_t EdgeMarginalIndex(const Params &params,
          child_state;
 }
 
-__device__ std::uint32_t SampleContiguous(const float *weights,
-                                          std::uint32_t states, float uniform) {
-  float total = 0.0f;
+__device__ std::uint32_t
+SampleContiguous(const Scalar *weights, std::uint32_t states, Scalar uniform) {
+  Scalar total = 0.0f;
   for (std::uint32_t state = 0; state < states; ++state)
     total += weights[state];
-  const float threshold = uniform * total;
-  float cumulative = 0.0f;
+  const Scalar threshold = uniform * total;
+  Scalar cumulative = 0.0f;
   std::uint32_t fallback = 0;
   for (std::uint32_t state = 0; state < states; ++state) {
-    const float value = weights[state];
+    const Scalar value = weights[state];
     if (value > 0.0f)
       fallback = state;
     cumulative += value;
@@ -244,17 +242,17 @@ __device__ std::uint32_t SampleContiguous(const float *weights,
   return fallback;
 }
 
-__device__ float LogProduct(float left, float right) {
-  return left > 0.0f && right > 0.0f ? logf(left) + logf(right) : -INFINITY;
+__device__ Scalar LogProduct(Scalar left, Scalar right) {
+  return left > 0.0f && right > 0.0f ? log(left) + log(right) : -INFINITY;
 }
 
-__device__ float LogProduct(float left, float middle, float right) {
+__device__ Scalar LogProduct(Scalar left, Scalar middle, Scalar right) {
   return left > 0.0f && middle > 0.0f && right > 0.0f
-             ? logf(left) + logf(middle) + logf(right)
+             ? log(left) + log(middle) + log(right)
              : -INFINITY;
 }
 
-__device__ bool Finite(float value) {
+__device__ bool Finite(Scalar value) {
   return value > -INFINITY && value < INFINITY;
 }
 
@@ -263,9 +261,9 @@ __device__ bool Finite(float value) {
 constexpr std::size_t kTransposeTile = 32;
 constexpr std::size_t kTransposeRows = 8;
 
-__global__ void InitializeNodes(const float *input, float *nodes,
+__global__ void InitializeNodes(const Scalar *input, Scalar *nodes,
                                 Params params) {
-  __shared__ float tile[kTransposeTile][kTransposeTile + 1];
+  __shared__ Scalar tile[kTransposeTile][kTransposeTile + 1];
   const std::size_t node = blockIdx.x * kTransposeTile + threadIdx.x;
   const std::size_t batch_base = blockIdx.y * kTransposeTile;
   for (std::size_t state = 0; state < params.states; ++state) {
@@ -293,9 +291,9 @@ __global__ void InitializeNodes(const float *input, float *nodes,
 }
 
 __global__ void
-InitializeCategoricalBase(const float *root_potential,
+InitializeCategoricalBase(const Scalar *root_potential,
                           const btrc::Index *observation_index_by_node,
-                          float *nodes, Params params) {
+                          Scalar *nodes, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.nodes) * params.batch;
@@ -314,8 +312,9 @@ InitializeCategoricalBase(const float *root_potential,
 
 __global__ void ApplyCategoricalObservations(
     const std::uint8_t *observations, const btrc::Index *observation_nodes,
-    const float *root_potential, const float *emission_potentials, float *nodes,
-    Params params, std::uint32_t observation_count, std::uint32_t categories) {
+    const Scalar *root_potential, const Scalar *emission_potentials,
+    Scalar *nodes, Params params, std::uint32_t observation_count,
+    std::uint32_t categories) {
   __shared__ std::uint8_t tile[kTransposeTile][kTransposeTile + 1];
   const std::size_t observation = blockIdx.x * kTransposeTile + threadIdx.x;
   const std::size_t batch_base = blockIdx.y * kTransposeTile;
@@ -337,7 +336,7 @@ __global__ void ApplyCategoricalObservations(
     const std::uint8_t category = tile[threadIdx.x][row];
     const btrc::Index node = observation_nodes[output_observation];
     for (std::size_t state = 0; state < params.states; ++state) {
-      const float emission =
+      const Scalar emission =
           category < categories
               ? emission_potentials[static_cast<std::size_t>(category) *
                                         params.states +
@@ -349,7 +348,7 @@ __global__ void ApplyCategoricalObservations(
   }
 }
 
-__global__ void InitializePaths(const float *input, float *paths,
+__global__ void InitializePaths(const Scalar *input, Scalar *paths,
                                 Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t path_batches = params.paths_batched ? params.batch : 1;
@@ -367,16 +366,16 @@ __global__ void InitializePaths(const float *input, float *paths,
     paths[output + entry] = input[source + entry];
 }
 
-__global__ void TakeLogs(float *values, std::size_t count) {
+__global__ void TakeLogs(Scalar *values, std::size_t count) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   if (index < count)
-    values[index] = values[index] > 0.0f ? logf(values[index]) : -INFINITY;
+    values[index] = values[index] > 0.0f ? log(values[index]) : -INFINITY;
 }
 
-__global__ void LogRake(const btrc::Rake *operations, const float *nodes,
-                        const float *paths, float *branches,
-                        float *path_tape, float *leaf_tape,
-                        float *message_tape, Params params) {
+__global__ void LogRake(const btrc::Rake *operations, const Scalar *nodes,
+                        const Scalar *paths, Scalar *branches,
+                        Scalar *path_tape, Scalar *leaf_tape,
+                        Scalar *message_tape, Params params) {
   const std::size_t parent_state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -390,30 +389,28 @@ __global__ void LogRake(const btrc::Rake *operations, const float *nodes,
       nodes[node_base + parent_state];
   for (std::size_t child_state = 0; child_state < params.states;
        ++child_state) {
-    path_tape[RakePathTapeIndex(
-        params, batch, operation.branch,
-        parent_state * params.states + child_state)] =
+    path_tape[RakePathTapeIndex(params, batch, operation.branch,
+                                parent_state * params.states + child_state)] =
         paths[path_base + parent_state * params.states + child_state];
   }
 
-  float maximum = -INFINITY;
+  Scalar maximum = -INFINITY;
   for (std::size_t child_state = 0; child_state < params.states;
        ++child_state) {
-    maximum = fmaxf(
-        maximum,
-        paths[path_base + parent_state * params.states + child_state] +
-            nodes[node_base + child_state]);
+    maximum = fmax(
+        maximum, paths[path_base + parent_state * params.states + child_state] +
+                     nodes[node_base + child_state]);
   }
-  float message = maximum;
+  Scalar message = maximum;
   if (Finite(maximum)) {
-    float total = 0.0f;
+    Scalar total = 0.0f;
     for (std::size_t child_state = 0; child_state < params.states;
          ++child_state) {
-      total += expf(paths[path_base + parent_state * params.states +
-                                child_state] +
-                    nodes[node_base + child_state] - maximum);
+      total +=
+          exp(paths[path_base + parent_state * params.states + child_state] +
+              nodes[node_base + child_state] - maximum);
     }
-    message += logf(total);
+    message += log(total);
   }
   branches[BranchIndex(params, batch, operation.branch, parent_state)] =
       message;
@@ -422,16 +419,16 @@ __global__ void LogRake(const btrc::Rake *operations, const float *nodes,
 }
 
 __global__ void LogCompress(const btrc::Compression *operations,
-                            const float *nodes, float *paths,
-                            float *left_tape, float *middle_tape,
-                            float *right_tape, float *output_tape,
+                            const Scalar *nodes, Scalar *paths,
+                            Scalar *left_tape, Scalar *middle_tape,
+                            Scalar *right_tape, Scalar *output_tape,
                             Params params) {
-  extern __shared__ float storage[];
+  extern __shared__ Scalar storage[];
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  float *left = storage;
-  float *right = left + matrix;
-  float *middle = right + matrix;
+  Scalar *left = storage;
+  Scalar *right = left + matrix;
+  Scalar *middle = right + matrix;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const std::size_t entry = threadIdx.x;
@@ -442,8 +439,8 @@ __global__ void LogCompress(const btrc::Compression *operations,
   if (entry < matrix) {
     const std::size_t parent_state = entry / params.states;
     const std::size_t child_state = entry % params.states;
-    const std::size_t tape_index = CompressionMatrixTapeIndex(
-        params, batch, operation.tape, entry);
+    const std::size_t tape_index =
+        CompressionMatrixTapeIndex(params, batch, operation.tape, entry);
     left[entry] = paths[PathIndex(params, batch, operation.left_edge,
                                   parent_state, child_state)];
     right[entry] = paths[PathIndex(params, batch, operation.right_edge,
@@ -462,25 +459,24 @@ __global__ void LogCompress(const btrc::Compression *operations,
 
   const std::size_t parent_state = entry / params.states;
   const std::size_t child_state = entry % params.states;
-  float maximum = -INFINITY;
+  Scalar maximum = -INFINITY;
   for (std::size_t middle_state = 0; middle_state < params.states;
        ++middle_state) {
-    maximum = fmaxf(maximum,
-                    left[parent_state * params.states + middle_state] +
-                        middle[middle_state] +
-                        right[middle_state * params.states + child_state]);
+    maximum =
+        fmax(maximum, left[parent_state * params.states + middle_state] +
+                          middle[middle_state] +
+                          right[middle_state * params.states + child_state]);
   }
-  float output = maximum;
+  Scalar output = maximum;
   if (Finite(maximum)) {
-    float total = 0.0f;
+    Scalar total = 0.0f;
     for (std::size_t middle_state = 0; middle_state < params.states;
          ++middle_state) {
-      total += expf(left[parent_state * params.states + middle_state] +
-                    middle[middle_state] +
-                    right[middle_state * params.states + child_state] -
-                    maximum);
+      total += exp(left[parent_state * params.states + middle_state] +
+                   middle[middle_state] +
+                   right[middle_state * params.states + child_state] - maximum);
     }
-    output += logf(total);
+    output += log(total);
   }
   paths[PathIndex(params, batch, operation.left_edge, parent_state,
                   child_state)] = output;
@@ -488,39 +484,40 @@ __global__ void LogCompress(const btrc::Compression *operations,
                                          entry)] = output;
 }
 
-__global__ void FinishLogRootAndSeedMarginals(const float *nodes,
-                                               float *log_partitions,
-                                               float *node_marginals,
-                                               Params params) {
+__global__ void FinishLogRootAndSeedMarginals(const Scalar *nodes,
+                                              Scalar *log_partitions,
+                                              Scalar *node_marginals,
+                                              Params params) {
   const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
   if (batch >= params.batch)
     return;
   const std::size_t root_base = NodeIndex(params, batch, params.root, 0);
-  float maximum = -INFINITY;
+  Scalar maximum = -INFINITY;
   for (std::size_t state = 0; state < params.states; ++state)
-    maximum = fmaxf(maximum, nodes[root_base + state]);
-  float log_partition = maximum;
+    maximum = fmax(maximum, nodes[root_base + state]);
+  Scalar log_partition = maximum;
   if (Finite(maximum)) {
-    float total = 0.0f;
+    Scalar total = 0.0f;
     for (std::size_t state = 0; state < params.states; ++state)
-      total += expf(nodes[root_base + state] - maximum);
-    log_partition += logf(total);
+      total += exp(nodes[root_base + state] - maximum);
+    log_partition += log(total);
   }
   log_partitions[batch] = log_partition;
   for (std::size_t state = 0; state < params.states; ++state) {
     node_marginals[NodeMarginalIndex(params, batch, params.root, state)] =
-        Finite(log_partition)
-            ? expf(nodes[root_base + state] - log_partition)
-            : 0.0f;
+        Finite(log_partition) ? exp(nodes[root_base + state] - log_partition)
+                              : 0.0f;
   }
 }
 
-__global__ void ReverseLogCompressions(
-    const btrc::Compression *operations, const float *left_tape,
-    const float *middle_tape, const float *right_tape,
-    const float *output_tape, float *node_marginals, float *edge_marginals,
-    Params params) {
-  extern __shared__ float output_adjoints[];
+__global__ void ReverseLogCompressions(const btrc::Compression *operations,
+                                       const Scalar *left_tape,
+                                       const Scalar *middle_tape,
+                                       const Scalar *right_tape,
+                                       const Scalar *output_tape,
+                                       Scalar *node_marginals,
+                                       Scalar *edge_marginals, Params params) {
+  extern __shared__ Scalar output_adjoints[];
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
   const std::size_t entry = threadIdx.x;
@@ -544,48 +541,46 @@ __global__ void ReverseLogCompressions(
 
   const std::size_t first_state = entry / params.states;
   const std::size_t second_state = entry % params.states;
-  const std::size_t left_tape_index = CompressionMatrixTapeIndex(
-      params, batch, operation.tape, entry);
-  const float left = left_tape[left_tape_index];
-  float left_adjoint = 0.0f;
+  const std::size_t left_tape_index =
+      CompressionMatrixTapeIndex(params, batch, operation.tape, entry);
+  const Scalar left = left_tape[left_tape_index];
+  Scalar left_adjoint = 0.0f;
   for (std::size_t child_state = 0; child_state < params.states;
        ++child_state) {
-    const std::size_t output_entry =
-        first_state * params.states + child_state;
-    const float output = output_tape[CompressionMatrixTapeIndex(
+    const std::size_t output_entry = first_state * params.states + child_state;
+    const Scalar output = output_tape[CompressionMatrixTapeIndex(
         params, batch, operation.tape, output_entry)];
-    const float term =
-        left + middle_tape[CompressionVectorTapeIndex(
-                   params, batch, operation.tape, second_state)] +
-        right_tape[CompressionMatrixTapeIndex(
-            params, batch, operation.tape,
-            second_state * params.states + child_state)];
+    const Scalar term = left +
+                        middle_tape[CompressionVectorTapeIndex(
+                            params, batch, operation.tape, second_state)] +
+                        right_tape[CompressionMatrixTapeIndex(
+                            params, batch, operation.tape,
+                            second_state * params.states + child_state)];
     if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
         Finite(output)) {
-      left_adjoint += output_adjoints[output_entry] * expf(term - output);
+      left_adjoint += output_adjoints[output_entry] * exp(term - output);
     }
   }
   edge_marginals[EdgeMarginalIndex(params, batch, operation.left_edge,
                                    first_state, second_state)] = left_adjoint;
 
-  const float right = right_tape[left_tape_index];
-  float right_adjoint = 0.0f;
+  const Scalar right = right_tape[left_tape_index];
+  Scalar right_adjoint = 0.0f;
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
     const std::size_t output_entry =
         parent_state * params.states + second_state;
-    const float output = output_tape[CompressionMatrixTapeIndex(
+    const Scalar output = output_tape[CompressionMatrixTapeIndex(
         params, batch, operation.tape, output_entry)];
-    const float term =
-        left_tape[CompressionMatrixTapeIndex(
-            params, batch, operation.tape,
-            parent_state * params.states + first_state)] +
-        middle_tape[CompressionVectorTapeIndex(
-            params, batch, operation.tape, first_state)] +
-        right;
+    const Scalar term = left_tape[CompressionMatrixTapeIndex(
+                            params, batch, operation.tape,
+                            parent_state * params.states + first_state)] +
+                        middle_tape[CompressionVectorTapeIndex(
+                            params, batch, operation.tape, first_state)] +
+                        right;
     if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
         Finite(output)) {
-      right_adjoint += output_adjoints[output_entry] * expf(term - output);
+      right_adjoint += output_adjoints[output_entry] * exp(term - output);
     }
   }
   edge_marginals[EdgeMarginalIndex(params, batch, operation.right_edge,
@@ -593,29 +588,27 @@ __global__ void ReverseLogCompressions(
 
   if (entry < params.states) {
     const std::size_t middle_state = entry;
-    const float middle = middle_tape[CompressionVectorTapeIndex(
+    const Scalar middle = middle_tape[CompressionVectorTapeIndex(
         params, batch, operation.tape, middle_state)];
-    float middle_adjoint = 0.0f;
+    Scalar middle_adjoint = 0.0f;
     for (std::size_t parent_state = 0; parent_state < params.states;
          ++parent_state) {
       for (std::size_t child_state = 0; child_state < params.states;
            ++child_state) {
         const std::size_t output_entry =
             parent_state * params.states + child_state;
-        const float output = output_tape[CompressionMatrixTapeIndex(
+        const Scalar output = output_tape[CompressionMatrixTapeIndex(
             params, batch, operation.tape, output_entry)];
-        const float term =
-            left_tape[CompressionMatrixTapeIndex(
-                params, batch, operation.tape,
-                parent_state * params.states + middle_state)] +
-            middle +
-            right_tape[CompressionMatrixTapeIndex(
-                params, batch, operation.tape,
-                middle_state * params.states + child_state)];
+        const Scalar term = left_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                parent_state * params.states + middle_state)] +
+                            middle +
+                            right_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                middle_state * params.states + child_state)];
         if (output_adjoints[output_entry] != 0.0f && Finite(term) &&
             Finite(output)) {
-          middle_adjoint +=
-              output_adjoints[output_entry] * expf(term - output);
+          middle_adjoint += output_adjoints[output_entry] * exp(term - output);
         }
       }
     }
@@ -624,9 +617,9 @@ __global__ void ReverseLogCompressions(
   }
 }
 
-__global__ void ReverseLogAbsorptions(
-    const btrc::BranchAbsorption *operations, const float *node_marginals,
-    float *branch_marginals, Params params) {
+__global__ void ReverseLogAbsorptions(const btrc::BranchAbsorption *operations,
+                                      const Scalar *node_marginals,
+                                      Scalar *branch_marginals, Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -635,13 +628,12 @@ __global__ void ReverseLogAbsorptions(
   const btrc::BranchAbsorption operation =
       operations[params.operation_offset + operation_in_batch];
   branch_marginals[BranchIndex(params, batch, operation.branch, state)] +=
-      node_marginals[NodeMarginalIndex(params, batch, operation.parent,
-                                       state)];
+      node_marginals[NodeMarginalIndex(params, batch, operation.parent, state)];
 }
 
-__global__ void ReverseLogCombinations(
-    const btrc::BranchCombination *operations, float *branch_marginals,
-    Params params) {
+__global__ void
+ReverseLogCombinations(const btrc::BranchCombination *operations,
+                       Scalar *branch_marginals, Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -654,11 +646,11 @@ __global__ void ReverseLogCombinations(
                                    state)];
 }
 
-__global__ void ReverseLogRakes(
-    const btrc::Rake *operations, const float *path_tape,
-    const float *leaf_tape, const float *message_tape,
-    const float *branch_marginals, float *node_marginals,
-    float *edge_marginals, Params params) {
+__global__ void
+ReverseLogRakes(const btrc::Rake *operations, const Scalar *path_tape,
+                const Scalar *leaf_tape, const Scalar *message_tape,
+                const Scalar *branch_marginals, Scalar *node_marginals,
+                Scalar *edge_marginals, Params params) {
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
   const std::size_t entry = threadIdx.x;
@@ -670,40 +662,39 @@ __global__ void ReverseLogRakes(
       operations[params.operation_offset + operation_in_batch];
   const std::size_t parent_state = entry / params.states;
   const std::size_t child_state = entry % params.states;
-  const float message = message_tape[RakeLeafTapeIndex(
+  const Scalar message = message_tape[RakeLeafTapeIndex(
       params, batch, operation.branch, parent_state)];
-  const float term =
+  const Scalar term =
       path_tape[RakePathTapeIndex(params, batch, operation.branch, entry)] +
       leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch,
                                   child_state)];
-  float contribution = 0.0f;
+  Scalar contribution = 0.0f;
   if (Finite(term) && Finite(message)) {
-    contribution =
-        branch_marginals[BranchIndex(params, batch, operation.branch,
-                                     parent_state)] *
-        expf(term - message);
+    contribution = branch_marginals[BranchIndex(params, batch, operation.branch,
+                                                parent_state)] *
+                   exp(term - message);
   }
-  edge_marginals[EdgeMarginalIndex(params, batch, operation.edge,
-                                   parent_state, child_state)] += contribution;
+  edge_marginals[EdgeMarginalIndex(params, batch, operation.edge, parent_state,
+                                   child_state)] += contribution;
 
   if (entry < params.states) {
     const std::size_t leaf_state = entry;
-    float leaf_adjoint = 0.0f;
-    for (std::size_t rake_parent_state = 0;
-         rake_parent_state < params.states; ++rake_parent_state) {
-      const float rake_message = message_tape[RakeLeafTapeIndex(
+    Scalar leaf_adjoint = 0.0f;
+    for (std::size_t rake_parent_state = 0; rake_parent_state < params.states;
+         ++rake_parent_state) {
+      const Scalar rake_message = message_tape[RakeLeafTapeIndex(
           params, batch, operation.branch, rake_parent_state)];
-      const float rake_term =
-          path_tape[RakePathTapeIndex(
-              params, batch, operation.branch,
-              rake_parent_state * params.states + leaf_state)] +
+      const Scalar rake_term =
+          path_tape[RakePathTapeIndex(params, batch, operation.branch,
+                                      rake_parent_state * params.states +
+                                          leaf_state)] +
           leaf_tape[RakeLeafTapeIndex(params, batch, operation.branch,
                                       leaf_state)];
       if (Finite(rake_term) && Finite(rake_message)) {
         leaf_adjoint +=
             branch_marginals[BranchIndex(params, batch, operation.branch,
                                          rake_parent_state)] *
-            expf(rake_term - rake_message);
+            exp(rake_term - rake_message);
       }
     }
     node_marginals[NodeMarginalIndex(params, batch, operation.leaf,
@@ -711,9 +702,9 @@ __global__ void ReverseLogRakes(
   }
 }
 
-__global__ void SaveRakeTapes(const btrc::Rake *operations, const float *nodes,
-                              const float *paths, float *path_tape,
-                              float *leaf_tape, Params params) {
+__global__ void SaveRakeTapes(const btrc::Rake *operations, const Scalar *nodes,
+                              const Scalar *paths, Scalar *path_tape,
+                              Scalar *leaf_tape, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -738,9 +729,9 @@ __global__ void SaveRakeTapes(const btrc::Rake *operations, const float *nodes,
 }
 
 __global__ void SaveCompressionTapes(const btrc::Compression *operations,
-                                     const float *nodes, const float *paths,
-                                     float *left_tape, float *middle_tape,
-                                     float *right_tape, Params params) {
+                                     const Scalar *nodes, const Scalar *paths,
+                                     Scalar *left_tape, Scalar *middle_tape,
+                                     Scalar *right_tape, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -769,7 +760,7 @@ __global__ void SaveCompressionTapes(const btrc::Compression *operations,
   }
 }
 
-__global__ void SeedRootSamples(const float *nodes, const float *uniforms,
+__global__ void SeedRootSamples(const Scalar *nodes, const Scalar *uniforms,
                                 std::uint32_t *assignments, Params params) {
   const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
   if (batch >= params.batch)
@@ -780,8 +771,9 @@ __global__ void SeedRootSamples(const float *nodes, const float *uniforms,
 }
 
 __global__ void ExpandSampleRakes(const btrc::Rake *operations,
-                                  const float *path_tape,
-                                  const float *leaf_tape, const float *uniforms,
+                                  const Scalar *path_tape,
+                                  const Scalar *leaf_tape,
+                                  const Scalar *uniforms,
                                   std::uint32_t *assignments, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -794,41 +786,41 @@ __global__ void ExpandSampleRakes(const btrc::Rake *operations,
       operations[params.operation_offset + operation_in_batch];
   const std::uint32_t parent_state =
       assignments[AssignmentIndex(params, batch, operation.parent)];
-  float maximum = -INFINITY;
+  Scalar maximum = -INFINITY;
   for (std::uint32_t child_state = 0; child_state < params.states;
        ++child_state) {
     maximum =
-        fmaxf(maximum,
-              LogProduct(path_tape[RakePathTapeIndex(
-                             params, batch, operation.branch,
-                             parent_state * params.states + child_state)],
-                         leaf_tape[RakeLeafTapeIndex(
-                             params, batch, operation.branch, child_state)]));
+        fmax(maximum,
+             LogProduct(path_tape[RakePathTapeIndex(
+                            params, batch, operation.branch,
+                            parent_state * params.states + child_state)],
+                        leaf_tape[RakeLeafTapeIndex(
+                            params, batch, operation.branch, child_state)]));
   }
-  float total = 0.0f;
+  Scalar total = 0.0f;
   for (std::uint32_t child_state = 0; child_state < params.states;
        ++child_state) {
     total +=
-        expf(LogProduct(path_tape[RakePathTapeIndex(
-                            params, batch, operation.branch,
-                            parent_state * params.states + child_state)],
-                        leaf_tape[RakeLeafTapeIndex(
-                            params, batch, operation.branch, child_state)]) -
-             maximum);
+        exp(LogProduct(path_tape[RakePathTapeIndex(
+                           params, batch, operation.branch,
+                           parent_state * params.states + child_state)],
+                       leaf_tape[RakeLeafTapeIndex(
+                           params, batch, operation.branch, child_state)]) -
+            maximum);
   }
-  const float threshold =
+  const Scalar threshold =
       uniforms[AssignmentIndex(params, batch, operation.leaf)] * total;
-  float cumulative = 0.0f;
+  Scalar cumulative = 0.0f;
   std::uint32_t choice = 0;
   for (std::uint32_t child_state = 0; child_state < params.states;
        ++child_state) {
-    const float value =
-        expf(LogProduct(path_tape[RakePathTapeIndex(
-                            params, batch, operation.branch,
-                            parent_state * params.states + child_state)],
-                        leaf_tape[RakeLeafTapeIndex(
-                            params, batch, operation.branch, child_state)]) -
-             maximum);
+    const Scalar value =
+        exp(LogProduct(path_tape[RakePathTapeIndex(
+                           params, batch, operation.branch,
+                           parent_state * params.states + child_state)],
+                       leaf_tape[RakeLeafTapeIndex(
+                           params, batch, operation.branch, child_state)]) -
+            maximum);
     if (value > 0.0f)
       choice = child_state;
     cumulative += value;
@@ -842,8 +834,8 @@ __global__ void ExpandSampleRakes(const btrc::Rake *operations,
 
 __global__ void
 ExpandSampleCompressions(const btrc::Compression *operations,
-                         const float *left_tape, const float *middle_tape,
-                         const float *right_tape, const float *uniforms,
+                         const Scalar *left_tape, const Scalar *middle_tape,
+                         const Scalar *right_tape, const Scalar *uniforms,
                          std::uint32_t *assignments, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -858,10 +850,10 @@ ExpandSampleCompressions(const btrc::Compression *operations,
       assignments[AssignmentIndex(params, batch, operation.parent)];
   const std::uint32_t child_state =
       assignments[AssignmentIndex(params, batch, operation.child)];
-  float maximum = -INFINITY;
+  Scalar maximum = -INFINITY;
   for (std::uint32_t middle_state = 0; middle_state < params.states;
        ++middle_state) {
-    maximum = fmaxf(
+    maximum = fmax(
         maximum, LogProduct(left_tape[CompressionMatrixTapeIndex(
                                 params, batch, operation.tape,
                                 parent_state * params.states + middle_state)],
@@ -871,35 +863,35 @@ ExpandSampleCompressions(const btrc::Compression *operations,
                                 params, batch, operation.tape,
                                 middle_state * params.states + child_state)]));
   }
-  float total = 0.0f;
+  Scalar total = 0.0f;
   for (std::uint32_t middle_state = 0; middle_state < params.states;
        ++middle_state) {
-    total += expf(LogProduct(left_tape[CompressionMatrixTapeIndex(
-                                 params, batch, operation.tape,
-                                 parent_state * params.states + middle_state)],
-                             middle_tape[CompressionVectorTapeIndex(
-                                 params, batch, operation.tape, middle_state)],
-                             right_tape[CompressionMatrixTapeIndex(
-                                 params, batch, operation.tape,
-                                 middle_state * params.states + child_state)]) -
-                  maximum);
+    total += exp(LogProduct(left_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                parent_state * params.states + middle_state)],
+                            middle_tape[CompressionVectorTapeIndex(
+                                params, batch, operation.tape, middle_state)],
+                            right_tape[CompressionMatrixTapeIndex(
+                                params, batch, operation.tape,
+                                middle_state * params.states + child_state)]) -
+                 maximum);
   }
-  const float threshold =
+  const Scalar threshold =
       uniforms[AssignmentIndex(params, batch, operation.middle)] * total;
-  float cumulative = 0.0f;
+  Scalar cumulative = 0.0f;
   std::uint32_t choice = 0;
   for (std::uint32_t middle_state = 0; middle_state < params.states;
        ++middle_state) {
-    const float value =
-        expf(LogProduct(left_tape[CompressionMatrixTapeIndex(
-                            params, batch, operation.tape,
-                            parent_state * params.states + middle_state)],
-                        middle_tape[CompressionVectorTapeIndex(
-                            params, batch, operation.tape, middle_state)],
-                        right_tape[CompressionMatrixTapeIndex(
-                            params, batch, operation.tape,
-                            middle_state * params.states + child_state)]) -
-             maximum);
+    const Scalar value =
+        exp(LogProduct(left_tape[CompressionMatrixTapeIndex(
+                           params, batch, operation.tape,
+                           parent_state * params.states + middle_state)],
+                       middle_tape[CompressionVectorTapeIndex(
+                           params, batch, operation.tape, middle_state)],
+                       right_tape[CompressionMatrixTapeIndex(
+                           params, batch, operation.tape,
+                           middle_state * params.states + child_state)]) -
+            maximum);
     if (value > 0.0f)
       choice = middle_state;
     cumulative += value;
@@ -912,8 +904,8 @@ ExpandSampleCompressions(const btrc::Compression *operations,
 }
 
 __global__ void MaximumRakeSerial(const btrc::Rake *operations,
-                                  const float *nodes, const float *paths,
-                                  float *branches, std::uint32_t *choices,
+                                  const Scalar *nodes, const Scalar *paths,
+                                  Scalar *branches, std::uint32_t *choices,
                                   Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -928,12 +920,12 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
   const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
-    float best =
+    Scalar best =
         paths[path_base + parent_state * params.states] + nodes[node_base];
     std::uint32_t choice = 0;
     for (std::uint32_t child_state = 1; child_state < params.states;
          ++child_state) {
-      const float candidate =
+      const Scalar candidate =
           paths[path_base + parent_state * params.states + child_state] +
           nodes[node_base + child_state];
       if (candidate > best) {
@@ -947,8 +939,8 @@ __global__ void MaximumRakeSerial(const btrc::Rake *operations,
   }
 }
 
-__global__ void MaximumRake(const btrc::Rake *operations, const float *nodes,
-                            const float *paths, float *branches,
+__global__ void MaximumRake(const btrc::Rake *operations, const Scalar *nodes,
+                            const Scalar *paths, Scalar *branches,
                             std::uint32_t *choices, Params params) {
   const std::size_t parent_state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
@@ -959,12 +951,12 @@ __global__ void MaximumRake(const btrc::Rake *operations, const float *nodes,
       operations[params.operation_offset + operation_in_batch];
   const std::size_t node_base = NodeIndex(params, batch, operation.leaf, 0);
   const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
-  float best =
+  Scalar best =
       paths[path_base + parent_state * params.states] + nodes[node_base];
   std::uint32_t choice = 0;
   for (std::uint32_t child_state = 1; child_state < params.states;
        ++child_state) {
-    const float candidate =
+    const Scalar candidate =
         paths[path_base + parent_state * params.states + child_state] +
         nodes[node_base + child_state];
     if (candidate > best) {
@@ -979,7 +971,7 @@ __global__ void MaximumRake(const btrc::Rake *operations, const float *nodes,
 
 __global__ void
 LogCombineBranchesSerial(const btrc::BranchCombination *operations,
-                         float *branches, Params params) {
+                         Scalar *branches, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -995,9 +987,8 @@ LogCombineBranchesSerial(const btrc::BranchCombination *operations,
   }
 }
 
-__global__ void
-LogCombineBranches(const btrc::BranchCombination *operations,
-                   float *branches, Params params) {
+__global__ void LogCombineBranches(const btrc::BranchCombination *operations,
+                                   Scalar *branches, Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -1010,8 +1001,8 @@ LogCombineBranches(const btrc::BranchCombination *operations,
 }
 
 __global__ void
-LogAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
-                        float *nodes, const float *branches, Params params) {
+LogAbsorbBranchesSerial(const btrc::BranchAbsorption *operations, Scalar *nodes,
+                        const Scalar *branches, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -1028,7 +1019,7 @@ LogAbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
 }
 
 __global__ void LogAbsorbBranches(const btrc::BranchAbsorption *operations,
-                                  float *nodes, const float *branches,
+                                  Scalar *nodes, const Scalar *branches,
                                   Params params) {
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
@@ -1042,7 +1033,7 @@ __global__ void LogAbsorbBranches(const btrc::BranchAbsorption *operations,
 }
 
 __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
-                                       const float *nodes, float *paths,
+                                       const Scalar *nodes, Scalar *paths,
                                        std::uint32_t *choices, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -1055,9 +1046,9 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
       operations[params.operation_offset + operation_in_batch];
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kMatrix = kStates * kStates;
-  float left[kMatrix];
-  float right[kMatrix];
-  float middle[kStates];
+  Scalar left[kMatrix];
+  Scalar right[kMatrix];
+  Scalar middle[kStates];
   const std::size_t left_base =
       PathIndex(params, batch, operation.left_edge, 0, 0);
   const std::size_t right_base =
@@ -1071,14 +1062,14 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
     middle[state] = nodes[middle_base + state];
   for (std::size_t parent_state = 0; parent_state < kStates; ++parent_state) {
     for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
-      float best =
+      Scalar best =
           left[parent_state * kStates] + middle[0] + right[child_state];
       std::uint32_t choice = 0;
       for (std::uint32_t middle_state = 1; middle_state < kStates;
            ++middle_state) {
-        const float candidate = left[parent_state * kStates + middle_state] +
-                                middle[middle_state] +
-                                right[middle_state * kStates + child_state];
+        const Scalar candidate = left[parent_state * kStates + middle_state] +
+                                 middle[middle_state] +
+                                 right[middle_state * kStates + child_state];
         if (candidate > best) {
           best = candidate;
           choice = middle_state;
@@ -1092,14 +1083,14 @@ __global__ void MaximumCompressSerial4(const btrc::Compression *operations,
 }
 
 __global__ void MaximumCompress(const btrc::Compression *operations,
-                                const float *nodes, float *paths,
+                                const Scalar *nodes, Scalar *paths,
                                 std::uint32_t *choices, Params params) {
-  extern __shared__ float storage[];
+  extern __shared__ Scalar storage[];
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  float *left = storage;
-  float *right = left + matrix;
-  float *middle = right + matrix;
+  Scalar *left = storage;
+  Scalar *right = left + matrix;
+  Scalar *middle = right + matrix;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const std::size_t entry = threadIdx.x;
@@ -1123,14 +1114,14 @@ __global__ void MaximumCompress(const btrc::Compression *operations,
 
   const std::size_t parent_state = entry / params.states;
   const std::size_t child_state = entry % params.states;
-  float best =
+  Scalar best =
       left[parent_state * params.states] + middle[0] + right[child_state];
   std::uint32_t choice = 0;
   for (std::uint32_t middle_state = 1; middle_state < params.states;
        ++middle_state) {
-    const float candidate = left[parent_state * params.states + middle_state] +
-                            middle[middle_state] +
-                            right[middle_state * params.states + child_state];
+    const Scalar candidate = left[parent_state * params.states + middle_state] +
+                             middle[middle_state] +
+                             right[middle_state * params.states + child_state];
     if (candidate > best) {
       best = candidate;
       choice = middle_state;
@@ -1142,13 +1133,13 @@ __global__ void MaximumCompress(const btrc::Compression *operations,
                                  child_state)] = choice;
 }
 
-__global__ void FinishMaximum(const float *nodes, float *log_weights,
+__global__ void FinishMaximum(const Scalar *nodes, Scalar *log_weights,
                               std::uint32_t *assignments, Params params) {
   const std::size_t batch = blockIdx.x * blockDim.x + threadIdx.x;
   if (batch >= params.batch)
     return;
   const std::size_t root_base = NodeIndex(params, batch, params.root, 0);
-  float best = nodes[root_base];
+  Scalar best = nodes[root_base];
   std::uint32_t choice = 0;
   for (std::uint32_t state = 1; state < params.states; ++state) {
     if (nodes[root_base + state] > best) {
@@ -1200,11 +1191,11 @@ __global__ void ExpandMaximumCompressions(const btrc::Compression *operations,
                                      parent_state, child_state)];
 }
 
-__global__ void Rake(const btrc::Rake *operations, const float *nodes,
-                     const float *paths, float *branches,
-                     const float *node_scales, const float *path_scales,
-                     float *branch_scales, Params params) {
-  __shared__ float normalizer;
+__global__ void Rake(const btrc::Rake *operations, const Scalar *nodes,
+                     const Scalar *paths, Scalar *branches,
+                     const Scalar *node_scales, const Scalar *path_scales,
+                     Scalar *branch_scales, Params params) {
+  __shared__ Scalar normalizer;
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -1212,7 +1203,7 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
       operations[params.operation_offset + operation_in_batch];
   if (state >= params.states || batch >= params.batch)
     return;
-  const float value =
+  const Scalar value =
       detail::RakeValue(paths + PathIndex(params, batch, operation.edge, 0, 0),
                         nodes + NodeIndex(params, batch, operation.leaf, 0),
                         params.states, state);
@@ -1223,10 +1214,10 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
     return;
   __syncthreads();
   if (state == 0) {
-    const float maximum =
+    const Scalar maximum =
         detail::Maximum(branches + branch_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
-    const float input_scale =
+    const Scalar input_scale =
         node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
         path_scales[PathScaleIndex(params, batch, operation.edge)];
     branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
@@ -1236,10 +1227,10 @@ __global__ void Rake(const btrc::Rake *operations, const float *nodes,
   branches[branch_base + state] = value / normalizer;
 }
 
-__global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
-                           const float *paths, float *branches,
-                           const float *node_scales, const float *path_scales,
-                           float *branch_scales, Params params) {
+__global__ void RakeSerial(const btrc::Rake *operations, const Scalar *nodes,
+                           const Scalar *paths, Scalar *branches,
+                           const Scalar *node_scales, const Scalar *path_scales,
+                           Scalar *branch_scales, Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
       static_cast<std::size_t>(params.batch) * params.operation_count;
@@ -1253,20 +1244,20 @@ __global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
   const std::size_t path_base = PathIndex(params, batch, operation.edge, 0, 0);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
-  float maximum = 0.0f;
+  Scalar maximum = 0.0f;
   for (std::size_t parent_state = 0; parent_state < params.states;
        ++parent_state) {
-    const float value = detail::RakeValue(paths + path_base, nodes + node_base,
-                                          params.states, parent_state);
+    const Scalar value = detail::RakeValue(paths + path_base, nodes + node_base,
+                                           params.states, parent_state);
     branches[branch_base + parent_state] = value;
-    maximum = fmaxf(maximum, value);
+    maximum = fmax(maximum, value);
   }
   if (!params.scaled)
     return;
-  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     branches[branch_base + state] /= normalizer;
-  const float input_scale =
+  const Scalar input_scale =
       node_scales[NodeScaleIndex(params, batch, operation.leaf)] +
       path_scales[PathScaleIndex(params, batch, operation.edge)];
   branch_scales[BranchScaleIndex(params, batch, operation.branch)] =
@@ -1274,9 +1265,9 @@ __global__ void RakeSerial(const btrc::Rake *operations, const float *nodes,
 }
 
 __global__ void CombineBranches(const btrc::BranchCombination *operations,
-                                float *branches, float *branch_scales,
+                                Scalar *branches, Scalar *branch_scales,
                                 Params params) {
-  __shared__ float normalizer;
+  __shared__ Scalar normalizer;
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -1288,21 +1279,21 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
       BranchIndex(params, batch, operation.destination, 0);
   const std::size_t source_base =
       BranchIndex(params, batch, operation.source, 0);
-  const float value = detail::Product(branches[destination_base + state],
-                                      branches[source_base + state]);
+  const Scalar value = detail::Product(branches[destination_base + state],
+                                       branches[source_base + state]);
   branches[destination_base + state] = value;
   if (!params.scaled)
     return;
   __syncthreads();
   if (state == 0) {
-    const float maximum =
+    const Scalar maximum =
         detail::Maximum(branches + destination_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t destination_scale =
         BranchScaleIndex(params, batch, operation.destination);
     const std::size_t source_scale =
         BranchScaleIndex(params, batch, operation.source);
-    const float input_scale =
+    const Scalar input_scale =
         branch_scales[destination_scale] + branch_scales[source_scale];
     branch_scales[destination_scale] =
         detail::UpdatedLogScale(input_scale, maximum);
@@ -1312,7 +1303,7 @@ __global__ void CombineBranches(const btrc::BranchCombination *operations,
 }
 
 __global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
-                                      float *branches, float *branch_scales,
+                                      Scalar *branches, Scalar *branch_scales,
                                       Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -1327,33 +1318,33 @@ __global__ void CombineBranchesSerial(const btrc::BranchCombination *operations,
       BranchIndex(params, batch, operation.destination, 0);
   const std::size_t source_base =
       BranchIndex(params, batch, operation.source, 0);
-  float maximum = 0.0f;
+  Scalar maximum = 0.0f;
   for (std::size_t state = 0; state < params.states; ++state) {
-    const float value = detail::Product(branches[destination_base + state],
-                                        branches[source_base + state]);
+    const Scalar value = detail::Product(branches[destination_base + state],
+                                         branches[source_base + state]);
     branches[destination_base + state] = value;
-    maximum = fmaxf(maximum, value);
+    maximum = fmax(maximum, value);
   }
   if (!params.scaled)
     return;
-  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     branches[destination_base + state] /= normalizer;
   const std::size_t destination_scale =
       BranchScaleIndex(params, batch, operation.destination);
   const std::size_t source_scale =
       BranchScaleIndex(params, batch, operation.source);
-  const float input_scale =
+  const Scalar input_scale =
       branch_scales[destination_scale] + branch_scales[source_scale];
   branch_scales[destination_scale] =
       detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
-                               float *nodes, const float *branches,
-                               float *node_scales, const float *branch_scales,
+                               Scalar *nodes, const Scalar *branches,
+                               Scalar *node_scales, const Scalar *branch_scales,
                                Params params) {
-  __shared__ float normalizer;
+  __shared__ Scalar normalizer;
   const std::size_t state = threadIdx.x;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
@@ -1364,18 +1355,18 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
   const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
-  const float value =
+  const Scalar value =
       detail::Product(nodes[node_base + state], branches[branch_base + state]);
   nodes[node_base + state] = value;
   if (!params.scaled)
     return;
   __syncthreads();
   if (state == 0) {
-    const float maximum = detail::Maximum(nodes + node_base, params.states);
+    const Scalar maximum = detail::Maximum(nodes + node_base, params.states);
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t node_scale =
         NodeScaleIndex(params, batch, operation.parent);
-    const float input_scale =
+    const Scalar input_scale =
         node_scales[node_scale] +
         branch_scales[BranchScaleIndex(params, batch, operation.branch)];
     node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
@@ -1385,9 +1376,9 @@ __global__ void AbsorbBranches(const btrc::BranchAbsorption *operations,
 }
 
 __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
-                                     float *nodes, const float *branches,
-                                     float *node_scales,
-                                     const float *branch_scales,
+                                     Scalar *nodes, const Scalar *branches,
+                                     Scalar *node_scales,
+                                     const Scalar *branch_scales,
                                      Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -1401,37 +1392,37 @@ __global__ void AbsorbBranchesSerial(const btrc::BranchAbsorption *operations,
   const std::size_t node_base = NodeIndex(params, batch, operation.parent, 0);
   const std::size_t branch_base =
       BranchIndex(params, batch, operation.branch, 0);
-  float maximum = 0.0f;
+  Scalar maximum = 0.0f;
   for (std::size_t state = 0; state < params.states; ++state) {
-    const float value = detail::Product(nodes[node_base + state],
-                                        branches[branch_base + state]);
+    const Scalar value = detail::Product(nodes[node_base + state],
+                                         branches[branch_base + state]);
     nodes[node_base + state] = value;
-    maximum = fmaxf(maximum, value);
+    maximum = fmax(maximum, value);
   }
   if (!params.scaled)
     return;
-  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     nodes[node_base + state] /= normalizer;
   const std::size_t node_scale =
       NodeScaleIndex(params, batch, operation.parent);
-  const float input_scale =
+  const Scalar input_scale =
       node_scales[node_scale] +
       branch_scales[BranchScaleIndex(params, batch, operation.branch)];
   node_scales[node_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
 __global__ void Compress(const btrc::Compression *operations,
-                         const float *nodes, float *paths,
-                         const float *node_scales, float *path_scales,
+                         const Scalar *nodes, Scalar *paths,
+                         const Scalar *node_scales, Scalar *path_scales,
                          Params params) {
-  extern __shared__ float storage[];
-  __shared__ float normalizer;
+  extern __shared__ Scalar storage[];
+  __shared__ Scalar normalizer;
   const std::size_t matrix =
       static_cast<std::size_t>(params.states) * params.states;
-  float *left = storage;
-  float *right = left + matrix;
-  float *middle = right + matrix;
+  Scalar *left = storage;
+  Scalar *right = left + matrix;
+  Scalar *middle = right + matrix;
   const std::size_t batch = blockIdx.x % params.batch;
   const std::size_t operation_in_batch = blockIdx.x / params.batch;
   const btrc::Compression operation =
@@ -1455,7 +1446,7 @@ __global__ void Compress(const btrc::Compression *operations,
     return;
   const std::size_t parent_state = entry / params.states;
   const std::size_t child_state = entry % params.states;
-  const float value = detail::CompressionValue(
+  const Scalar value = detail::CompressionValue(
       left, middle, right, params.states, parent_state, child_state);
   paths[PathIndex(params, batch, operation.left_edge, parent_state,
                   child_state)] = value;
@@ -1465,12 +1456,12 @@ __global__ void Compress(const btrc::Compression *operations,
   if (entry == 0) {
     const std::size_t output_base =
         PathIndex(params, batch, operation.left_edge, 0, 0);
-    const float maximum =
+    const Scalar maximum =
         detail::Maximum(paths + output_base, static_cast<unsigned>(matrix));
     normalizer = maximum > 0.0f ? maximum : 1.0f;
     const std::size_t left_scale =
         PathScaleIndex(params, batch, operation.left_edge);
-    const float input_scale =
+    const Scalar input_scale =
         path_scales[left_scale] +
         node_scales[NodeScaleIndex(params, batch, operation.middle)] +
         path_scales[PathScaleIndex(params, batch, operation.right_edge)];
@@ -1482,8 +1473,8 @@ __global__ void Compress(const btrc::Compression *operations,
 }
 
 __global__ void CompressSerial4(const btrc::Compression *operations,
-                                const float *nodes, float *paths,
-                                const float *node_scales, float *path_scales,
+                                const Scalar *nodes, Scalar *paths,
+                                const Scalar *node_scales, Scalar *path_scales,
                                 Params params) {
   const std::size_t index = blockIdx.x * blockDim.x + threadIdx.x;
   const std::size_t count =
@@ -1496,9 +1487,9 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
       operations[params.operation_offset + operation_in_batch];
   constexpr std::size_t kStates = 4;
   constexpr std::size_t kMatrix = kStates * kStates;
-  float left[kMatrix];
-  float right[kMatrix];
-  float middle[kStates];
+  Scalar left[kMatrix];
+  Scalar right[kMatrix];
+  Scalar middle[kStates];
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     const std::size_t parent_state = entry / kStates;
     const std::size_t child_state = entry % kStates;
@@ -1510,19 +1501,19 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
   for (std::size_t state = 0; state < kStates; ++state)
     middle[state] = nodes[NodeIndex(params, batch, operation.middle, state)];
 
-  float maximum = 0.0f;
+  Scalar maximum = 0.0f;
   for (std::size_t parent_state = 0; parent_state < kStates; ++parent_state) {
     for (std::size_t child_state = 0; child_state < kStates; ++child_state) {
-      const float value = detail::CompressionValue(left, middle, right, kStates,
-                                                   parent_state, child_state);
+      const Scalar value = detail::CompressionValue(
+          left, middle, right, kStates, parent_state, child_state);
       paths[PathIndex(params, batch, operation.left_edge, parent_state,
                       child_state)] = value;
-      maximum = fmaxf(maximum, value);
+      maximum = fmax(maximum, value);
     }
   }
   if (!params.scaled)
     return;
-  const float normalizer = maximum > 0.0f ? maximum : 1.0f;
+  const Scalar normalizer = maximum > 0.0f ? maximum : 1.0f;
   for (std::size_t entry = 0; entry < kMatrix; ++entry) {
     const std::size_t parent_state = entry / kStates;
     const std::size_t child_state = entry % kStates;
@@ -1531,26 +1522,26 @@ __global__ void CompressSerial4(const btrc::Compression *operations,
   }
   const std::size_t left_scale =
       PathScaleIndex(params, batch, operation.left_edge);
-  const float input_scale =
+  const Scalar input_scale =
       path_scales[left_scale] +
       node_scales[NodeScaleIndex(params, batch, operation.middle)] +
       path_scales[PathScaleIndex(params, batch, operation.right_edge)];
   path_scales[left_scale] = detail::UpdatedLogScale(input_scale, maximum);
 }
 
-__global__ void FinishRoot(const float *nodes, const float *node_scales,
-                           float *output, Params params) {
+__global__ void FinishRoot(const Scalar *nodes, const Scalar *node_scales,
+                           Scalar *output, Params params) {
   const std::size_t batch = blockIdx.x;
   if (batch >= params.batch || threadIdx.x != 0)
     return;
-  float value = 0.0f;
+  Scalar value = 0.0f;
   for (std::size_t state = 0; state < params.states; ++state)
     value += nodes[NodeIndex(params, batch, params.root, state)];
   output[batch] =
       params.scaled
           ? (value > 0.0f
                  ? node_scales[NodeScaleIndex(params, batch, params.root)] +
-                       logf(value)
+                       log(value)
                  : -INFINITY)
           : value;
 }
@@ -1579,44 +1570,44 @@ struct Workspace::Impl {
   btrc::BranchCombination *combinations = nullptr;
   btrc::BranchAbsorption *absorptions = nullptr;
   btrc::Compression *compressions = nullptr;
-  float *host_nodes = nullptr;
-  float *host_edges = nullptr;
-  float *host_output = nullptr;
+  Scalar *host_nodes = nullptr;
+  Scalar *host_edges = nullptr;
+  Scalar *host_output = nullptr;
   std::uint32_t *host_assignments = nullptr;
-  float *host_uniforms = nullptr;
-  float *host_node_marginals = nullptr;
-  float *host_edge_marginals = nullptr;
+  Scalar *host_uniforms = nullptr;
+  Scalar *host_node_marginals = nullptr;
+  Scalar *host_edge_marginals = nullptr;
   std::uint8_t *host_observations = nullptr;
-  float *host_root_potential = nullptr;
-  float *host_emission_potentials = nullptr;
-  float *input_nodes = nullptr;
-  float *input_edges = nullptr;
+  Scalar *host_root_potential = nullptr;
+  Scalar *host_emission_potentials = nullptr;
+  Scalar *input_nodes = nullptr;
+  Scalar *input_edges = nullptr;
   std::uint8_t *input_observations = nullptr;
-  float *input_root_potential = nullptr;
-  float *input_emission_potentials = nullptr;
+  Scalar *input_root_potential = nullptr;
+  Scalar *input_emission_potentials = nullptr;
   btrc::Index *categorical_observation_nodes = nullptr;
   btrc::Index *categorical_observation_index_by_node = nullptr;
-  float *nodes = nullptr;
-  float *paths = nullptr;
-  float *branches = nullptr;
-  float *node_scales = nullptr;
-  float *path_scales = nullptr;
-  float *branch_scales = nullptr;
-  float *output = nullptr;
+  Scalar *nodes = nullptr;
+  Scalar *paths = nullptr;
+  Scalar *branches = nullptr;
+  Scalar *node_scales = nullptr;
+  Scalar *path_scales = nullptr;
+  Scalar *branch_scales = nullptr;
+  Scalar *output = nullptr;
   std::uint32_t *rake_choices = nullptr;
   std::uint32_t *compression_choices = nullptr;
   std::uint32_t *assignments = nullptr;
-  float *uniforms = nullptr;
-  float *rake_path_tape = nullptr;
-  float *rake_leaf_tape = nullptr;
-  float *compression_left_tape = nullptr;
-  float *compression_middle_tape = nullptr;
-  float *compression_right_tape = nullptr;
-  float *rake_message_tape = nullptr;
-  float *compression_output_tape = nullptr;
-  float *node_marginals = nullptr;
-  float *edge_marginals = nullptr;
-  float *branch_marginals = nullptr;
+  Scalar *uniforms = nullptr;
+  Scalar *rake_path_tape = nullptr;
+  Scalar *rake_leaf_tape = nullptr;
+  Scalar *compression_left_tape = nullptr;
+  Scalar *compression_middle_tape = nullptr;
+  Scalar *compression_right_tape = nullptr;
+  Scalar *rake_message_tape = nullptr;
+  Scalar *compression_output_tape = nullptr;
+  Scalar *node_marginals = nullptr;
+  Scalar *edge_marginals = nullptr;
+  Scalar *branch_marginals = nullptr;
   std::vector<btrc::Index> observation_nodes;
   std::size_t categories = 0;
   bool categorical = false;
@@ -1855,9 +1846,8 @@ void ReserveMarginalRecovery(Workspace::Impl &storage) {
       {storage.batch, plan.num_nodes(), storage.states}, "node marginals");
   const std::size_t edge_values = CheckedProduct(
       {storage.batch, plan.num_edges(), matrix}, "edge marginals");
-  const std::size_t branch_values =
-      CheckedProduct({storage.batch, plan.num_branches(), storage.states},
-                     "branch marginals");
+  const std::size_t branch_values = CheckedProduct(
+      {storage.batch, plan.num_branches(), storage.states}, "branch marginals");
   const std::size_t compression_values =
       CheckedProduct({storage.batch, plan.num_compressions(), matrix},
                      "compression output tape");
@@ -1952,7 +1942,7 @@ void Workspace::ReserveCategoricalMaximum(
 }
 
 void Workspace::ReserveSampling(const btrc::Plan &plan, std::size_t states,
-                                  std::size_t batch, int device) {
+                                std::size_t batch, int device) {
   Reserve(plan, states, batch, device);
   ReserveSamplingRecovery(*impl_);
 }
@@ -2039,9 +2029,9 @@ Workspace::CategoricalInputs(std::size_t batch) {
           {storage.host_edges, edge_values}};
 }
 
-std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
+std::span<Scalar> Workspace::Uniforms() { return Uniforms(impl_->batch); }
 
-std::span<float> Workspace::Uniforms(std::size_t batch) {
+std::span<Scalar> Workspace::Uniforms(std::size_t batch) {
   Impl &storage = *impl_;
   if (!storage.sampling) {
     throw std::logic_error(
@@ -2060,8 +2050,8 @@ namespace {
 template <class StageInputs, class UploadInputs, class InitializeNodeData>
 tree_hmm::PartitionView
 RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
-            std::span<const float> edge_potentials, Workspace::Impl &storage,
-            bool scaled, std::span<const float> uniforms,
+            std::span<const Scalar> edge_potentials, Workspace::Impl &storage,
+            bool scaled, std::span<const Scalar> uniforms,
             StageInputs stage_inputs, UploadInputs upload_inputs,
             InitializeNodeData initialize_node_data) {
   const auto wall_start = Clock::now();
@@ -2080,13 +2070,12 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   const bool sampling = !uniforms.empty();
   const std::size_t assignment_count =
       CheckedProduct({batch, plan.num_nodes()}, "posterior assignments");
-  if (sampling &&
-      (!storage.sampling || uniforms.size() != assignment_count)) {
+  if (sampling && (!storage.sampling || uniforms.size() != assignment_count)) {
     throw std::invalid_argument(
         "prepared CUDA posterior sampling requires ReserveSampling and one "
         "uniform variate per batch item and node");
   }
-  for (const float uniform : uniforms) {
+  for (const Scalar uniform : uniforms) {
     if (!std::isfinite(uniform) || uniform < 0.0f || uniform >= 1.0f) {
       throw std::invalid_argument(
           "posterior-sampling variates must lie in [0, 1)");
@@ -2126,15 +2115,15 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   const std::size_t path_batches = base_params.paths_batched ? batch : 1;
   if (scaled) {
     Check(cudaMemsetAsync(storage.node_scales, 0,
-                          batch * plan.num_nodes() * sizeof(float),
+                          batch * plan.num_nodes() * sizeof(Scalar),
                           storage.stream),
           "cudaMemsetAsync node scales");
     Check(cudaMemsetAsync(storage.path_scales, 0,
-                          path_batches * plan.num_edges() * sizeof(float),
+                          path_batches * plan.num_edges() * sizeof(Scalar),
                           storage.stream),
           "cudaMemsetAsync path scales");
     Check(cudaMemsetAsync(storage.branch_scales, 0,
-                          batch * plan.num_branches() * sizeof(float),
+                          batch * plan.num_branches() * sizeof(Scalar),
                           storage.stream),
           "cudaMemsetAsync branch scales");
   }
@@ -2211,7 +2200,7 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
             storage.node_scales, storage.path_scales, params);
       } else {
         Compress<<<operation_blocks, matrix,
-                   (2 * matrix + states) * sizeof(float), storage.stream>>>(
+                   (2 * matrix + states) * sizeof(Scalar), storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
             storage.node_scales, storage.path_scales, params);
       }
@@ -2258,7 +2247,7 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   Check(cudaEventRecord(storage.download_start, storage.stream),
         "cudaEventRecord download start");
   Check(cudaMemcpyAsync(storage.host_output, storage.output,
-                        batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        batch * sizeof(Scalar), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync output download");
   if (sampling) {
@@ -2301,7 +2290,7 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
 template <class StageInputs, class UploadInputs, class InitializeNodeData>
 tree_hmm::BatchedMaximumAssignmentView
 RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
-                   std::size_t batch, std::span<const float> edge_potentials,
+                   std::size_t batch, std::span<const Scalar> edge_potentials,
                    Workspace::Impl &storage, StageInputs stage_inputs,
                    UploadInputs upload_inputs,
                    InitializeNodeData initialize_node_data) {
@@ -2384,8 +2373,8 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
     case btrc::Primitive::kBranchCombination:
       if (states <= 8) {
         LogCombineBranchesSerial<<<serial_blocks, kThreads, 0,
-                                   storage.stream>>>(
-            storage.combinations, storage.branches, params);
+                                   storage.stream>>>(storage.combinations,
+                                                     storage.branches, params);
       } else {
         LogCombineBranches<<<operation_blocks, states, 0, storage.stream>>>(
             storage.combinations, storage.branches, params);
@@ -2393,8 +2382,7 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
       break;
     case btrc::Primitive::kBranchAbsorption:
       if (states <= 8) {
-        LogAbsorbBranchesSerial<<<serial_blocks, kThreads, 0,
-                                  storage.stream>>>(
+        LogAbsorbBranchesSerial<<<serial_blocks, kThreads, 0, storage.stream>>>(
             storage.absorptions, storage.nodes, storage.branches, params);
       } else {
         LogAbsorbBranches<<<operation_blocks, states, 0, storage.stream>>>(
@@ -2408,7 +2396,7 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
             storage.compression_choices, params);
       } else {
         MaximumCompress<<<operation_blocks, matrix,
-                          (2 * matrix + states) * sizeof(float),
+                          (2 * matrix + states) * sizeof(Scalar),
                           storage.stream>>>(
             storage.compressions, storage.nodes, storage.paths,
             storage.compression_choices, params);
@@ -2451,7 +2439,7 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
   Check(cudaEventRecord(storage.download_start, storage.stream),
         "cudaEventRecord download start");
   Check(cudaMemcpyAsync(storage.host_output, storage.output,
-                        batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        batch * sizeof(Scalar), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync MAP-weight download");
   const std::size_t assignment_count =
@@ -2493,14 +2481,13 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
 template <class StageInputs, class UploadInputs, class InitializeNodeData>
 tree_hmm::BatchedMarginalView
 RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
-                     std::size_t batch,
-                     std::span<const float> edge_potentials,
+                     std::size_t batch, std::span<const Scalar> edge_potentials,
                      Workspace::Impl &storage, StageInputs stage_inputs,
                      UploadInputs upload_inputs,
                      InitializeNodeData initialize_node_data) {
   const auto wall_start = Clock::now();
-  if (!storage.marginals || storage.plan != &plan ||
-      storage.states != states || batch == 0 || batch > storage.batch) {
+  if (!storage.marginals || storage.plan != &plan || storage.states != states ||
+      batch == 0 || batch > storage.batch) {
     throw std::invalid_argument(
         "prepared CUDA marginal inference requires ReserveMarginals for "
         "this plan, state count, and batch capacity");
@@ -2542,8 +2529,8 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
                       storage.stream>>>(storage.input_edges, storage.paths,
                                         base_params);
   }
-  const std::size_t node_values = CheckedProduct(
-      {batch, plan.num_nodes(), states}, "marginal node values");
+  const std::size_t node_values =
+      CheckedProduct({batch, plan.num_nodes(), states}, "marginal node values");
   TakeLogs<<<Blocks(node_values, kThreads), kThreads, 0, storage.stream>>>(
       storage.nodes, node_values);
   const std::size_t path_values = CheckedProduct(
@@ -2556,14 +2543,14 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
       CheckedProduct({batch, plan.num_edges(), matrix}, "edge marginals");
   const std::size_t branch_values =
       CheckedProduct({batch, plan.num_branches(), states}, "branch marginals");
-  Check(cudaMemsetAsync(storage.node_marginals, 0,
-                        node_values * sizeof(float), storage.stream),
+  Check(cudaMemsetAsync(storage.node_marginals, 0, node_values * sizeof(Scalar),
+                        storage.stream),
         "cudaMemsetAsync node marginals");
   Check(cudaMemsetAsync(storage.edge_marginals, 0,
-                        marginal_edge_values * sizeof(float), storage.stream),
+                        marginal_edge_values * sizeof(Scalar), storage.stream),
         "cudaMemsetAsync edge marginals");
   Check(cudaMemsetAsync(storage.branch_marginals, 0,
-                        branch_values * sizeof(float), storage.stream),
+                        branch_values * sizeof(Scalar), storage.stream),
         "cudaMemsetAsync branch marginals");
 
   for (const btrc::PrimitiveBatch &primitive_batch : plan.primitive_batches()) {
@@ -2591,7 +2578,7 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
       break;
     case btrc::Primitive::kCompression:
       LogCompress<<<operation_blocks, matrix,
-                    (2 * matrix + states) * sizeof(float), storage.stream>>>(
+                    (2 * matrix + states) * sizeof(Scalar), storage.stream>>>(
           storage.compressions, storage.nodes, storage.paths,
           storage.compression_left_tape, storage.compression_middle_tape,
           storage.compression_right_tape, storage.compression_output_tape,
@@ -2609,8 +2596,8 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
     Params params = base_params;
     params.operation_offset = primitive_batch.offset;
     params.operation_count = primitive_batch.count;
-    const std::size_t operations = CheckedProduct(
-        {batch, primitive_batch.count}, "marginal reverse grid");
+    const std::size_t operations =
+        CheckedProduct({batch, primitive_batch.count}, "marginal reverse grid");
     const std::uint32_t operation_blocks =
         CheckedU32(operations, "marginal reverse grid");
     switch (primitive_batch.primitive) {
@@ -2626,12 +2613,12 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
       break;
     case btrc::Primitive::kBranchAbsorption:
       ReverseLogAbsorptions<<<operation_blocks, states, 0, storage.stream>>>(
-          storage.absorptions, storage.node_marginals,
-          storage.branch_marginals, params);
+          storage.absorptions, storage.node_marginals, storage.branch_marginals,
+          params);
       break;
     case btrc::Primitive::kCompression:
       ReverseLogCompressions<<<operation_blocks, matrix,
-                               matrix * sizeof(float), storage.stream>>>(
+                               matrix * sizeof(Scalar), storage.stream>>>(
           storage.compressions, storage.compression_left_tape,
           storage.compression_middle_tape, storage.compression_right_tape,
           storage.compression_output_tape, storage.node_marginals,
@@ -2646,15 +2633,15 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
   Check(cudaEventRecord(storage.download_start, storage.stream),
         "cudaEventRecord download start");
   Check(cudaMemcpyAsync(storage.host_output, storage.output,
-                        batch * sizeof(float), cudaMemcpyDeviceToHost,
+                        batch * sizeof(Scalar), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync marginal log-partition download");
   Check(cudaMemcpyAsync(storage.host_node_marginals, storage.node_marginals,
-                        node_values * sizeof(float), cudaMemcpyDeviceToHost,
+                        node_values * sizeof(Scalar), cudaMemcpyDeviceToHost,
                         storage.stream),
         "cudaMemcpyAsync node-marginal download");
   Check(cudaMemcpyAsync(storage.host_edge_marginals, storage.edge_marginals,
-                        marginal_edge_values * sizeof(float),
+                        marginal_edge_values * sizeof(Scalar),
                         cudaMemcpyDeviceToHost, storage.stream),
         "cudaMemcpyAsync edge-marginal download");
   Check(cudaEventRecord(storage.download_stop, storage.stream),
@@ -2690,8 +2677,8 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
 }
 
 template <class Execute>
-auto WithDenseInputs(tree_hmm::BatchedModelView model,
-                     Workspace::Impl &storage, Execute execute) {
+auto WithDenseInputs(tree_hmm::BatchedModelView model, Workspace::Impl &storage,
+                     Execute execute) {
   if (storage.categorical)
     throw std::invalid_argument(
         "dense CUDA inference cannot use a categorical workspace");
@@ -2806,7 +2793,7 @@ auto WithCategoricalInputs(tree_hmm::BatchedCategoricalModelView model,
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
                             Workspace::Impl &storage, bool scaled,
-                            std::span<const float> uniforms = {}) {
+                            std::span<const Scalar> uniforms = {}) {
   return WithDenseInputs(
       model, storage, [&](auto stage, auto upload, auto initialize) {
         return RunPrepared(model.plan, model.states, model.batch,
@@ -2817,7 +2804,7 @@ tree_hmm::PartitionView Run(tree_hmm::BatchedModelView model,
 
 tree_hmm::PartitionView Run(tree_hmm::BatchedCategoricalModelView model,
                             Workspace::Impl &storage, bool scaled,
-                            std::span<const float> uniforms = {}) {
+                            std::span<const Scalar> uniforms = {}) {
   return WithCategoricalInputs(
       model, storage, [&](auto stage, auto upload, auto initialize) {
         return RunPrepared(model.plan, model.states, model.batch,
@@ -2847,8 +2834,8 @@ RunMaximum(tree_hmm::BatchedCategoricalModelView model,
       });
 }
 
-tree_hmm::BatchedMarginalView
-RunMarginals(tree_hmm::BatchedModelView model, Workspace::Impl &storage) {
+tree_hmm::BatchedMarginalView RunMarginals(tree_hmm::BatchedModelView model,
+                                           Workspace::Impl &storage) {
   return WithDenseInputs(
       model, storage, [&](auto stage, auto upload, auto initialize) {
         return RunMarginalsPrepared(model.plan, model.states, model.batch,
@@ -2908,7 +2895,8 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
-                        std::span<const float> uniforms, Workspace &workspace) {
+                        std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
   const tree_hmm::PartitionView result =
       Run(model, *workspace.impl_, true, uniforms);
   return {
@@ -2918,7 +2906,8 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
-                        std::span<const float> uniforms, Workspace &workspace) {
+                        std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
   const tree_hmm::PartitionView result =
       Run(model, *workspace.impl_, true, uniforms);
   return {
@@ -2932,8 +2921,9 @@ PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
   return RunMarginals(model, *workspace.impl_);
 }
 
-tree_hmm::BatchedMarginalView PosteriorMarginalsPrepared(
-    tree_hmm::BatchedCategoricalModelView model, Workspace &workspace) {
+tree_hmm::BatchedMarginalView
+PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView model,
+                           Workspace &workspace) {
   return RunMarginals(model, *workspace.impl_);
 }
 

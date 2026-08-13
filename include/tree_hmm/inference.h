@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "btrc/plan.h"
+#include "tree_hmm/scalar.h"
 
 namespace tree_hmm {
 
@@ -16,33 +17,33 @@ namespace tree_hmm {
 struct ModelView {
   const btrc::Plan &plan;
   std::size_t states;
-  std::span<const double> node_potentials;
-  std::span<const double> edge_potentials;
+  std::span<const Scalar> node_potentials;
+  std::span<const Scalar> edge_potentials;
 };
 
 struct Marginals {
-  double partition = 0.0;
-  double log_partition = 0.0;
-  std::vector<double> nodes;
-  std::vector<double> edges;
+  Scalar partition = 0.0;
+  Scalar log_partition = 0.0;
+  std::vector<Scalar> nodes;
+  std::vector<Scalar> edges;
 };
 
 struct MarginalView {
-  double partition = 0.0;
-  double log_partition = 0.0;
-  std::span<const double> nodes;
-  std::span<const double> edges;
+  Scalar partition = 0.0;
+  Scalar log_partition = 0.0;
+  std::span<const Scalar> nodes;
+  std::span<const Scalar> edges;
 };
 
 struct MaximumAssignment {
-  double weight = 0.0;
-  double log_weight = 0.0;
+  Scalar weight = 0.0;
+  Scalar log_weight = 0.0;
   std::vector<std::size_t> states;
 };
 
 struct MaximumAssignmentView {
-  double weight = 0.0;
-  double log_weight = 0.0;
+  Scalar weight = 0.0;
+  Scalar log_weight = 0.0;
   std::span<const std::size_t> states;
 };
 
@@ -61,18 +62,18 @@ public:
   void Reserve(const btrc::Plan &plan, std::size_t states);
 
 private:
-  friend double PartitionFunctionPrepared(ModelView, Workspace &);
-  friend double LogPartitionFunctionPrepared(ModelView, Workspace &);
+  friend Scalar PartitionFunctionPrepared(ModelView, Workspace &);
+  friend Scalar LogPartitionFunctionPrepared(ModelView, Workspace &);
   friend MarginalView PosteriorMarginalsPrepared(ModelView, Workspace &);
   friend MaximumAssignmentView MaximumAPosterioriPrepared(ModelView,
                                                           Workspace &);
   friend std::span<const std::size_t>
-  PosteriorSamplePrepared(ModelView, std::span<const double>, Workspace &);
+  PosteriorSamplePrepared(ModelView, std::span<const Scalar>, Workspace &);
   std::unique_ptr<Impl> impl_;
 };
 
-double PartitionFunctionPrepared(ModelView model, Workspace &workspace);
-double LogPartitionFunctionPrepared(ModelView model, Workspace &workspace);
+Scalar PartitionFunctionPrepared(ModelView model, Workspace &workspace);
+Scalar LogPartitionFunctionPrepared(ModelView model, Workspace &workspace);
 MarginalView PosteriorMarginalsPrepared(ModelView model, Workspace &workspace);
 Marginals Materialize(MarginalView view);
 MaximumAssignmentView MaximumAPosterioriPrepared(ModelView model,
@@ -84,11 +85,11 @@ MaximumAssignment Materialize(MaximumAssignmentView view);
 // reproducible and avoids allocating random-number-generator state within
 // CPU or accelerator inference.
 std::span<const std::size_t>
-PosteriorSamplePrepared(ModelView model, std::span<const double> uniforms,
+PosteriorSamplePrepared(ModelView model, std::span<const Scalar> uniforms,
                         Workspace &workspace);
 
-double PartitionFunction(ModelView model);
-double LogPartitionFunction(ModelView model);
+Scalar PartitionFunction(ModelView model);
+Scalar LogPartitionFunction(ModelView model);
 
 // Returns normalized p(x_i) and p(x_parent, x_child). Log-domain contraction
 // and analytic reverse contraction avoid underflow and division by
@@ -96,7 +97,7 @@ double LogPartitionFunction(ModelView model);
 Marginals PosteriorMarginals(ModelView model);
 MaximumAssignment MaximumAPosteriori(ModelView model);
 std::vector<std::size_t> PosteriorSample(ModelView model,
-                                         std::span<const double> uniforms);
+                                         std::span<const Scalar> uniforms);
 
 } // namespace tree_hmm
 

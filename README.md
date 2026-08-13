@@ -19,12 +19,12 @@ The package provides:
   and posterior-sampling backends sharing one accelerator API;
 - brute-force, device-emulation, and accelerator cross-validation.
 
-The CPU implementation uses nonnegative double-precision factors. Likelihoods
-use scale propagation and marginals use a log-domain contraction, so neither
-underflows on large trees. Accelerator likelihoods use single precision with
-scale propagation attached to every intermediate node, edge, and branch
-factor. Prepared CPU and accelerator APIs allocate all problem storage in the
-corresponding workspace reservation; repeated numerical calls reuse it.
+The CPU and CUDA implementations use one compile-time `tree_hmm::Scalar`.
+FP64 is the default; FP32 is a separate pure-precision build. Likelihoods use
+scale propagation and marginals use a log-domain contraction, so neither
+underflows on large trees. Metal is FP32-only. Prepared CPU and accelerator
+APIs allocate all problem storage in the corresponding workspace reservation;
+repeated numerical calls reuse it.
 
 MAP assignments and posterior samples use the same topology plan as sum-product
 inference. Contraction records the local conditional data required for
@@ -58,17 +58,31 @@ NVIDIA system. The Metal kernels are compiled and tested directly on macOS.
 
 ## Build
 
-Keep this repository beside `bidirectional_tree_rake_compress`, then run:
+Keep this repository beside `bidirectional_tree_rake_compress`. Build and test
+the default FP64 CPU implementation with:
 
 ```sh
-bazel test //...
+bazel test //... --config=fp64
 ```
 
-On an NVIDIA host, build the real CUDA test with:
+On an NVIDIA host, build the real CUDA tests in the same precision:
 
 ```sh
-bazel test --config=cuda //:cuda_test
+bazel test //:cuda_test --config=fp64 --config=cuda
+bazel test //:cuda_test --config=fp32 --config=cuda
 ```
+
+Metal uses FP32:
+
+```sh
+bazel test //:metal_test --config=fp32
+```
+
+A dependent Bazel repository selects the precision explicitly with
+`--@parallel_tree_hmm//:precision=fp64` or
+`--@parallel_tree_hmm//:precision=fp32`. The selected type is part of the C++
+ABI, so a binary and all of its tree-HMM dependencies must use the same build
+configuration.
 
 ## License
 

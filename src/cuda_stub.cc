@@ -41,28 +41,27 @@ void Workspace::ReserveCategoricalMaximum(const btrc::Plan &, std::size_t,
 }
 
 void Workspace::ReserveSampling(const btrc::Plan &, std::size_t, std::size_t,
-                                  int) {
+                                int) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
 void Workspace::ReserveCategoricalSampling(const btrc::Plan &, std::size_t,
+                                           std::size_t, std::size_t,
+                                           std::span<const btrc::Index>, int) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+void Workspace::ReserveMarginals(const btrc::Plan &, std::size_t, std::size_t,
+                                 int) {
+  throw std::runtime_error(
+      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
+}
+
+void Workspace::ReserveCategoricalMarginals(const btrc::Plan &, std::size_t,
                                             std::size_t, std::size_t,
-                                            std::span<const btrc::Index>,
-                                            int) {
-  throw std::runtime_error(
-      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
-}
-
-void Workspace::ReserveMarginals(const btrc::Plan &, std::size_t,
-                                 std::size_t, int) {
-  throw std::runtime_error(
-      "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
-}
-
-void Workspace::ReserveCategoricalMarginals(
-    const btrc::Plan &, std::size_t, std::size_t, std::size_t,
-    std::span<const btrc::Index>, int) {
+                                            std::span<const btrc::Index>, int) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
@@ -88,12 +87,12 @@ Workspace::CategoricalInputs(std::size_t) {
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
-std::span<float> Workspace::Uniforms() {
+std::span<Scalar> Workspace::Uniforms() {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
-std::span<float> Workspace::Uniforms(std::size_t) {
+std::span<Scalar> Workspace::Uniforms(std::size_t) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
@@ -136,7 +135,7 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
 }
 
 tree_hmm::BatchedPosteriorSampleView
-PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const float>,
+PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const Scalar>,
                         Workspace &) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
@@ -150,14 +149,13 @@ PosteriorMarginalsPrepared(tree_hmm::BatchedModelView, Workspace &) {
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
-                        std::span<const float>, Workspace &) {
+                        std::span<const Scalar>, Workspace &) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }
 
 tree_hmm::BatchedMarginalView
-PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView,
-                           Workspace &) {
+PosteriorMarginalsPrepared(tree_hmm::BatchedCategoricalModelView, Workspace &) {
   throw std::runtime_error(
       "CUDA backend not built; use Bazel --config=cuda and link tree_hmm_cuda");
 }

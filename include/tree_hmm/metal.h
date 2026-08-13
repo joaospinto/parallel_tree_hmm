@@ -55,8 +55,8 @@ public:
   tree_hmm::MutableBatchedCategoricalModelView CategoricalInputs();
   tree_hmm::MutableBatchedCategoricalModelView
   CategoricalInputs(std::size_t batch);
-  std::span<float> Uniforms();
-  std::span<float> Uniforms(std::size_t batch);
+  std::span<Scalar> Uniforms();
+  std::span<Scalar> Uniforms(std::size_t batch);
 
 private:
   friend tree_hmm::PartitionView
@@ -74,11 +74,11 @@ private:
   MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView,
                              Workspace &);
   friend tree_hmm::BatchedPosteriorSampleView
-  PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const float>,
+  PosteriorSamplePrepared(tree_hmm::BatchedModelView, std::span<const Scalar>,
                           Workspace &);
   friend tree_hmm::BatchedPosteriorSampleView
   PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView,
-                          std::span<const float>, Workspace &);
+                          std::span<const Scalar>, Workspace &);
   friend tree_hmm::BatchedMarginalView
   PosteriorMarginalsPrepared(tree_hmm::BatchedModelView, Workspace &);
   friend tree_hmm::BatchedMarginalView
@@ -107,10 +107,10 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
                            Workspace &workspace);
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
-                        std::span<const float> uniforms, Workspace &workspace);
+                        std::span<const Scalar> uniforms, Workspace &workspace);
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
-                        std::span<const float> uniforms, Workspace &workspace);
+                        std::span<const Scalar> uniforms, Workspace &workspace);
 tree_hmm::BatchedMarginalView
 PosteriorMarginalsPrepared(tree_hmm::BatchedModelView model,
                            Workspace &workspace);

@@ -13,6 +13,9 @@ build:macos --cxxopt=-Werror
 build:macos --cxxopt=-O3
 build:macos --macos_minimum_os=11.0
 
+build:fp64 --//:precision=fp64
+build:fp32 --//:precision=fp32
+
 # Native CUDA targets are opt-in and excluded from ordinary CPU/Metal builds.
 build --@rules_cuda//cuda:enable=false
 build:cuda --@rules_cuda//cuda:enable=true

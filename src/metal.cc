@@ -15,6 +15,9 @@
 #include <utility>
 #include <vector>
 
+static_assert(std::is_same_v<tree_hmm::Scalar, float>,
+              "the Metal backend supports FP32 only");
+
 #include "src/metal_kernels.h"
 
 namespace tree_hmm::metal {
@@ -253,7 +256,7 @@ private:
 
 id<MTLBuffer> MakeBuffer(id<MTLDevice> device, std::size_t bytes) {
   const NSUInteger length =
-      static_cast<NSUInteger>(std::max(bytes, sizeof(float)));
+      static_cast<NSUInteger>(std::max(bytes, sizeof(Scalar)));
   id<MTLBuffer> buffer =
       [device newBufferWithLength:length options:MTLResourceStorageModeShared];
   if (buffer == nil)
@@ -417,36 +420,36 @@ void ReserveCommon(Workspace::Impl &storage, const btrc::Plan &plan,
     const std::size_t matrix_size = CheckedProduct({states, states}, "matrix");
     storage.input_edges = MakeBuffer(
         runtime.device(),
-        CheckedProduct({plan.num_edges(), matrix_size, sizeof(float)},
+        CheckedProduct({plan.num_edges(), matrix_size, sizeof(Scalar)},
                        "Metal input edges"));
     storage.nodes = MakeBuffer(
         runtime.device(),
-        CheckedProduct({batch, plan.num_nodes(), states, sizeof(float)},
+        CheckedProduct({batch, plan.num_nodes(), states, sizeof(Scalar)},
                        "Metal node workspace"));
     const std::size_t path_batches = plan.num_compressions() == 0 ? 1 : batch;
     storage.paths = MakeBuffer(runtime.device(),
                                CheckedProduct({path_batches, plan.num_edges(),
-                                               matrix_size, sizeof(float)},
+                                               matrix_size, sizeof(Scalar)},
                                               "Metal path workspace"));
     storage.branches = MakeBuffer(
         runtime.device(),
-        CheckedProduct({batch, plan.num_branches(), states, sizeof(float)},
+        CheckedProduct({batch, plan.num_branches(), states, sizeof(Scalar)},
                        "Metal branch workspace"));
     storage.node_scales =
         MakeBuffer(runtime.device(),
-                   CheckedProduct({batch, plan.num_nodes(), sizeof(float)},
+                   CheckedProduct({batch, plan.num_nodes(), sizeof(Scalar)},
                                   "Metal node scales"));
     storage.path_scales = MakeBuffer(
         runtime.device(),
-        CheckedProduct({path_batches, plan.num_edges(), sizeof(float)},
+        CheckedProduct({path_batches, plan.num_edges(), sizeof(Scalar)},
                        "Metal path scales"));
     storage.branch_scales =
         MakeBuffer(runtime.device(),
-                   CheckedProduct({batch, plan.num_branches(), sizeof(float)},
+                   CheckedProduct({batch, plan.num_branches(), sizeof(Scalar)},
                                   "Metal branch scales"));
     storage.output =
         MakeBuffer(runtime.device(),
-                   CheckedProduct({batch, sizeof(float)}, "Metal output"));
+                   CheckedProduct({batch, sizeof(Scalar)}, "Metal output"));
   }
 }
 
@@ -480,7 +483,7 @@ void Workspace::Reserve(const btrc::Plan &plan, std::size_t states,
   @autoreleasepool {
     impl_->input_nodes = MakeBuffer(
         Runtime::Get().device(),
-        CheckedProduct({batch, plan.num_nodes(), states, sizeof(float)},
+        CheckedProduct({batch, plan.num_nodes(), states, sizeof(Scalar)},
                        "Metal input nodes"));
   }
 }
@@ -516,10 +519,10 @@ void Workspace::ReserveCategorical(
         CheckedProduct({batch, observation_nodes.size(), sizeof(std::uint8_t)},
                        "Metal categorical observations"));
     storage.input_root_potential =
-        MakeBuffer(runtime.device(), CheckedProduct({states, sizeof(float)},
+        MakeBuffer(runtime.device(), CheckedProduct({states, sizeof(Scalar)},
                                                     "Metal root potential"));
     storage.input_emission_potentials = MakeBuffer(
-        runtime.device(), CheckedProduct({categories, states, sizeof(float)},
+        runtime.device(), CheckedProduct({categories, states, sizeof(Scalar)},
                                          "Metal emission potentials"));
     std::vector<btrc::Index> observation_index_by_node(
         plan.num_nodes(), std::numeric_limits<btrc::Index>::max());
@@ -554,23 +557,23 @@ void ReserveConditionalTapes(Workspace::Impl &storage, const btrc::Plan &plan,
   const std::size_t matrix_size = CheckedProduct({states, states}, "matrix");
   storage.rake_path_tape = MakeBuffer(
       runtime.device(),
-      CheckedProduct({batch, plan.num_branches(), matrix_size, sizeof(float)},
+      CheckedProduct({batch, plan.num_branches(), matrix_size, sizeof(Scalar)},
                      "Metal rake matrix tape"));
   storage.rake_leaf_tape = MakeBuffer(
       runtime.device(),
-      CheckedProduct({batch, plan.num_branches(), states, sizeof(float)},
+      CheckedProduct({batch, plan.num_branches(), states, sizeof(Scalar)},
                      "Metal rake vector tape"));
   storage.compression_left_tape = MakeBuffer(
       runtime.device(), CheckedProduct({batch, plan.num_compressions(),
-                                        matrix_size, sizeof(float)},
+                                        matrix_size, sizeof(Scalar)},
                                        "Metal compression-left tape"));
   storage.compression_middle_tape = MakeBuffer(
       runtime.device(),
-      CheckedProduct({batch, plan.num_compressions(), states, sizeof(float)},
+      CheckedProduct({batch, plan.num_compressions(), states, sizeof(Scalar)},
                      "Metal compression-middle tape"));
   storage.compression_right_tape = MakeBuffer(
       runtime.device(), CheckedProduct({batch, plan.num_compressions(),
-                                        matrix_size, sizeof(float)},
+                                        matrix_size, sizeof(Scalar)},
                                        "Metal compression-right tape"));
 }
 
@@ -584,7 +587,7 @@ void ReserveSamplingRecovery(Workspace::Impl &storage) {
                        "Metal assignment workspace"));
     storage.uniforms = MakeBuffer(
         runtime.device(),
-        CheckedProduct({storage.batch, plan.num_nodes(), sizeof(float)},
+        CheckedProduct({storage.batch, plan.num_nodes(), sizeof(Scalar)},
                        "Metal posterior uniforms"));
     ReserveConditionalTapes(storage, plan, storage.states, storage.batch);
     storage.sampling = true;
@@ -600,24 +603,24 @@ void ReserveMarginalRecovery(Workspace::Impl &storage) {
     ReserveConditionalTapes(storage, plan, storage.states, storage.batch);
     storage.rake_message_tape = MakeBuffer(
         runtime.device(), CheckedProduct({storage.batch, plan.num_branches(),
-                                          storage.states, sizeof(float)},
+                                          storage.states, sizeof(Scalar)},
                                          "Metal rake-message tape"));
     storage.compression_output_tape =
         MakeBuffer(runtime.device(),
                    CheckedProduct({storage.batch, plan.num_compressions(),
-                                   matrix_size, sizeof(float)},
+                                   matrix_size, sizeof(Scalar)},
                                   "Metal compression-output tape"));
     storage.node_marginals = MakeBuffer(
         runtime.device(), CheckedProduct({storage.batch, plan.num_nodes(),
-                                          storage.states, sizeof(float)},
+                                          storage.states, sizeof(Scalar)},
                                          "Metal node marginals"));
     storage.edge_marginals = MakeBuffer(
         runtime.device(), CheckedProduct({storage.batch, plan.num_edges(),
-                                          matrix_size, sizeof(float)},
+                                          matrix_size, sizeof(Scalar)},
                                          "Metal edge marginals"));
     storage.branch_marginals = MakeBuffer(
         runtime.device(), CheckedProduct({storage.batch, plan.num_branches(),
-                                          storage.states, sizeof(float)},
+                                          storage.states, sizeof(Scalar)},
                                          "Metal branch marginals"));
     storage.marginals = true;
   }
@@ -675,8 +678,8 @@ tree_hmm::MutableBatchedModelView Workspace::Inputs(std::size_t batch) {
     return {*storage.plan,
             storage.states,
             batch,
-            {static_cast<float *>(storage.input_nodes.contents), node_values},
-            {static_cast<float *>(storage.input_edges.contents), edge_values}};
+            {static_cast<Scalar *>(storage.input_nodes.contents), node_values},
+            {static_cast<Scalar *>(storage.input_edges.contents), edge_values}};
   }
 }
 
@@ -710,17 +713,17 @@ Workspace::CategoricalInputs(std::size_t batch) {
             storage.observation_nodes,
             {static_cast<std::uint8_t *>(storage.input_observations.contents),
              observation_values},
-            {static_cast<float *>(storage.input_root_potential.contents),
+            {static_cast<Scalar *>(storage.input_root_potential.contents),
              storage.states},
-            {static_cast<float *>(storage.input_emission_potentials.contents),
+            {static_cast<Scalar *>(storage.input_emission_potentials.contents),
              emission_values},
-            {static_cast<float *>(storage.input_edges.contents), edge_values}};
+            {static_cast<Scalar *>(storage.input_edges.contents), edge_values}};
   }
 }
 
-std::span<float> Workspace::Uniforms() { return Uniforms(impl_->batch); }
+std::span<Scalar> Workspace::Uniforms() { return Uniforms(impl_->batch); }
 
-std::span<float> Workspace::Uniforms(std::size_t batch) {
+std::span<Scalar> Workspace::Uniforms(std::size_t batch) {
   @autoreleasepool {
     Impl &storage = *impl_;
     if (!storage.sampling) {
@@ -730,7 +733,7 @@ std::span<float> Workspace::Uniforms(std::size_t batch) {
     if (batch == 0 || batch > storage.batch)
       throw std::invalid_argument(
           "Metal uniform batch exceeds the reserved capacity");
-    return {static_cast<float *>(storage.uniforms.contents),
+    return {static_cast<Scalar *>(storage.uniforms.contents),
             CheckedProduct({batch, storage.plan->num_nodes()},
                            "Metal posterior uniforms")};
   }
@@ -800,7 +803,7 @@ void EncodeInitializeNodes(id<MTLComputeCommandEncoder> encoder,
   constexpr NSUInteger kTransposeTile = 32;
   constexpr NSUInteger kTransposeRows = 8;
   [encoder setThreadgroupMemoryLength:kTransposeTile * (kTransposeTile + 1) *
-                                      sizeof(float)
+                                      sizeof(Scalar)
                               atIndex:0];
   [encoder dispatchThreadgroups:MTLSizeMake((model.plan.num_nodes() +
                                              kTransposeTile - 1) /
@@ -838,7 +841,7 @@ void EncodeInitializeNodes(id<MTLComputeCommandEncoder> encoder,
 
 template <class Model>
 tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
-                            std::span<const float> uniforms = {}) {
+                            std::span<const Scalar> uniforms = {}) {
   @autoreleasepool {
     const auto wall_start = Clock::now();
     if (storage.plan != &model.plan || storage.states != model.states ||
@@ -861,7 +864,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
           "prepared Metal posterior sampling requires ReserveSampling and "
           "one uniform variate per batch item and node");
     }
-    for (const float uniform : uniforms) {
+    for (const Scalar uniform : uniforms) {
       if (!std::isfinite(uniform) || uniform < 0.0f || uniform >= 1.0f) {
         throw std::invalid_argument(
             "posterior-sampling variates must lie in [0, 1)");
@@ -893,7 +896,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
       [encoder fillBuffer:storage.node_scales
                     range:NSMakeRange(0, CheckedProduct({model.batch,
                                                          model.plan.num_nodes(),
-                                                         sizeof(float)},
+                                                         sizeof(Scalar)},
                                                         "Metal node scales"))
                     value:0];
       [encoder
@@ -901,14 +904,14 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
                range:NSMakeRange(
                          0, CheckedProduct(
                                 {base_params.paths_batched ? model.batch : 1,
-                                 model.plan.num_edges(), sizeof(float)},
+                                 model.plan.num_edges(), sizeof(Scalar)},
                                 "Metal path scales"))
                value:0];
       [encoder
           fillBuffer:storage.branch_scales
                range:NSMakeRange(0, CheckedProduct({model.batch,
                                                     model.plan.num_branches(),
-                                                    sizeof(float)},
+                                                    sizeof(Scalar)},
                                                    "Metal branch scales"))
                value:0];
       [encoder endEncoding];
@@ -1055,7 +1058,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
           const std::size_t matrix_size = model.states * model.states;
           [encoder
               setThreadgroupMemoryLength:(2 * matrix_size + model.states + 1) *
-                                         sizeof(float)
+                                         sizeof(Scalar)
                                  atIndex:0];
           [encoder dispatchThreadgroups:MTLSizeMake(primitive_batch.count,
                                                     model.batch, 1)
@@ -1140,7 +1143,7 @@ tree_hmm::PartitionView Run(Model model, Workspace::Impl &storage, bool scaled,
             .count();
     const double kernel_ms =
         1000.0 * (command.GPUEndTime - command.GPUStartTime);
-    const auto *output = static_cast<const float *>(storage.output.contents);
+    const auto *output = static_cast<const Scalar *>(storage.output.contents);
     if (sampling) {
       for (std::size_t batch = 0; batch < model.batch; ++batch) {
         if (!std::isfinite(output[batch])) {
@@ -1266,7 +1269,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
         [encoder setBytes:&params length:sizeof(Params) atIndex:4];
         const std::size_t matrix = model.states * model.states;
         [encoder setThreadgroupMemoryLength:(2 * matrix + model.states) *
-                                            sizeof(float)
+                                            sizeof(Scalar)
                                     atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(primitive_batch.count,
                                                   model.batch, 1)
@@ -1328,7 +1331,7 @@ tree_hmm::BatchedMaximumAssignmentView RunMaximum(Model model,
     }
     const auto wall_end = Clock::now();
     const auto *log_weights =
-        static_cast<const float *>(storage.output.contents);
+        static_cast<const Scalar *>(storage.output.contents);
     for (std::size_t batch = 0; batch < model.batch; ++batch) {
       if (!std::isfinite(log_weights[batch])) {
         throw std::domain_error(
@@ -1393,13 +1396,13 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
                        "branch marginals");
     id<MTLBlitCommandEncoder> blit = [command blitCommandEncoder];
     [blit fillBuffer:storage.node_marginals
-               range:NSMakeRange(0, node_values * sizeof(float))
+               range:NSMakeRange(0, node_values * sizeof(Scalar))
                value:0];
     [blit fillBuffer:storage.edge_marginals
-               range:NSMakeRange(0, edge_values * sizeof(float))
+               range:NSMakeRange(0, edge_values * sizeof(Scalar))
                value:0];
     [blit fillBuffer:storage.branch_marginals
-               range:NSMakeRange(0, branch_values * sizeof(float))
+               range:NSMakeRange(0, branch_values * sizeof(Scalar))
                value:0];
     [blit endEncoding];
 
@@ -1485,7 +1488,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
         [encoder setBuffer:storage.compression_output_tape offset:0 atIndex:6];
         [encoder setBytes:&params length:sizeof(Params) atIndex:7];
         [encoder setThreadgroupMemoryLength:(2 * matrix_size + model.states) *
-                                            sizeof(float)
+                                            sizeof(Scalar)
                                     atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(primitive_batch.count,
                                                   model.batch, 1)
@@ -1554,7 +1557,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
         [encoder setBuffer:storage.node_marginals offset:0 atIndex:5];
         [encoder setBuffer:storage.edge_marginals offset:0 atIndex:6];
         [encoder setBytes:&params length:sizeof(Params) atIndex:7];
-        [encoder setThreadgroupMemoryLength:matrix_size * sizeof(float)
+        [encoder setThreadgroupMemoryLength:matrix_size * sizeof(Scalar)
                                     atIndex:0];
         [encoder dispatchThreadgroups:MTLSizeMake(primitive_batch.count,
                                                   model.batch, 1)
@@ -1572,7 +1575,7 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
     }
     const auto wall_end = Clock::now();
     const auto *log_partitions =
-        static_cast<const float *>(storage.output.contents);
+        static_cast<const Scalar *>(storage.output.contents);
     for (std::size_t batch = 0; batch < model.batch; ++batch) {
       if (!std::isfinite(log_partitions[batch])) {
         throw std::domain_error(
@@ -1588,9 +1591,9 @@ tree_hmm::BatchedMarginalView RunMarginals(Model model,
     const double kernel_ms =
         1000.0 * (command.GPUEndTime - command.GPUStartTime);
     return {{log_partitions, model.batch},
-            {static_cast<const float *>(storage.node_marginals.contents),
+            {static_cast<const Scalar *>(storage.node_marginals.contents),
              node_values},
-            {static_cast<const float *>(storage.edge_marginals.contents),
+            {static_cast<const Scalar *>(storage.edge_marginals.contents),
              edge_values},
             {upload_ms, kernel_ms, 0.0, wall_ms}};
   }
@@ -1636,7 +1639,8 @@ MaximumAPosterioriPrepared(tree_hmm::BatchedCategoricalModelView model,
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
-                        std::span<const float> uniforms, Workspace &workspace) {
+                        std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
   const tree_hmm::PartitionView result =
       Run(model, *workspace.impl_, true, uniforms);
   const auto *assignments =
@@ -1646,7 +1650,8 @@ PosteriorSamplePrepared(tree_hmm::BatchedModelView model,
 
 tree_hmm::BatchedPosteriorSampleView
 PosteriorSamplePrepared(tree_hmm::BatchedCategoricalModelView model,
-                        std::span<const float> uniforms, Workspace &workspace) {
+                        std::span<const Scalar> uniforms,
+                        Workspace &workspace) {
   const tree_hmm::PartitionView result =
       Run(model, *workspace.impl_, true, uniforms);
   const auto *assignments =

@@ -45,7 +45,7 @@ int main() {
       },
       [&](std::size_t batch) { return workspace.Uniforms(batch); },
       [&](tree_hmm::BatchedCategoricalModelView model,
-          std::span<const float> uniforms) {
+          std::span<const tree_hmm::Scalar> uniforms) {
         return tree_hmm::metal::PosteriorSamplePrepared(model, uniforms,
                                                         workspace);
       },
@@ -74,7 +74,8 @@ int main() {
       },
       [&](std::size_t batch) { return workspace.Inputs(batch); },
       [&](std::size_t batch) { return workspace.Uniforms(batch); },
-      [&](tree_hmm::BatchedModelView model, std::span<const float> uniforms) {
+      [&](tree_hmm::BatchedModelView model,
+          std::span<const tree_hmm::Scalar> uniforms) {
         return tree_hmm::metal::PosteriorSamplePrepared(model, uniforms,
                                                         workspace);
       });

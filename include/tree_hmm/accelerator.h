@@ -6,6 +6,7 @@
 #include <span>
 
 #include "btrc/plan.h"
+#include "tree_hmm/scalar.h"
 
 namespace tree_hmm {
 
@@ -16,9 +17,9 @@ struct BatchedModelView {
   std::size_t states;
   std::size_t batch;
   // [batch, node, state]
-  std::span<const float> node_potentials;
+  std::span<const Scalar> node_potentials;
   // [edge, parent state, child state], broadcast across the batch.
-  std::span<const float> edge_potentials;
+  std::span<const Scalar> edge_potentials;
 };
 
 // Host-writable storage with the same layout as BatchedModelView. Accelerator
@@ -29,8 +30,8 @@ struct MutableBatchedModelView {
   const btrc::Plan &plan;
   std::size_t states;
   std::size_t batch;
-  std::span<float> node_potentials;
-  std::span<float> edge_potentials;
+  std::span<Scalar> node_potentials;
+  std::span<Scalar> edge_potentials;
 
   operator BatchedModelView() const {
     return {plan, states, batch, node_potentials, edge_potentials};
@@ -51,11 +52,11 @@ struct BatchedCategoricalModelView {
   // [batch, observation node]
   std::span<const std::uint8_t> observations;
   // [state]
-  std::span<const float> root_potential;
+  std::span<const Scalar> root_potential;
   // [category, state]
-  std::span<const float> emission_potentials;
+  std::span<const Scalar> emission_potentials;
   // [edge, parent state, child state], broadcast across the batch.
-  std::span<const float> edge_potentials;
+  std::span<const Scalar> edge_potentials;
 };
 
 struct MutableBatchedCategoricalModelView {
@@ -65,9 +66,9 @@ struct MutableBatchedCategoricalModelView {
   std::size_t categories;
   std::span<const btrc::Index> observation_nodes;
   std::span<std::uint8_t> observations;
-  std::span<float> root_potential;
-  std::span<float> emission_potentials;
-  std::span<float> edge_potentials;
+  std::span<Scalar> root_potential;
+  std::span<Scalar> emission_potentials;
+  std::span<Scalar> edge_potentials;
 
   operator BatchedCategoricalModelView() const {
     return {plan,
@@ -92,7 +93,7 @@ struct AcceleratorTimings {
 // The returned values are owned by the workspace and remain valid until that
 // workspace is reserved again, reused, moved, or destroyed.
 struct PartitionView {
-  std::span<const float> values;
+  std::span<const Scalar> values;
   AcceleratorTimings timings;
 };
 
@@ -100,7 +101,7 @@ struct PartitionView {
 // [batch], and states have shape [batch, node]. The spans are owned by the
 // backend workspace and follow the same lifetime rules as PartitionView.
 struct BatchedMaximumAssignmentView {
-  std::span<const float> log_weights;
+  std::span<const Scalar> log_weights;
   std::span<const std::uint32_t> states;
   AcceleratorTimings timings;
 };
@@ -117,9 +118,9 @@ struct BatchedPosteriorSampleView {
 // [batch, edge, parent state, child state]. All spans are owned by the backend
 // workspace.
 struct BatchedMarginalView {
-  std::span<const float> log_partitions;
-  std::span<const float> nodes;
-  std::span<const float> edges;
+  std::span<const Scalar> log_partitions;
+  std::span<const Scalar> nodes;
+  std::span<const Scalar> edges;
   AcceleratorTimings timings;
 };
 
