@@ -121,6 +121,12 @@ void Upload(Value *destination, std::span<const Value> source,
   }
 }
 
+template <class Value, class Allocator>
+void Upload(Value *destination, const std::vector<Value, Allocator> &source,
+            cudaStream_t stream) {
+  Upload(destination, std::span<const Value>(source), stream);
+}
+
 __device__ std::size_t NodeIndex(const Params &params, std::size_t batch,
                                  std::size_t node, std::size_t state) {
   return (node * params.batch + batch) * params.states + state;
@@ -2195,8 +2201,9 @@ RunPrepared(const btrc::Plan &plan, std::size_t states, std::size_t batch,
   initialize_node_data(base_params);
   if (path_matrices != 0) {
     InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
-                      storage.stream>>>(storage.input_edges, storage.paths,
+                      storage.stream>>>(storage.input_edges,
                                         storage.mutable_path_edges,
+                                        storage.paths,
                                         base_params);
   }
 
@@ -2402,8 +2409,9 @@ RunMaximumPrepared(const btrc::Plan &plan, std::size_t states,
   initialize_node_data(base_params);
   if (path_matrices != 0) {
     InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
-                      storage.stream>>>(storage.input_edges, storage.paths,
+                      storage.stream>>>(storage.input_edges,
                                         storage.mutable_path_edges,
+                                        storage.paths,
                                         base_params);
   }
   const std::size_t node_values =
@@ -2595,8 +2603,9 @@ RunMarginalsPrepared(const btrc::Plan &plan, std::size_t states,
   initialize_node_data(base_params);
   if (path_matrices != 0) {
     InitializePaths<<<Blocks(path_matrices, kThreads), kThreads, 0,
-                      storage.stream>>>(storage.input_edges, storage.paths,
+                      storage.stream>>>(storage.input_edges,
                                         storage.mutable_path_edges,
+                                        storage.paths,
                                         base_params);
   }
   const std::size_t node_values =
