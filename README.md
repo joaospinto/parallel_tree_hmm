@@ -15,22 +15,23 @@ The package provides:
 - log-domain max-product contraction followed by MAP-state reconstruction;
 - exact posterior sampling from caller-supplied uniform variates;
 - stable scaled log-partition evaluation for long trees;
-- batched Metal and CUDA likelihood, posterior-marginal, MAP-reconstruction,
-  and posterior-sampling backends sharing one accelerator API;
-- brute-force, device-emulation, and accelerator cross-validation.
+- batched CUDA, ROCm, and Metal likelihood, posterior-marginal,
+  MAP-reconstruction, and posterior-sampling backends sharing one accelerator
+  API;
+- brute-force, host-side device-algebra, and accelerator cross-validation.
 
-The CPU and CUDA implementations use one compile-time `tree_hmm::Scalar`.
-FP64 is the default; FP32 is a separate pure-precision build. Likelihoods use
-scale propagation and marginals use a log-domain contraction, so neither
-underflows on large trees. Metal is FP32-only. Prepared CPU and accelerator
-APIs allocate all problem storage in the corresponding workspace reservation;
-repeated numerical calls reuse it.
+The CPU, CUDA, and ROCm implementations use one compile-time
+`tree_hmm::Scalar`. FP64 is the default; FP32 is a separate pure-precision
+build. Likelihoods use scale propagation and marginals use a log-domain
+contraction, so neither underflows on large trees. Metal is FP32-only. Prepared
+CPU and accelerator APIs allocate all problem storage in the corresponding
+workspace reservation; repeated numerical calls reuse it.
 
 MAP assignments and posterior samples use the same topology plan as sum-product
 inference. Contraction records the local conditional data required for
 reconstruction, and reverse traversal restores all eliminated states in
 dependency order. CPU prepared calls return workspace-backed views and allocate
-no memory. The CUDA and Metal APIs provide the same marginal, MAP, and
+no memory. The accelerator APIs provide the same marginal, MAP, and
 posterior-sampling behavior for batches. Accelerator operation-specific
 workspace reservations own only the choice tapes, conditional-factor tapes, or
 reverse adjoints required by the requested result, so likelihood-only
@@ -40,21 +41,26 @@ external, reproducible, and independent of execution order. Posterior-marginal
 calls return workspace-backed batch-major node and edge probabilities together
 with one log partition function per batch item.
 
-CUDA and Metal pack independent operations into full threadgroups for small
-state spaces, with a generic-state fallback. Each accelerator workspace also
-exposes a mutable model view through `Inputs()`. Applications can prepare
-factors directly in the workspace's pinned CUDA storage or shared Metal
+CUDA, ROCm, and Metal pack independent operations into full threadgroups for
+small state spaces, with a generic-state fallback. Each accelerator workspace
+also exposes a mutable model view through `Inputs()`. Applications can prepare
+factors directly in the workspace's pinned CUDA/ROCm storage or shared Metal
 storage, then pass the resulting ordinary `BatchedModelView` to the same
 inference call. This avoids a full-batch staging copy without introducing a
-separate numerical path. Both backends also expose `CategoricalInputs()` for
+separate numerical path. All three backends also expose `CategoricalInputs()` for
 models in which selected nodes carry byte-valued observations. Those inputs
 remain compact: an initialization kernel combines the observations with a
 shared emission table directly in the inference workspace instead of
 materializing a batch of dense node factors on the host.
 
-The CUDA device algebra is exercised on every host build by an emulation test.
-Real CUDA compilation, launch semantics, and performance still require an
-NVIDIA system. The Metal kernels are compiled and tested directly on macOS.
+CUDA and ROCm share one kernel and execution implementation over the common
+CUDA/HIP runtime subset; thin wrappers select the public namespace and runtime.
+The shared CUDA/HIP device algebra is also compiled and exercised as ordinary
+host code on every build. This checks its numerical operations but does not
+emulate GPU execution. Real CUDA or ROCm compilation and launch semantics
+require the corresponding SDK, and performance validation requires the
+corresponding GPU. The Metal kernels are compiled and tested directly on
+macOS.
 
 ## Build
 
@@ -71,6 +77,22 @@ On an NVIDIA host, build the real CUDA tests in the same precision:
 bazel test //:cuda_test --config=fp64 --config=cuda
 bazel test //:cuda_test --config=fp32 --config=cuda
 ```
+
+ROCm compilation is opt-in. It can be validated without an AMD GPU; execution
+of the test requires one. The default target is MI300 (`gfx942`) and can be
+changed with `TREE_HMM_ROCM_ARCH`:
+
+```sh
+scripts/rocm.sh build
+TREE_HMM_ROCM_ARCH=gfx90a scripts/rocm.sh build
+scripts/rocm.sh test
+```
+
+On Linux, Bazel fetches a pinned ROCm 7.2.3 SDK when `ROCM_PATH` is unset.
+Set `ROCM_PATH` to use an existing installation instead. CUDA targets likewise
+use a pinned CUDA 12.8.1 redistribution, so CUDA and ROCm compilation do not
+depend on a system toolkit. A corresponding GPU and driver are still required
+to execute either backend.
 
 Metal uses FP32:
 

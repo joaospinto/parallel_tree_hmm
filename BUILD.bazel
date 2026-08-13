@@ -1,7 +1,11 @@
 load("@rules_cc//cc:cc_binary.bzl", "cc_binary")
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
 load("@rules_cc//cc:cc_test.bzl", "cc_test")
-load("@bazel_skylib//rules:common_settings.bzl", "string_flag")
+load(
+    "@bazel_skylib//rules:common_settings.bzl",
+    "bool_flag",
+    "string_flag",
+)
 load(
     "@rules_cuda//cuda:defs.bzl",
     "cuda_library",
@@ -18,6 +22,27 @@ string_flag(
     visibility = ["//visibility:public"],
 )
 
+bool_flag(
+    name = "enable_rocm",
+    build_setting_default = False,
+    visibility = ["//visibility:public"],
+)
+
+string_flag(
+    name = "rocm_arch",
+    build_setting_default = "gfx942",
+    values = [
+        "gfx90a",
+        "gfx942",
+        "gfx950",
+        "gfx1100",
+        "gfx1101",
+        "gfx1200",
+        "gfx1201",
+    ],
+    visibility = ["//visibility:public"],
+)
+
 config_setting(
     name = "fp32",
     flag_values = {":precision": "fp32"},
@@ -28,6 +53,38 @@ config_setting(
     constraint_values = ["@platforms//os:osx"],
     flag_values = {":precision": "fp32"},
 )
+
+config_setting(
+    name = "rocm_enabled_linux",
+    constraint_values = ["@platforms//os:linux"],
+    flag_values = {":enable_rocm": "true"},
+)
+
+[
+    config_setting(
+        name = "rocm_" + arch,
+        flag_values = {":rocm_arch": arch},
+    )
+    for arch in [
+        "gfx90a",
+        "gfx942",
+        "gfx950",
+        "gfx1100",
+        "gfx1101",
+        "gfx1200",
+        "gfx1201",
+    ]
+]
+
+ROCM_ARCH_COPTS = select({
+    ":rocm_gfx90a": ["--offload-arch=gfx90a"],
+    ":rocm_gfx942": ["--offload-arch=gfx942"],
+    ":rocm_gfx950": ["--offload-arch=gfx950"],
+    ":rocm_gfx1100": ["--offload-arch=gfx1100"],
+    ":rocm_gfx1101": ["--offload-arch=gfx1101"],
+    ":rocm_gfx1200": ["--offload-arch=gfx1200"],
+    ":rocm_gfx1201": ["--offload-arch=gfx1201"],
+})
 
 cc_library(
     name = "scalar",
@@ -69,10 +126,14 @@ cc_binary(
 
 cc_library(
     name = "tree_hmm_cuda_stub",
-    srcs = ["src/cuda_stub.cc"],
+    srcs = [
+        "src/cuda_stub.cc",
+        "src/gpu_backend_stub.inc",
+    ],
     hdrs = [
         "include/tree_hmm/accelerator.h",
         "include/tree_hmm/cuda.h",
+        "include/tree_hmm/detail/gpu_backend_api.inc",
     ],
     includes = ["include"],
     visibility = ["//visibility:public"],
@@ -89,10 +150,70 @@ cc_test(
 )
 
 cc_test(
-    name = "cuda_kernel_emulation_test",
+    name = "cuda_api_test",
     srcs = [
-        "src/cuda_device_algebra.h",
-        "tests/cuda_kernel_emulation_test.cc",
+        "tests/accelerator_test.h",
+        "tests/cuda_test.cc",
+        "tests/gpu_backend_test.inc",
+    ],
+    deps = [
+        ":tree_hmm",
+        ":tree_hmm_cuda_stub",
+    ],
+)
+
+cc_library(
+    name = "tree_hmm_rocm_stub",
+    srcs = [
+        "src/gpu_backend_stub.inc",
+        "src/rocm_stub.cc",
+    ],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/detail/gpu_backend_api.inc",
+        "include/tree_hmm/rocm.h",
+    ],
+    includes = ["include"],
+    visibility = ["//visibility:public"],
+    deps = [
+        ":scalar",
+        "@bidirectional_tree_rake_compress//:btrc",
+    ],
+)
+
+cc_test(
+    name = "rocm_stub_test",
+    srcs = ["tests/rocm_stub_test.cc"],
+    deps = [":tree_hmm_rocm_stub"],
+)
+
+cc_test(
+    name = "rocm_api_test",
+    srcs = [
+        "tests/accelerator_test.h",
+        "tests/gpu_backend_test.inc",
+        "tests/rocm_test.cc",
+    ],
+    deps = [
+        ":tree_hmm",
+        ":tree_hmm_rocm_stub",
+    ],
+)
+
+cc_test(
+    name = "gpu_headers_test",
+    srcs = ["tests/gpu_headers_test.cc"],
+    deps = [
+        ":tree_hmm_cuda_stub",
+        ":tree_hmm_rocm_stub",
+    ],
+)
+
+cc_test(
+    name = "gpu_device_algebra_test",
+    srcs = [
+        "src/gpu_device_algebra.h",
+        "tests/gpu_device_algebra_test.cc",
     ],
     deps = [
         ":tree_hmm",
@@ -118,7 +239,9 @@ cuda_library(
     hdrs = [
         "include/tree_hmm/accelerator.h",
         "include/tree_hmm/cuda.h",
-        "src/cuda_device_algebra.h",
+        "include/tree_hmm/detail/gpu_backend_api.inc",
+        "src/gpu_backend_impl.inc",
+        "src/gpu_device_algebra.h",
     ],
     alwayslink = True,
     copts = [
@@ -136,11 +259,46 @@ cuda_library(
     ],
 )
 
+cc_library(
+    name = "tree_hmm_rocm",
+    srcs = [
+        "src/accelerator_path_storage.h",
+        "src/rocm.cc",
+    ],
+    hdrs = [
+        "include/tree_hmm/accelerator.h",
+        "include/tree_hmm/detail/gpu_backend_api.inc",
+        "include/tree_hmm/rocm.h",
+        "src/gpu_backend_impl.inc",
+        "src/gpu_device_algebra.h",
+        "src/hip_cuda_runtime_compat.h",
+    ],
+    copts = [
+        "-x",
+        "hip",
+        "-std=c++20",
+        "-Wno-error",
+    ] + ROCM_ARCH_COPTS,
+    includes = ["include"],
+    linkopts = ["--hip-link"],
+    target_compatible_with = select({
+        ":rocm_enabled_linux": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    visibility = ["//visibility:public"],
+    deps = [
+        ":scalar",
+        "@bidirectional_tree_rake_compress//:btrc",
+        "@rocm_sdk//:hip_runtime",
+    ],
+)
+
 cc_test(
     name = "cuda_test",
     srcs = [
         "tests/accelerator_test.h",
         "tests/cuda_test.cc",
+        "tests/gpu_backend_test.inc",
     ],
     tags = [
         "manual",
@@ -150,6 +308,27 @@ cc_test(
     deps = [
         ":tree_hmm",
         ":tree_hmm_cuda",
+    ],
+)
+
+cc_test(
+    name = "rocm_test",
+    srcs = [
+        "tests/accelerator_test.h",
+        "tests/gpu_backend_test.inc",
+        "tests/rocm_test.cc",
+    ],
+    tags = [
+        "manual",
+        "requires-gpu",
+    ],
+    target_compatible_with = select({
+        ":rocm_enabled_linux": [],
+        "//conditions:default": ["@platforms//:incompatible"],
+    }),
+    deps = [
+        ":tree_hmm",
+        ":tree_hmm_rocm",
     ],
 )
 

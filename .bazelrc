@@ -21,6 +21,12 @@ build --@rules_cuda//cuda:enable=false
 build:cuda --@rules_cuda//cuda:enable=true
 build:cuda --@rules_cuda//cuda:compiler=nvcc
 common --flag_alias=cuda_archs=@rules_cuda//cuda:archs
+common --flag_alias=rocm_arch=//:rocm_arch
+
+# Native ROCm targets are opt-in. scripts/rocm.sh supplies the detected ROCm
+# compiler paths so nonstandard installations do not require editing Bazel
+# configuration.
+build:rocm --//:enable_rocm=true
 
 build -c opt
 common --enable_platform_specific_config

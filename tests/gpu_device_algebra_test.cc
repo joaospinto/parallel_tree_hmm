@@ -1,4 +1,4 @@
-#include "src/cuda_device_algebra.h"
+#include "src/gpu_device_algebra.h"
 
 #include "btrc/execute.h"
 #include "tree_hmm/inference.h"
@@ -14,11 +14,11 @@
 
 namespace {
 
-class EmulatedDispatcher {
+class HostAlgebraDispatcher {
 public:
-  EmulatedDispatcher(const btrc::Plan &plan, std::size_t states,
-                     std::span<const tree_hmm::Scalar> nodes,
-                     std::span<const tree_hmm::Scalar> paths, bool scaled)
+  HostAlgebraDispatcher(const btrc::Plan &plan, std::size_t states,
+                        std::span<const tree_hmm::Scalar> nodes,
+                        std::span<const tree_hmm::Scalar> paths, bool scaled)
       : plan_(plan), states_(states), matrix_(states * states),
         nodes_(nodes.begin(), nodes.end()), paths_(paths.begin(), paths.end()),
         branches_(plan.num_branches() * states), node_scales_(plan.num_nodes()),
@@ -29,7 +29,7 @@ public:
     for (const btrc::Rake &operation : operations) {
       tree_hmm::Scalar *output = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state) {
-        output[state] = tree_hmm::cuda::detail::RakeValue(
+        output[state] = tree_hmm::accelerator_detail::RakeValue(
             Path(operation.edge), Node(operation.leaf), states_, state);
       }
       if (scaled_) {
@@ -46,7 +46,7 @@ public:
       const tree_hmm::Scalar *source = Branch(operation.source);
       for (std::size_t state = 0; state < states_; ++state) {
         destination[state] =
-            tree_hmm::cuda::detail::Product(destination[state], source[state]);
+            tree_hmm::accelerator_detail::Product(destination[state], source[state]);
       }
       if (scaled_) {
         BranchScale(operation.destination) = Normalize(
@@ -62,7 +62,7 @@ public:
       const tree_hmm::Scalar *branch = Branch(operation.branch);
       for (std::size_t state = 0; state < states_; ++state) {
         node[state] =
-            tree_hmm::cuda::detail::Product(node[state], branch[state]);
+            tree_hmm::accelerator_detail::Product(node[state], branch[state]);
       }
       if (scaled_) {
         NodeScale(operation.parent) = Normalize(
@@ -83,7 +83,7 @@ public:
       for (std::size_t parent = 0; parent < states_; ++parent) {
         for (std::size_t child = 0; child < states_; ++child) {
           left[parent * states_ + child] =
-              tree_hmm::cuda::detail::MatrixProductValue(
+              tree_hmm::accelerator_detail::MatrixProductValue(
                   scratch_.data(), weighted_right_.data(), states_, parent,
                   child);
         }
@@ -107,12 +107,12 @@ private:
   tree_hmm::Scalar Normalize(tree_hmm::Scalar *values, std::size_t size,
                              tree_hmm::Scalar input_scale) const {
     const tree_hmm::Scalar maximum =
-        tree_hmm::cuda::detail::Maximum(values, static_cast<unsigned>(size));
+        tree_hmm::accelerator_detail::Maximum(values, static_cast<unsigned>(size));
     if (maximum > 0.0f) {
       for (std::size_t index = 0; index < size; ++index)
         values[index] /= maximum;
     }
-    return tree_hmm::cuda::detail::UpdatedLogScale(input_scale, maximum);
+    return tree_hmm::accelerator_detail::UpdatedLogScale(input_scale, maximum);
   }
   tree_hmm::Scalar *Node(btrc::Index index) {
     return nodes_.data() + index * states_;
@@ -189,13 +189,15 @@ int main() {
   const std::vector<tree_hmm::Scalar> host_edges(edges.begin(), edges.end());
   const tree_hmm::ModelView host_model{plan, kStates, host_nodes, host_edges};
 
-  EmulatedDispatcher raw(plan, kStates, nodes, edges, false);
+  HostAlgebraDispatcher raw(plan, kStates, nodes, edges, false);
   btrc::Contract(plan, raw);
   if (!Near(raw.Finish(), tree_hmm::PartitionFunction(host_model)))
-    throw std::runtime_error("emulated CUDA partition function is incorrect");
+    throw std::runtime_error(
+        "host-side device-algebra partition function is incorrect");
 
-  EmulatedDispatcher scaled(plan, kStates, nodes, edges, true);
+  HostAlgebraDispatcher scaled(plan, kStates, nodes, edges, true);
   btrc::Contract(plan, scaled);
   if (!Near(scaled.Finish(), tree_hmm::LogPartitionFunction(host_model)))
-    throw std::runtime_error("emulated CUDA log partition is incorrect");
+    throw std::runtime_error(
+        "host-side device-algebra log partition is incorrect");
 }

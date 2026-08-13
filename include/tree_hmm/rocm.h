@@ -1,5 +1,5 @@
-#ifndef TREE_HMM_CUDA_H_
-#define TREE_HMM_CUDA_H_
+#ifndef TREE_HMM_ROCM_H_
+#define TREE_HMM_ROCM_H_
 
 #include <cstddef>
 #include <memory>
@@ -7,10 +7,10 @@
 
 #include "tree_hmm/accelerator.h"
 
-namespace tree_hmm::cuda {
+namespace tree_hmm::rocm {
 
 #include "tree_hmm/detail/gpu_backend_api.inc"
 
-} // namespace tree_hmm::cuda
+} // namespace tree_hmm::rocm
 
-#endif // TREE_HMM_CUDA_H_
+#endif // TREE_HMM_ROCM_H_

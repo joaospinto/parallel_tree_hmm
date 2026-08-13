@@ -9,12 +9,8 @@ bazel_dep(name = "platforms", version = "1.0.0")
 bazel_dep(name = "rules_cuda", version = "0.3.0")
 bazel_dep(name = "bidirectional_tree_rake_compress", version = "0.1.0")
 
-cuda = use_extension("@rules_cuda//cuda:extensions.bzl", "toolchain")
-cuda.toolkit(
-    name = "cuda",
-    toolkit_path = "",
-)
-use_repo(cuda, "cuda")
+accelerator_sdks = use_extension("//toolchains:extensions.bzl", "accelerator_sdks")
+use_repo(accelerator_sdks, "cuda", "rocm_sdk")
 
 local_path_override(
     module_name = "bidirectional_tree_rake_compress",
