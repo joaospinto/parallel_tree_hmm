@@ -76,8 +76,9 @@ macOS.
 
 ## Build
 
-Keep this repository beside `bidirectional_tree_rake_compress`. Build and test
-the default FP64 CPU implementation with:
+The public `bidirectional_tree_rake_compress` dependency is pinned and fetched
+automatically from GitHub. Build and test the default FP64 CPU implementation
+with:
 
 ```sh
 bazel test //... --config=fp64

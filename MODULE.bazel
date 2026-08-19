@@ -12,7 +12,8 @@ bazel_dep(name = "bidirectional_tree_rake_compress", version = "0.1.0")
 accelerator_sdks = use_extension("//toolchains:extensions.bzl", "accelerator_sdks")
 use_repo(accelerator_sdks, "cuda", "rocm_sdk")
 
-local_path_override(
+git_override(
     module_name = "bidirectional_tree_rake_compress",
-    path = "../bidirectional_tree_rake_compress",
+    commit = "36cfd7592a653011ac36ffd8e3d918acc59a2e05",
+    remote = "https://github.com/joaospinto/bidirectional_tree_rake_compress.git",
 )
